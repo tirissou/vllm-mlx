@@ -4489,6 +4489,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         _sanitize_log_text(last_user_preview, limit=300),
     )
 
+    try:
+        import json as _json, time as _t
+        _body = await raw_request.body()
+        _parsed = _json.loads(_body)
+        _record = {"ts": _t.time(), "messages": _parsed.get("messages", [])}
+        with open("USER_INPUT.log", "a") as _f:
+            _f.write(_json.dumps(_record) + "\n")
+    except Exception:
+        pass
+
     engine = await _acquire_default_engine_for_request(
         raw_request,
         total_timeout=total_timeout,
