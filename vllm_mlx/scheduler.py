@@ -1260,6 +1260,80 @@ class Scheduler:
         """
         return self._actual_tokenizer.decode(token_ids)
 
+    def _template_truncates_thinking(self) -> bool:
+        """Return True if the tokenizer's chat template strips thinking from history."""
+        if not hasattr(self, "_template_truncates_thinking_cache"):
+            template = getattr(self._actual_tokenizer, "chat_template", None) or ""
+            self._template_truncates_thinking_cache = (
+                "truncate_history_thinking" in template
+            )
+        return self._template_truncates_thinking_cache
+
+    def _build_thinking_cache_key(
+        self, prompt_token_ids: List[int], output_token_ids: List[int]
+    ) -> List[int]:
+        """
+        Build the cache key that matches what the next request's chat template
+        will produce for this turn's historical assistant message.
+
+        Qwen3 (and similar) templates replace full thinking blocks with an empty
+        <think></think> in all historical turns (truncate_history_thinking=True).
+        The generation prefix appends <think>\\n to prompt_token_ids, so the raw
+        key (prompt + output) has full thinking, but re-encoded requests don't.
+
+        When truncation is detected, we strip <think>\\n from the prompt end and
+        replace the thinking body in the output with <think></think>, so future
+        prefix lookups find the right entry.
+        """
+        if not self._template_truncates_thinking():
+            return list(prompt_token_ids) + list(output_token_ids)
+
+        if not output_token_ids:
+            return list(prompt_token_ids) + list(output_token_ids)
+
+        # Decode output to check for thinking content.
+        output_text = self._decode_tokens(list(output_token_ids))
+        if "</think>" not in output_text:
+            return list(prompt_token_ids) + list(output_token_ids)
+
+        # Decode tail of prompt to detect the <think>\n generation prefix.
+        tail_len = min(20, len(prompt_token_ids))
+        tail_text = self._decode_tokens(list(prompt_token_ids[-tail_len:]))
+        if not tail_text.endswith("<think>\n"):
+            return list(prompt_token_ids) + list(output_token_ids)
+
+        # Find the exact token boundary for <think>\n at the prompt tail.
+        think_nl = "<think>\n"
+        n_think_tokens = None
+        for n in range(1, tail_len + 1):
+            chunk = self._decode_tokens(list(prompt_token_ids[-n:]))
+            if chunk == think_nl:
+                n_think_tokens = n
+                break
+            if len(chunk) > len(think_nl):
+                break  # overshot — boundary is ambiguous, skip adjustment
+
+        if n_think_tokens is None:
+            return list(prompt_token_ids) + list(output_token_ids)
+
+        stripped_prompt = list(prompt_token_ids[:-n_think_tokens])
+
+        # Compute truncated output: <think></think> + text after last </think>.
+        after_think = output_text.split("</think>")[-1]
+        truncated_text = "<think></think>" + after_think
+        try:
+            truncated_tokens = list(
+                self._actual_tokenizer.encode(truncated_text, add_special_tokens=False)
+            )
+        except Exception:
+            return list(prompt_token_ids) + list(output_token_ids)
+
+        logger.debug(
+            f"[thinking_cache_key] stripped {n_think_tokens} think-prefix tokens, "
+            f"compressed output from {len(output_token_ids)} to {len(truncated_tokens)} tokens"
+        )
+        return stripped_prompt + truncated_tokens
+
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
         if request_id not in self._detokenizer_pool:
@@ -2272,8 +2346,9 @@ class Scheduler:
                         and request._extracted_cache is not None
                     ):
                         try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(
-                                request.output_token_ids
+                            full_token_sequence = self._build_thinking_cache_key(
+                                list(request.prompt_token_ids),
+                                list(request.output_token_ids),
                             )
                             import time as _time
 
@@ -2321,8 +2396,9 @@ class Scheduler:
                         and request._extracted_cache is not None
                     ):
                         try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(
-                                request.output_token_ids
+                            full_token_sequence = self._build_thinking_cache_key(
+                                list(request.prompt_token_ids),
+                                list(request.output_token_ids),
                             )
                             self.prefix_cache.store_cache(
                                 full_token_sequence,
