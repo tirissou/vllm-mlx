@@ -2223,8 +2223,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             sequence += 1
         return events
 
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
+    reasoning_parser = _build_reasoning_parser(engine)
 
     global _tool_parser_instance
     tool_parser = None
@@ -2265,8 +2264,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if _reasoning_parser:
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+        if reasoning_parser:
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, raw_accumulated_text, delta_text
             )
             if delta_msg is None:
@@ -5240,12 +5239,10 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = _reasoning_parser is not None and not chat_kwargs.get(
+    reasoning_parser = _build_reasoning_parser(engine)
+    use_reasoning = reasoning_parser is not None and not chat_kwargs.get(
         "logits_processors"
     )
-
-    if use_reasoning:
-        _reasoning_parser.reset_state()
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -5330,7 +5327,7 @@ async def _stream_anthropic_messages(
             # Reasoning parser path
             previous_text = accumulated_text
             accumulated_text += filtered
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, filtered
             )
 
@@ -5571,14 +5568,11 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
+    reasoning_parser = _build_reasoning_parser(engine)
     is_thinking_model = (
-        "nemotron" in (engine.model_name or "").lower() and not _reasoning_parser
+        "nemotron" in (engine.model_name or "").lower() and not reasoning_parser
     )
     think_prefix_sent = False
-
-    # Reset reasoning parser state for this stream
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -5626,13 +5620,13 @@ async def stream_chat_completion(
 
             # Use reasoning parser if enabled (skip when enable_thinking=False)
             if (
-                _reasoning_parser
+                reasoning_parser
                 and delta_text
                 and request.enable_thinking is not False
             ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
-                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                delta_msg = reasoning_parser.extract_reasoning_streaming(
                     previous_text, accumulated_text, delta_text
                 )
 
