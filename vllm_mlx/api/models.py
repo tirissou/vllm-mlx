@@ -81,6 +81,10 @@ class Message(BaseModel):
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
     tool_call_id: str | None = None
+    # Thinking content returned by reasoning-parser; preserved so the chat
+    # template can reconstruct the full <think>BODY</think> block when
+    # building the next prompt, keeping GET cache keys consistent with PUT.
+    reasoning_content: str | None = None
 
 
 # =============================================================================
