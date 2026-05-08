@@ -1307,8 +1307,11 @@ class Scheduler:
           2. The output contains "</think>" (thinking was completed).
 
         When both signals fire, we strip <think>\\n from the prompt end and
-        replace the thinking body in the output with <think></think>, so future
-        prefix lookups find the right entry.
+        drop the entire thinking block from the output (including the \\n\\n
+        separator after </think>), keeping only the response token slice.
+        Working at the token level avoids re-encoding fragility: standalone
+        encode() can produce different token boundaries than the chat template
+        would for the same text embedded in context.
         """
         if not output_token_ids:
             return list(prompt_token_ids) + list(output_token_ids)
@@ -1340,21 +1343,48 @@ class Scheduler:
 
         stripped_prompt = list(prompt_token_ids[:-n_think_tokens])
 
-        # Compute truncated output: <think></think> + text after last </think>.
-        after_think = output_text.split("</think>")[-1]
-        truncated_text = "<think></think>" + after_think
-        try:
-            truncated_tokens = list(
-                self._actual_tokenizer.encode(truncated_text, add_special_tokens=False)
-            )
-        except Exception:
+        # Work at the token level to avoid re-encoding fragility (standalone
+        # encode() can produce different token boundaries than the chat template
+        # would when encoding the same text in context).
+        #
+        # Strategy: find the last </think> token sequence in output_token_ids,
+        # then skip any \n tokens that follow (the \n\n separator between
+        # </think> and the response is not part of the content the client
+        # receives, so it won't appear in the next request's history encoding).
+        think_end_ids = self._actual_tokenizer.encode(
+            "</think>", add_special_tokens=False
+        )
+        n_end = len(think_end_ids)
+        output_list = list(output_token_ids)
+
+        # Find last occurrence of the </think> token sequence.
+        last_pos = None
+        for i in range(len(output_list) - n_end, -1, -1):
+            if output_list[i : i + n_end] == think_end_ids:
+                last_pos = i
+                break
+
+        if last_pos is None:
             return list(prompt_token_ids) + list(output_token_ids)
 
+        # Advance past </think> and any immediately following newline tokens.
+        # \n → token 198; \n\n → single token 271 in Qwen3. Skip both.
+        response_start = last_pos + n_end
+        nl_token_set: set[int] = set()
+        for s in ("\n", "\n\n"):
+            ids = self._actual_tokenizer.encode(s, add_special_tokens=False)
+            if len(ids) == 1:
+                nl_token_set.add(ids[0])
+        while response_start < len(output_list) and output_list[response_start] in nl_token_set:
+            response_start += 1
+
+        response_tokens = output_list[response_start:]
         logger.debug(
             f"[thinking_cache_key] stripped {n_think_tokens} think-prefix tokens, "
-            f"compressed output from {len(output_token_ids)} to {len(truncated_tokens)} tokens"
+            f"dropped {response_start} output tokens (thinking+separator), "
+            f"kept {len(response_tokens)} response tokens"
         )
-        return stripped_prompt + truncated_tokens
+        return stripped_prompt + response_tokens
 
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
