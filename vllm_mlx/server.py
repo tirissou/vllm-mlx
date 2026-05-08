@@ -4607,12 +4607,29 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             await _release_engine_for_request(raw_request)
 
 
+def _strip_thinking(content: str) -> str:
+    """Strip <think>...</think> block from assistant message content.
+
+    Removes the thinking block so the chat template never sees thinking markers
+    in historical turns, making cache keys consistent regardless of whether the
+    client sends the full reasoning content or just the response.
+    """
+    idx = content.find("</think>")
+    if idx == -1:
+        return content
+    after = content[idx + len("</think>"):]
+    return after.lstrip("\n")
+
+
 def _normalize_messages(messages: list[dict]) -> list[dict]:
     """Normalize message roles and merge consecutive same-role messages.
 
     1. Maps non-standard roles to standard ones (e.g. ``developer`` -> ``system``).
     2. Merges consecutive same-role messages to satisfy chat template constraints
        (Qwen 3.5, Llama, etc. require alternating roles).
+    3. Strips <think>...</think> blocks from historical assistant messages so the
+       chat template always produces the same token sequence regardless of whether
+       the client includes thinking content in its history.
 
     Only merges when both messages have string content. Messages with list
     content (multimodal) are left as-is to preserve image/video attachments.
@@ -4652,14 +4669,27 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
             copy["role"] = role
             merged.append(copy)
 
+    # Strip thinking blocks from all assistant messages. The last message in
+    # the list is always from the user (the current turn), so all assistant
+    # messages here are historical and their thinking bodies are irrelevant.
+    thinking_stripped = 0
+    for msg in merged:
+        if msg["role"] == "assistant" and isinstance(msg.get("content"), str):
+            stripped = _strip_thinking(msg["content"])
+            if stripped != msg["content"]:
+                msg["content"] = stripped
+                thinking_stripped += 1
+
     mapped_roles = sum(1 for m in messages if m["role"] in _ROLE_MAP)
     merged_count = len(messages) - len(merged)
-    if mapped_roles or merged_count:
+    if mapped_roles or merged_count or thinking_stripped:
         parts = []
         if mapped_roles:
             parts.append(f"mapped {mapped_roles} role(s)")
         if merged_count:
             parts.append(f"merged {len(messages)} -> {len(merged)}")
+        if thinking_stripped:
+            parts.append(f"stripped thinking from {thinking_stripped} assistant message(s)")
         logger.info(f"Normalized messages: {', '.join(parts)}")
 
     return merged
