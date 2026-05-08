@@ -1260,15 +1260,6 @@ class Scheduler:
         """
         return self._actual_tokenizer.decode(token_ids)
 
-    def _template_truncates_thinking(self) -> bool:
-        """Return True if the tokenizer's chat template strips thinking from history."""
-        if not hasattr(self, "_template_truncates_thinking_cache"):
-            template = getattr(self._actual_tokenizer, "chat_template", None) or ""
-            self._template_truncates_thinking_cache = (
-                "truncate_history_thinking" in template
-            )
-        return self._template_truncates_thinking_cache
-
     def _build_thinking_cache_key(
         self, prompt_token_ids: List[int], output_token_ids: List[int]
     ) -> List[int]:
@@ -1281,13 +1272,16 @@ class Scheduler:
         The generation prefix appends <think>\\n to prompt_token_ids, so the raw
         key (prompt + output) has full thinking, but re-encoded requests don't.
 
-        When truncation is detected, we strip <think>\\n from the prompt end and
+        We detect this by two behavioral signals that are sufficient without
+        inspecting the template string (Qwen3's built-in template does not
+        expose a named flag):
+          1. The prompt tail ends with "<think>\\n" (template added the prefix).
+          2. The output contains "</think>" (thinking was completed).
+
+        When both signals fire, we strip <think>\\n from the prompt end and
         replace the thinking body in the output with <think></think>, so future
         prefix lookups find the right entry.
         """
-        if not self._template_truncates_thinking():
-            return list(prompt_token_ids) + list(output_token_ids)
-
         if not output_token_ids:
             return list(prompt_token_ids) + list(output_token_ids)
 
