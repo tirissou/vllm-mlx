@@ -103,6 +103,12 @@ class SchedulerConfig:
     ssd_cache_dir: Optional[str] = None  # None = disabled
     ssd_cache_max_gb: float = 10.0
 
+    # Debug: write every cache GET/PUT key (as JSON lines) to this file.
+    # Each line: {"ts": float, "op": "get"|"put", "request_id": str,
+    #             "n_tokens": int, "tokens": [int, ...]}.
+    # None = disabled.
+    cache_key_log_path: Optional[str] = None
+
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
 
@@ -1159,6 +1165,9 @@ class Scheduler:
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
 
+        # Optional path for cache-key debug logging.
+        self._cache_key_log_path: Optional[str] = self.config.cache_key_log_path
+
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
@@ -1259,6 +1268,25 @@ class Scheduler:
         Decode token IDs to text, handling both tokenizers and processors.
         """
         return self._actual_tokenizer.decode(token_ids)
+
+    def _log_cache_key(self, op: str, request_id: str, tokens: List[int]) -> None:
+        """Append a cache key event to _cache_key_log_path (if set)."""
+        path = getattr(self, "_cache_key_log_path", None)
+        if not path:
+            return
+        import json, time as _t
+        record = {
+            "ts": _t.time(),
+            "op": op,
+            "request_id": request_id,
+            "n_tokens": len(tokens),
+            "tokens": tokens,
+        }
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.debug(f"[cache_key_log] write failed: {e}")
 
     def _build_thinking_cache_key(
         self, prompt_token_ids: List[int], output_token_ids: List[int]
@@ -1870,6 +1898,7 @@ class Scheduler:
             _fetch_t0 = _time.monotonic()
             cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
             _fetch_dt = _time.monotonic() - _fetch_t0
+            self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
             request.cache_hit_type = self.memory_aware_cache._last_match_type
             if cache:
                 request.prompt_cache = cache
@@ -2346,6 +2375,7 @@ class Scheduler:
                             )
                             import time as _time
 
+                            self._log_cache_key("put", request_id, full_token_sequence)
                             _store_t0 = _time.monotonic()
                             stored = self.memory_aware_cache.store(
                                 full_token_sequence,

@@ -153,6 +153,7 @@ from .audio_limits import (
 )
 from .cli_arg_types import make_json_object_arg_parser
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .scheduler import SchedulerConfig
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
     resolve_stt_model_name,
@@ -6138,9 +6139,13 @@ def main():
     load_embedding_model(args.embedding_model, lock=True)
 
     # Load model before starting server
+    _scheduler_config = SchedulerConfig(
+        cache_key_log_path=args.cache_key_log,
+    ) if args.cache_key_log else None
     load_model(
         args.model,
         use_batching=args.continuous_batching,
+        scheduler_config=_scheduler_config,
         max_tokens=args.max_tokens,
         max_request_tokens=args.max_request_tokens,
         force_mllm=args.mllm,
@@ -6315,6 +6320,13 @@ Examples:
         type=int,
         default=DEFAULT_MAX_TTS_INPUT_CHARS,
         help="Maximum number of characters accepted by /v1/audio/speech (default: 4096)",
+    )
+    parser.add_argument(
+        "--cache-key-log",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Write every cache GET/PUT key as JSON lines to PATH (debug).",
     )
     return parser
 

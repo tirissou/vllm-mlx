@@ -255,6 +255,8 @@ def serve_command(args):
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
             # KV cache size limit
             max_kv_size=args.max_kv_size or 0,
+            # Debug
+            cache_key_log_path=getattr(args, "cache_key_log", None),
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -313,6 +315,10 @@ def serve_command(args):
         load_model_registry(args.models_config, defaults=defaults)
     else:
         # Load model with unified server
+        cache_key_log = getattr(args, "cache_key_log", None)
+        if cache_key_log and scheduler_config is None:
+            from .scheduler import SchedulerConfig
+            scheduler_config = SchedulerConfig(cache_key_log_path=cache_key_log)
         load_model(
             args.model,
             use_batching=args.continuous_batching,
@@ -1380,6 +1386,13 @@ Examples:
         "--offline",
         action="store_true",
         help="Offline mode — only use locally cached models",
+    )
+    serve_parser.add_argument(
+        "--cache-key-log",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Write every cache GET/PUT key as JSON lines to PATH (debug).",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
