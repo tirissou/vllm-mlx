@@ -422,6 +422,12 @@ class BlockAwarePrefixCache:
         # Maps hash(tokens[:block_size*n]) -> (tokens, block_ids)
         self._prefix_index: Dict[str, Tuple[List[int], List[int]]] = {}
 
+        # Non-block-aligned sequence lengths (terminal entries).
+        # Hybrid models (e.g. Qwen3-Next) store recurrent state only in the
+        # terminal partial block, so we must be able to look up these entries
+        # by exact length rather than rounding down to the nearest block.
+        self._terminal_lengths: set = set()
+
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
 
@@ -456,41 +462,20 @@ class BlockAwarePrefixCache:
         if not tokens:
             return None, tokens
 
-        # Try to find shared prefix blocks
-        shared_block_ids, remaining = self.paged_cache.find_shared_prefix(tokens)
+        # Collect candidates from both lookup paths and pick the longest.
+        # The prefix index can return terminal (non-block-aligned) matches
+        # that cover more tokens than the block-aligned find_shared_prefix —
+        # this is critical for hybrid recurrent+attention models where the
+        # recurrent state snapshot lives only in the terminal partial block.
+        shared_block_ids, _ = self.paged_cache.find_shared_prefix(tokens)
+        shared_len = len(shared_block_ids) * self.block_size
 
-        if shared_block_ids:
-            # Create block table for this request with shared blocks
-            block_table = self.paged_cache.create_block_table(request_id)
-            borrowed: set = self._borrowed_blocks.setdefault(request_id, set())
-
-            for block_id in shared_block_ids:
-                # Increment ref count for sharing; record as borrowed so
-                # release_cache can balance it without freeing owned blocks.
-                self.paged_cache.increment_ref(block_id)
-                borrowed.add(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
-                    block_table.num_tokens += block.token_count
-
-            num_prefix_tokens = len(tokens) - len(remaining)
-            self._hits += 1
-            self._tokens_saved += num_prefix_tokens
-
-            logger.debug(
-                f"Cache hit for {request_id}: "
-                f"{len(shared_block_ids)} blocks, {num_prefix_tokens} tokens"
-            )
-
-            return block_table, remaining
-
-        # Try prefix index for longer matches
         best_match = self._find_best_prefix_match(tokens)
-        if best_match:
-            matched_tokens, matched_block_ids = best_match
+        index_len = len(best_match[0]) if best_match else 0
 
-            # Fork the matched blocks
+        if index_len > shared_len:
+            # Prefix-index match is longer (e.g. terminal block present)
+            matched_tokens, matched_block_ids = best_match
             block_table = self.paged_cache.create_block_table(request_id)
             borrowed = self._borrowed_blocks.setdefault(request_id, set())
             for block_id in matched_block_ids:
@@ -501,13 +486,37 @@ class BlockAwarePrefixCache:
                     block_table.block_ids.append(block_id)
                     block_table.num_tokens += block.token_count
 
-            remaining = tokens[len(matched_tokens) :]
+            remaining = list(tokens[len(matched_tokens):])
             self._hits += 1
             self._tokens_saved += len(matched_tokens)
 
             logger.debug(
                 f"Prefix index hit for {request_id}: "
                 f"{len(matched_tokens)} tokens matched"
+            )
+
+            return block_table, remaining
+
+        if shared_block_ids:
+            # Block-aligned match
+            block_table = self.paged_cache.create_block_table(request_id)
+            borrowed: set = self._borrowed_blocks.setdefault(request_id, set())
+
+            for block_id in shared_block_ids:
+                self.paged_cache.increment_ref(block_id)
+                borrowed.add(block_id)
+                block = self.paged_cache.allocated_blocks.get(block_id)
+                if block:
+                    block_table.block_ids.append(block_id)
+                    block_table.num_tokens += block.token_count
+
+            remaining = list(tokens[shared_len:])
+            self._hits += 1
+            self._tokens_saved += shared_len
+
+            logger.debug(
+                f"Cache hit for {request_id}: "
+                f"{len(shared_block_ids)} blocks, {shared_len} tokens"
             )
 
             return block_table, remaining
@@ -1008,7 +1017,7 @@ class BlockAwarePrefixCache:
         best_match = None
         best_len = 0
 
-        # Try progressively longer prefixes
+        # Try block-aligned prefixes
         for num_blocks in range(1, len(tokens) // self.block_size + 1):
             prefix_len = num_blocks * self.block_size
             if prefix_len > len(tokens):
@@ -1023,6 +1032,22 @@ class BlockAwarePrefixCache:
                     best_match = (cached_tokens, block_ids)
                     best_len = len(cached_tokens)
 
+        # Also check terminal (non-block-aligned) entries.  For hybrid
+        # recurrent+attention models (e.g. Qwen3-Next/Qwen3.5) the recurrent
+        # state snapshot lives only in the terminal partial block, so a
+        # terminal match can reconstruct state that a block-aligned match
+        # cannot.
+        for stored_len in self._terminal_lengths:
+            if stored_len <= best_len or stored_len > len(tokens):
+                continue
+            prefix_tokens = tokens[:stored_len]
+            prefix_hash = self.paged_cache.compute_block_hash(prefix_tokens)
+            if prefix_hash in self._prefix_index:
+                cached_tokens, block_ids = self._prefix_index[prefix_hash]
+                if list(cached_tokens) == list(prefix_tokens):
+                    best_match = (cached_tokens, block_ids)
+                    best_len = stored_len
+
         return best_match
 
     def _update_prefix_index(
@@ -1031,12 +1056,16 @@ class BlockAwarePrefixCache:
         block_ids: List[int],
     ) -> None:
         """Update prefix index with new token sequence."""
-        # Index block-aligned prefixes
+        # Index block-aligned prefixes, plus the terminal entry when the
+        # last block is partial (non-block-aligned).
         for i in range(1, len(block_ids) + 1):
             prefix_len = min(i * self.block_size, len(tokens))
             prefix_tokens = tokens[:prefix_len]
             prefix_hash = self.paged_cache.compute_block_hash(prefix_tokens)
             self._prefix_index[prefix_hash] = (prefix_tokens, block_ids[:i])
+            if prefix_len < i * self.block_size:
+                # Terminal partial block: track its length for fast lookup
+                self._terminal_lengths.add(prefix_len)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
@@ -1065,6 +1094,7 @@ class BlockAwarePrefixCache:
         """Clear all cached data."""
         self._request_tables.clear()
         self._prefix_index.clear()
+        self._terminal_lengths.clear()
         self._borrowed_blocks.clear()
         self.paged_cache.clear()
         self.reset_stats()

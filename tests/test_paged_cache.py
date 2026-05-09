@@ -986,3 +986,98 @@ class TestBlockAwarePrefixCache:
             # Verify the reconstructed keys match what was stored
             assert layer.keys.tolist() == raw_cache[i].keys.tolist(), \
                 f"layer {i} keys mismatch"
+
+    def test_hybrid_model_terminal_block_match(self):
+        """Hybrid recurrent+attention models (e.g. Qwen3-Next) store recurrent
+        state only in the terminal partial block.  Prefix caching must find the
+        terminal block via _find_best_prefix_match so that reconstruct_cache can
+        recover the recurrent snapshot.
+
+        Scenario: request 1 stores N full blocks + 1 partial terminal block.
+        Request 2 starts with the same N+partial tokens (exact prefix of stored
+        sequence).  The terminal block must be included in the match.
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        block_size = 4
+        paged_manager = PagedCacheManager(block_size=block_size, max_blocks=100)
+        cache = BlockAwarePrefixCache(model=None, paged_cache_manager=paged_manager)
+
+        # Simulate a hybrid model: alternating KVCache and ArraysCache layers
+        # 8 tokens = 2 full blocks + 3-token partial terminal block (total 11 tokens)
+        total_tokens = 11
+        n_kv_heads = 2
+        head_dim = 4
+
+        # KVCache layer: 4D (1, H, L, D) — sliceable per block
+        kv_keys = mx.arange(1 * n_kv_heads * total_tokens * head_dim, dtype=mx.float32).reshape(
+            1, n_kv_heads, total_tokens, head_dim
+        )
+        kv_values = kv_keys * 2
+
+        kv_layer = KVCache()
+        kv_layer.keys = kv_keys
+        kv_layer.values = kv_values
+        kv_layer.offset = total_tokens
+
+        # ArraysCache layer: recurrent state — NOT sliceable (mixed 3D/4D shapes)
+        conv_state = mx.ones((1, 3, 8))    # 3D — conv buffer
+        ssm_state = mx.ones((1, 2, 3, 4))  # 4D — SSM state
+
+        arrays_layer = ArraysCache(size=2)
+        arrays_layer.cache = [conv_state, ssm_state]
+
+        extracted = [
+            {
+                "state": kv_layer.state,
+                "meta_state": kv_layer.meta_state,
+                "class_ref": KVCache,
+                "class_name": "KVCache",
+            },
+            {
+                "state": arrays_layer.state,
+                "meta_state": arrays_layer.meta_state,
+                "class_ref": ArraysCache,
+                "class_name": "ArraysCache",
+            },
+        ]
+
+        tokens = list(range(total_tokens))
+        block_table = cache.store_cache("req-1", tokens, extracted)
+        cache.release_cache("req-1")
+
+        # 2 full blocks + 1 partial = 3 block entries
+        assert block_table is not None
+        assert len(block_table.block_ids) == 3
+
+        # Request 2: same first 11 tokens + 2 new tokens
+        second_tokens = tokens + [999, 1000]
+        block_table2, remaining = cache.fetch_cache("req-2", second_tokens)
+
+        assert block_table2 is not None, \
+            "Expected cache hit including terminal block"
+        assert remaining == [999, 1000], \
+            f"Expected only the 2 new tokens remaining, got {remaining}"
+        assert block_table2.num_tokens == total_tokens, \
+            f"Expected {total_tokens} cached tokens, got {block_table2.num_tokens}"
+
+        reconstructed = cache.reconstruct_cache(block_table2)
+
+        assert reconstructed is not None, \
+            "reconstruct_cache must succeed when terminal block is included"
+        assert len(reconstructed) == 2
+
+        # KVCache layer: keys should cover all total_tokens
+        kv_out = reconstructed[0]
+        assert isinstance(kv_out, KVCache)
+        assert kv_out.keys.shape == (1, n_kv_heads, total_tokens, head_dim)
+
+        # ArraysCache layer: recurrent state should match the stored snapshot
+        arr_out = reconstructed[1]
+        assert isinstance(arr_out, ArraysCache)
+        assert arr_out.cache[0].tolist() == conv_state.tolist()
+        assert arr_out.cache[1].tolist() == ssm_state.tolist()
