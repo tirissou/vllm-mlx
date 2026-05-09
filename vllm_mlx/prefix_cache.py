@@ -367,6 +367,11 @@ class BlockCacheEntry:
     block_table: BlockTable
     cache_data: List[Any]  # Actual KV cache data per block
     last_access: float
+    borrowed_block_ids: "set[int]" = None  # block_ids with an extra ref owned by this request
+
+    def __post_init__(self):
+        if self.borrowed_block_ids is None:
+            self.borrowed_block_ids = set()
 
 
 class BlockAwarePrefixCache:
@@ -420,6 +425,12 @@ class BlockAwarePrefixCache:
         # Request to block table mapping
         self._request_tables: Dict[str, BlockCacheEntry] = {}
 
+        # Tracks block_ids for which this request holds an extra (borrow) ref.
+        # These are blocks that existed before this request (via fetch or dedup).
+        # Only borrowed refs are released on request cleanup; newly allocated
+        # blocks keep their single allocation ref as the cache's permanence ref.
+        self._borrowed_blocks: Dict[str, set] = {}
+
         # Statistics
         self._hits = 0
         self._misses = 0
@@ -451,10 +462,13 @@ class BlockAwarePrefixCache:
         if shared_block_ids:
             # Create block table for this request with shared blocks
             block_table = self.paged_cache.create_block_table(request_id)
+            borrowed: set = self._borrowed_blocks.setdefault(request_id, set())
 
             for block_id in shared_block_ids:
-                # Increment ref count for sharing
+                # Increment ref count for sharing; record as borrowed so
+                # release_cache can balance it without freeing owned blocks.
                 self.paged_cache.increment_ref(block_id)
+                borrowed.add(block_id)
                 block = self.paged_cache.allocated_blocks.get(block_id)
                 if block:
                     block_table.block_ids.append(block_id)
@@ -478,8 +492,10 @@ class BlockAwarePrefixCache:
 
             # Fork the matched blocks
             block_table = self.paged_cache.create_block_table(request_id)
+            borrowed = self._borrowed_blocks.setdefault(request_id, set())
             for block_id in matched_block_ids:
                 self.paged_cache.increment_ref(block_id)
+                borrowed.add(block_id)
                 block = self.paged_cache.allocated_blocks.get(block_id)
                 if block:
                     block_table.block_ids.append(block_id)
@@ -564,8 +580,12 @@ class BlockAwarePrefixCache:
             if len(block_tokens) == self.block_size:
                 existing_block = self.paged_cache.find_cached_block(block_tokens)
                 if existing_block:
-                    # Reuse existing block
+                    # Reuse existing block; track the borrow so release_cache
+                    # can balance the increment without freeing the block.
                     self.paged_cache.increment_ref(existing_block.block_id)
+                    self._borrowed_blocks.setdefault(request_id, set()).add(
+                        existing_block.block_id
+                    )
                     block_table.block_ids.append(existing_block.block_id)
                     block_table.num_tokens += len(block_tokens)
                     continue
@@ -580,12 +600,6 @@ class BlockAwarePrefixCache:
                 block = self.paged_cache.allocate_block()
                 if not block:
                     break
-
-            # Increment ref so the block survives the request-level release
-            # that balances this increment when the request finishes.
-            # This separates the "cache permanence" ref (ref=1, from allocate_block)
-            # from the "request holds it" ref (this increment).
-            self.paged_cache.increment_ref(block.block_id)
 
             # Store block data
             block.token_count = len(block_tokens)
@@ -808,13 +822,22 @@ class BlockAwarePrefixCache:
         """
         Release cache blocks for a completed request.
 
-        Args:
-            request_id: Request identifier
+        Only borrowed refs (blocks that existed before this request) are
+        decremented. Newly allocated blocks keep their single allocation ref
+        as the cache's permanence ref and remain accessible for future hits.
         """
-        entry = self._request_tables.pop(request_id, None)
-        if entry:
-            self.paged_cache.delete_block_table(request_id)
-            logger.debug(f"Released cache for {request_id}")
+        self._request_tables.pop(request_id, None)
+        # Remove block table entry from paged_cache without freeing blocks.
+        # We only release the extra refs that this request borrowed.
+        with self.paged_cache._lock:
+            self.paged_cache.request_tables.pop(request_id, None)
+
+        borrowed = self._borrowed_blocks.pop(request_id, set())
+        for block_id in borrowed:
+            self.paged_cache.free_block(block_id)
+
+        if borrowed:
+            logger.debug(f"Released {len(borrowed)} borrowed block refs for {request_id}")
 
     def fork_cache(
         self,
@@ -1037,6 +1060,7 @@ class BlockAwarePrefixCache:
         """Clear all cached data."""
         self._request_tables.clear()
         self._prefix_index.clear()
+        self._borrowed_blocks.clear()
         self.paged_cache.clear()
         self.reset_stats()
 
