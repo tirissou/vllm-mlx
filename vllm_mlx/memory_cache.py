@@ -407,6 +407,7 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
             ):
                 tc.keys = keys[..., :new_offset, :]
                 tc.values = values[..., :new_offset, :]
+                eval_targets.extend([tc.keys, tc.values])
             else:
                 tc.keys = keys
                 tc.values = values
