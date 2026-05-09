@@ -1791,91 +1791,9 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
-        # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
-            # Use paged cache
-            block_table, remaining = self.block_aware_cache.fetch_cache(
-                request.request_id,
-                request.prompt_token_ids,
-            )
-            if block_table and block_table.num_tokens > 0:
-                request.cache_hit_type = "hit"
-                # Reconstruct actual KVCache objects from stored tensor data
-                reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
-                if reconstructed:
-                    request.prompt_cache = reconstructed
-                    request.block_table = block_table
-                    request.cached_tokens = block_table.num_tokens
-                    request.shared_prefix_blocks = len(block_table.block_ids)
-                    request.remaining_tokens = remaining
-                    logger.debug(
-                        f"Request {request.request_id}: paged cache hit, "
-                        f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks, "
-                        f"{len(remaining)} tokens remaining, cache reconstructed"
-                    )
-                else:
-                    # Reconstruction failed, treat as cache miss
-                    request.cache_hit_type = "miss"
-                    request.remaining_tokens = request.prompt_token_ids
-                    logger.debug(
-                        f"Request {request.request_id}: paged cache reconstruction failed"
-                    )
-            else:
-                request.cache_hit_type = "miss"
-                request.remaining_tokens = request.prompt_token_ids
-        elif self.memory_aware_cache is not None:
-            # Use memory-aware prefix cache
-            import time as _time
-
-            _fetch_t0 = _time.monotonic()
-            cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
-            _fetch_dt = _time.monotonic() - _fetch_t0
-            self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
-            request.cache_hit_type = self.memory_aware_cache._last_match_type
-            if cache:
-                request.prompt_cache = cache
-                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
-                request.remaining_tokens = remaining
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} HIT "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"cached={request.cached_tokens} remaining={len(remaining)} "
-                    f"time={_fetch_dt:.3f}s"
-                )
-            else:
-                request.remaining_tokens = request.prompt_token_ids
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} MISS "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
-                )
-                # Check SSD tier for cold-tier hit
-                if self._ssd_tier is not None:
-                    ssd_candidate = self.memory_aware_cache.check_ssd(
-                        request.prompt_token_ids
-                    )
-                    if ssd_candidate is not None:
-                        request.cache_hit_type = "ssd_pending"
-                        request._ssd_candidate = ssd_candidate
-        elif self.prefix_cache is not None:
-            # Use legacy prefix cache
-            cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
-            if cache:
-                request.cache_hit_type = "hit"
-                request.prompt_cache = cache
-                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
-                request.remaining_tokens = remaining
-                logger.debug(
-                    f"Request {request.request_id}: cache hit, "
-                    f"{request.cached_tokens} tokens cached, "
-                    f"{len(remaining)} tokens remaining"
-                )
-            else:
-                request.cache_hit_type = "miss"
-                request.remaining_tokens = request.prompt_token_ids
-        else:
-            request.cache_hit_type = "miss"
-            request.remaining_tokens = request.prompt_token_ids
+        # Cache fetch is deferred to _schedule_waiting() on the worker thread
+        # to avoid MLX stream/thread mismatches (lazy ops must stay on the
+        # thread that will evaluate them).
 
         # Add to tracking
         self.requests[request.request_id] = request
@@ -1987,6 +1905,175 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
+    def _fetch_cache_for_request(self, request: Request) -> None:
+        """Fetch cached KV state for request.
+
+        Must be called on the worker thread — all MLX ops (dequantize,
+        reconstruct/concat) are lazy and must be enqueued on the same
+        stream that will later evaluate them inside BatchGenerator.
+        """
+        import time as _time
+
+        if self.block_aware_cache is not None:
+            block_table, remaining = self.block_aware_cache.fetch_cache(
+                request.request_id,
+                request.prompt_token_ids,
+            )
+            if block_table and block_table.num_tokens > 0:
+                reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
+                if reconstructed:
+                    request.cache_hit_type = "hit"
+                    request.prompt_cache = reconstructed
+                    request.block_table = block_table
+                    request.cached_tokens = block_table.num_tokens
+                    request.shared_prefix_blocks = len(block_table.block_ids)
+                    request.remaining_tokens = remaining
+                    logger.info(
+                        f"[paged_cache] request={request.request_id[:12]} HIT "
+                        f"cached={request.cached_tokens} remaining={len(remaining)} "
+                        f"blocks={request.shared_prefix_blocks}"
+                    )
+                else:
+                    request.cache_hit_type = "miss"
+                    request.remaining_tokens = request.prompt_token_ids
+                    # Release the refs incremented by fetch_cache for this failed hit
+                    self.block_aware_cache.release_cache(request.request_id)
+                    logger.info(
+                        f"[paged_cache] request={request.request_id[:12]} MISS "
+                        f"(reconstruct failed for {len(block_table.block_ids)} blocks)"
+                    )
+            else:
+                request.cache_hit_type = "miss"
+                request.remaining_tokens = request.prompt_token_ids
+                logger.info(
+                    f"[paged_cache] request={request.request_id[:12]} MISS "
+                    f"prompt_tokens={len(request.prompt_token_ids)}"
+                )
+
+        elif self.memory_aware_cache is not None:
+            _fetch_t0 = _time.monotonic()
+            cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
+            _fetch_dt = _time.monotonic() - _fetch_t0
+            self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
+            request.cache_hit_type = self.memory_aware_cache._last_match_type
+            if cache:
+                request.prompt_cache = cache
+                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
+                request.remaining_tokens = remaining
+                logger.info(
+                    f"[cache_fetch] request={request.request_id[:12]} HIT "
+                    f"prompt_tokens={len(request.prompt_token_ids)} "
+                    f"cached={request.cached_tokens} remaining={len(remaining)} "
+                    f"time={_fetch_dt:.3f}s"
+                )
+            else:
+                request.remaining_tokens = request.prompt_token_ids
+                logger.info(
+                    f"[cache_fetch] request={request.request_id[:12]} MISS "
+                    f"prompt_tokens={len(request.prompt_token_ids)} "
+                    f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
+                )
+                if self._ssd_tier is not None:
+                    ssd_candidate = self.memory_aware_cache.check_ssd(
+                        request.prompt_token_ids
+                    )
+                    if ssd_candidate is not None:
+                        request.cache_hit_type = "ssd_pending"
+                        request._ssd_candidate = ssd_candidate
+
+        elif self.prefix_cache is not None:
+            cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
+            if cache:
+                request.cache_hit_type = "hit"
+                request.prompt_cache = cache
+                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
+                request.remaining_tokens = remaining
+                logger.debug(
+                    f"Request {request.request_id}: cache hit, "
+                    f"{request.cached_tokens} tokens cached, "
+                    f"{len(remaining)} tokens remaining"
+                )
+            else:
+                request.cache_hit_type = "miss"
+                request.remaining_tokens = request.prompt_token_ids
+
+        else:
+            request.cache_hit_type = "miss"
+            request.remaining_tokens = request.prompt_token_ids
+
+    def _try_promote_ssd_for_request(self, request: Request) -> None:
+        """Attempt synchronous SSD promotion for a single request tagged ssd_pending.
+
+        Called from _schedule_waiting() after _fetch_cache_for_request() detects
+        an SSD candidate. Sets request.prompt_cache and remaining_tokens on success.
+        """
+        candidate = getattr(request, "_ssd_candidate", None)
+        if candidate is None:
+            return
+
+        memory_bytes = candidate["memory_bytes"]
+
+        if self.memory_aware_cache is None:
+            request.cache_hit_type = "miss"
+            return
+
+        if not self.memory_aware_cache.try_reserve_memory(memory_bytes):
+            self._ssd_tier._stats.promotion_failures += 1
+            request.cache_hit_type = "miss"
+            logger.info(
+                f"[ssd_promote] request={request.request_id[:12]} "
+                f"budget denied ({memory_bytes} bytes)"
+            )
+            return
+
+        matched_count = candidate["matched_tokens"]
+        matched_tokens = tuple(request.prompt_token_ids[:matched_count])
+
+        try:
+            cache_layers = self._ssd_tier._read_entry(
+                matched_tokens, candidate["file_path"]
+            )
+        except Exception:
+            self.memory_aware_cache.release_reserved_memory(memory_bytes)
+            self._ssd_tier._stats.promotion_failures += 1
+            request.cache_hit_type = "miss"
+            logger.exception(
+                f"[ssd_promote] request={request.request_id[:12]} disk read failed"
+            )
+            return
+
+        if cache_layers is None:
+            self.memory_aware_cache.release_reserved_memory(memory_bytes)
+            self._ssd_tier._stats.promotion_failures += 1
+            request.cache_hit_type = "miss"
+            return
+
+        self.memory_aware_cache.release_reserved_memory(memory_bytes)
+
+        reconstructed = self._reconstruct_ssd_layers(cache_layers)
+        if reconstructed is None:
+            request.cache_hit_type = "miss"
+            return
+
+        self.memory_aware_cache.store(
+            list(matched_tokens), reconstructed, evict_prefixes=False
+        )
+
+        request.prompt_cache = reconstructed
+        request.cached_tokens = matched_count
+        request.remaining_tokens = request.prompt_token_ids[matched_count:]
+        request.cache_hit_type = "ssd_hit"
+
+        self._ssd_tier._stats.ssd_hits += 1
+        self._ssd_tier._index.touch(matched_tokens)
+
+        logger.info(
+            f"[ssd_promote] request={request.request_id[:12]} "
+            f"{candidate.get('match_type', 'exact')} promote: "
+            f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
+            f"{len(request.remaining_tokens)} remaining"
+        )
+
     def _schedule_waiting(self) -> List[Request]:
         """
         Move requests from waiting queue to running.
@@ -1994,16 +2081,18 @@ class Scheduler:
         Returns:
             List of requests that were scheduled
         """
-        # Attempt synchronous SSD promotion for any ssd_pending requests
-        # before scheduling. This keeps SSD I/O out of fetch() while
-        # avoiding engine modifications.
-        if self._ssd_tier is not None:
-            self._try_promote_ssd_pending()
 
         scheduled = []
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
+
+            # Fetch cache on the worker thread so all MLX ops (dequantize,
+            # reconstruct) are enqueued on the correct stream.
+            if request.remaining_tokens is None:
+                self._fetch_cache_for_request(request)
+                if getattr(request, "cache_hit_type", None) == "ssd_pending":
+                    self._try_promote_ssd_for_request(request)
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -2276,17 +2365,23 @@ class Scheduler:
                                 full_token_sequence,
                                 request._extracted_cache,
                             )
-                            logger.debug(
-                                f"Stored paged cache for request {request_id} "
-                                f"({len(full_token_sequence)} tokens: {len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output)"
+                            logger.info(
+                                f"[paged_cache] request={request_id[:12]} STORED "
+                                f"{len(full_token_sequence)} tokens "
+                                f"({len(request.prompt_token_ids)} prompt + "
+                                f"{len(request.output_token_ids)} output)"
                             )
                         except Exception as e:
-                            logger.debug(
-                                f"Failed to store paged cache for {request_id}: {e}"
+                            logger.warning(
+                                f"[paged_cache] request={request_id[:12]} store failed: {e}"
                             )
-                    # NOTE: Do NOT call release_cache here - blocks should persist
-                    # for future requests to share. The LRU eviction will clean up
-                    # unused blocks when under memory pressure.
+                    # Release the request's block references so blocks can be
+                    # shared and eventually evicted. Blocks survive because
+                    # store_cache increments their ref beyond the base alloc ref.
+                    try:
+                        self.block_aware_cache.release_cache(request_id)
+                    except Exception as e:
+                        logger.debug(f"[paged_cache] release_cache failed for {request_id}: {e}")
 
                 elif self.memory_aware_cache is not None:
                     # Keep mid-prefill entry as prefix cache for future
@@ -2984,21 +3079,23 @@ class Scheduler:
             request.cache_hit_type = "miss"
             return False
 
-        # Store in RAM cache under the matched prefix tokens
+        # Store in RAM cache — the worker thread will fetch it via the normal
+        # cache lookup in _fetch_cache_for_request(), avoiding any cross-thread
+        # MLX stream dependency.
         self.memory_aware_cache.store(
             list(matched_tokens), reconstructed, evict_prefixes=False
         )
 
-        request.prompt_cache = reconstructed
-        request.cached_tokens = matched_count
-        request.remaining_tokens = request.prompt_token_ids[matched_count:]
-        request.cache_hit_type = "ssd_hit"
+        # Clear the SSD candidate so the worker thread doesn't re-promote.
+        request._ssd_candidate = None
+        request.cache_hit_type = "miss"
 
+        remaining_count = len(request.prompt_token_ids) - matched_count
         logger.info(
             f"[ssd_promote] request={request.request_id[:12]} "
-            f"{candidate.get('match_type', 'exact')} promote: "
-            f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
-            f"{len(request.remaining_tokens)} remaining"
+            f"{candidate.get('match_type', 'exact')} async promote: "
+            f"{matched_count}/{len(request.prompt_token_ids)} tokens stored to RAM, "
+            f"{remaining_count} remaining"
         )
         return True
 

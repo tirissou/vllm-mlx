@@ -581,6 +581,12 @@ class BlockAwarePrefixCache:
                 if not block:
                     break
 
+            # Increment ref so the block survives the request-level release
+            # that balances this increment when the request finishes.
+            # This separates the "cache permanence" ref (ref=1, from allocate_block)
+            # from the "request holds it" ref (this increment).
+            self.paged_cache.increment_ref(block.block_id)
+
             # Store block data
             block.token_count = len(block_tokens)
             block_table.block_ids.append(block.block_id)

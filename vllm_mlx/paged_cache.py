@@ -650,6 +650,12 @@ class PagedCacheManager:
             block.ref_count -= 1
 
             if block.ref_count <= 0:
+                # Clean up legacy hash entry to prevent stale lookups after reuse
+                if block.hash_value is not None:
+                    if self.hash_to_block.get(block.hash_value) == block_id:
+                        del self.hash_to_block[block.hash_value]
+                    block.hash_value = None
+
                 # Remove from allocated
                 del self.allocated_blocks[block_id]
 

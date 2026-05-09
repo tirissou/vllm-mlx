@@ -504,6 +504,7 @@ class _QuantizedCacheWrapper:
 
         self.keys = mx.quantize(layer.keys, group_size=group_size, bits=bits)
         self.values = mx.quantize(layer.values, group_size=group_size, bits=bits)
+        mx.eval(self.keys, self.values)
         self.offset = layer.offset
         self.bits = bits
         self.group_size = group_size
