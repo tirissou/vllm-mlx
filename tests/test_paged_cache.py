@@ -910,3 +910,79 @@ class TestBlockAwarePrefixCache:
         recon_b = cache.reconstruct_cache(bt_b)
         assert recon_b is not None
         assert recon_b[1].state[0].tolist() == recurrent_b[0].tolist()
+
+    def test_full_pipeline_4d_kvcache(self):
+        """End-to-end: 4D KVCache (from BatchKVCache.extract) → store → fetch → reconstruct.
+
+        This covers the standard production path for Qwen3 and other models
+        that use KVCache with shape (1, n_kv_heads, seq_len, head_dim).
+        """
+        import mlx.core as mx
+        from mlx_lm.models.cache import BatchKVCache, KVCache
+
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        block_size = 64
+        n_layers = 4
+        n_kv_heads = 8
+        seq_len = 128  # 2 full blocks
+        head_dim = 16
+
+        paged_manager = PagedCacheManager(block_size=block_size, max_blocks=100)
+        cache = BlockAwarePrefixCache(model=None, paged_cache_manager=paged_manager)
+
+        # Simulate what BatchKVCache.extract(idx) produces: shape (1, H, L, D)
+        raw_cache = []
+        for _ in range(n_layers):
+            kv = KVCache()
+            kv.keys = mx.random.normal((1, n_kv_heads, seq_len, head_dim))
+            kv.values = mx.random.normal((1, n_kv_heads, seq_len, head_dim))
+            kv.offset = seq_len
+            raw_cache.append(kv)
+
+        # Simulate _extract_cache_states (as done in the scheduler)
+        extracted = [
+            {
+                "state": layer.state,
+                "meta_state": layer.meta_state,
+                "class_ref": KVCache,
+                "class_name": "KVCache",
+            }
+            for layer in raw_cache
+        ]
+
+        tokens = list(range(seq_len))
+        block_table = cache.store_cache("req-1", tokens, extracted)
+
+        assert block_table is not None
+        assert len(block_table.block_ids) == 2
+        assert block_table.num_tokens == seq_len
+
+        # All blocks should have tensor data
+        for bid in block_table.block_ids:
+            block = paged_manager.allocated_blocks[bid]
+            assert block.cache_data is not None, f"block {bid} has no cache_data"
+
+        cache.release_cache("req-1")
+
+        # Second request with the same prefix + extra tokens
+        second_tokens = tokens + [999, 1000]
+        block_table2, remaining = cache.fetch_cache("req-2", second_tokens)
+
+        assert block_table2 is not None, "Expected a cache hit on the shared prefix"
+        assert remaining == [999, 1000]
+
+        reconstructed = cache.reconstruct_cache(block_table2)
+
+        assert reconstructed is not None, "reconstruct_cache returned None"
+        assert len(reconstructed) == n_layers
+
+        for i, layer in enumerate(reconstructed):
+            assert isinstance(layer, KVCache), f"layer {i} is {type(layer)}"
+            assert layer.keys is not None
+            assert layer.keys.shape == (1, n_kv_heads, seq_len, head_dim), \
+                f"layer {i} keys shape {layer.keys.shape}"
+            # Verify the reconstructed keys match what was stored
+            assert layer.keys.tolist() == raw_cache[i].keys.tolist(), \
+                f"layer {i} keys mismatch"

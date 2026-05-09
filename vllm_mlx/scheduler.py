@@ -1688,10 +1688,16 @@ class Scheduler:
                         }
                     )
             except Exception as e:
-                logger.debug(f"Failed to extract state from cache layer: {e}")
+                logger.warning(f"Failed to extract state from cache layer {len(extracted)}/{len(raw_cache)} "
+                               f"(type={type(layer_cache).__name__}): {e}")
                 continue
 
-        return extracted if len(extracted) == len(raw_cache) else []
+        if len(extracted) != len(raw_cache):
+            logger.warning(
+                f"_extract_cache_states partial: {len(extracted)}/{len(raw_cache)} layers succeeded"
+            )
+            return []
+        return extracted
 
     def _reconstruct_cache_from_states(
         self, extracted_states: List[Dict[str, Any]]
@@ -2320,15 +2326,28 @@ class Scheduler:
                                 extracted_cache = self._extract_cache_states(raw_cache)
                                 if extracted_cache:
                                     request._extracted_cache = extracted_cache
-                                    logger.debug(
-                                        f"Extracted {len(extracted_cache)} layer states "
-                                        f"for request {request_id}"
+                                    logger.info(
+                                        f"[paged_cache] request={request_id[:12]} "
+                                        f"EXTRACTED {len(extracted_cache)} layers "
+                                        f"(type={type(raw_cache[0]).__name__})"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[paged_cache] request={request_id[:12]} "
+                                        f"EXTRACT FAILED raw_cache={len(raw_cache)} layers "
+                                        f"(type={type(raw_cache[0]).__name__ if raw_cache else 'empty'})"
                                     )
                             else:
                                 # Standard cache stores object references
                                 request._extracted_cache = raw_cache
+                        else:
+                            if self.block_aware_cache is not None:
+                                logger.info(
+                                    f"[paged_cache] request={request_id[:12]} "
+                                    f"no prompt_cache on finished response"
+                                )
                     except Exception as e:
-                        logger.debug(f"Failed to extract cache for {request_id}: {e}")
+                        logger.warning(f"[paged_cache] request={request_id[:12]} extract exception: {e}")
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1

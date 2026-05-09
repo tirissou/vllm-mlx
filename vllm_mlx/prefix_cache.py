@@ -617,6 +617,11 @@ class BlockAwarePrefixCache:
                         f"Stored tensor slice for block {block.block_id}: "
                         f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
                     )
+                else:
+                    logger.warning(
+                        f"[paged_cache] block {block.block_id} slice FAILED "
+                        f"tokens [{global_start}:{global_end}] of {len(tokens)}"
+                    )
 
             # Register hash for full blocks (for deduplication)
             if len(block_tokens) == self.block_size:
