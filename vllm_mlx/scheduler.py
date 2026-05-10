@@ -2045,15 +2045,15 @@ class Scheduler:
                         # so the store pass knows which segments are already in the trie.
                         request.cached_tokens = 0
                         request.remaining_tokens = request.prompt_token_ids
-                    logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request_id}")
+                    logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request.request_id}")
                 else:
                     request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
-                    logger.info(f"[turn_cache] MISS for {request_id}")
+                    logger.info(f"[turn_cache] MISS for {request.request_id}")
             else:
                 request.cache_hit_type = "miss"
                 request.remaining_tokens = request.prompt_token_ids
-                logger.info(f"[turn_cache] MISS (no segments) for {request_id}")
+                logger.info(f"[turn_cache] MISS (no segments) for {request.request_id}")
 
         elif self.prefix_cache is not None:
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
