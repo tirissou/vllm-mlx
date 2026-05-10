@@ -136,23 +136,36 @@ class TurnPrefixCache:
                 node.last_used = time.time()
                 return node
 
-            # Compute tokens_since_checkpoint from nearest permanent checkpoint ancestor
             if parent.is_permanent_checkpoint:
                 tokens_since = len(segment.token_ids)
             else:
                 tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
+
+            is_permanent = is_system_prompt or (
+                self.config.checkpoint_stride == 0
+                or tokens_since >= self.config.checkpoint_stride
+            )
 
             node = TurnNode(
                 token_ids=segment.token_ids,
                 context_hash=h,
                 kv_arrays=kv_arrays,
                 kv_scales=kv_scales,
-                recurrent_state=recurrent_state,  # temp checkpoint (leaf)
-                tokens_since_checkpoint=tokens_since,
+                recurrent_state=recurrent_state,
+                tokens_since_checkpoint=tokens_since if not is_permanent else 0,
                 parent=parent,
-                is_permanent_checkpoint=False,
+                is_permanent_checkpoint=is_permanent,
             )
             parent.children[h] = node
+
+            # Prune parent's temp recurrent state if parent just became an inner node
+            # and its recurrent state was only a temp (leaf) checkpoint.
+            if (
+                len(parent.children) == 1          # parent just got its first child
+                and not parent.is_permanent_checkpoint
+                and parent is not self.root
+            ):
+                parent.recurrent_state = None
 
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
