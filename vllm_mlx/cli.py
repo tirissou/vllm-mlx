@@ -236,6 +236,11 @@ def serve_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # Turn cache options
+            use_turn_cache=args.use_turn_cache,
+            turn_cache_stride=args.turn_cache_stride,
+            turn_cache_memory_gb=args.turn_cache_memory_gb,
+            turn_cache_ssd_gb=args.turn_cache_ssd_gb,
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
             # MTP
@@ -283,6 +288,12 @@ def serve_command(args):
                 )
         elif enable_prefix_cache:
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
+        if args.use_turn_cache:
+            print(
+                f"Turn cache: stride={args.turn_cache_stride} tokens, "
+                f"memory={args.turn_cache_memory_gb}GB"
+                + (f", SSD={args.turn_cache_ssd_gb}GB" if args.turn_cache_ssd_gb > 0 else "")
+            )
     else:
         print("Mode: Simple (maximum throughput)")
         if args.enable_mtp:
@@ -488,6 +499,11 @@ def bench_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # Turn cache options
+            use_turn_cache=args.use_turn_cache,
+            turn_cache_stride=args.turn_cache_stride,
+            turn_cache_memory_gb=args.turn_cache_memory_gb,
+            turn_cache_ssd_gb=args.turn_cache_ssd_gb,
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -1138,6 +1154,35 @@ Examples:
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
     )
+    serve_parser.add_argument(
+        "--use-turn-cache",
+        action="store_true",
+        default=False,
+        help="Enable TurnPrefixCache (conversation-turn-level prefix trie). "
+             "Recommended for hybrid models (Qwen3.5-27B, etc.).",
+    )
+    serve_parser.add_argument(
+        "--turn-cache-stride",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Tokens between permanent recurrent checkpoints in TurnPrefixCache. "
+             "0 = checkpoint every turn (eager). Default: 512.",
+    )
+    serve_parser.add_argument(
+        "--turn-cache-memory-gb",
+        type=float,
+        default=8.0,
+        metavar="GB",
+        help="RAM budget in GB for TurnPrefixCache KV data. Default: 8.0.",
+    )
+    serve_parser.add_argument(
+        "--turn-cache-ssd-gb",
+        type=float,
+        default=0.0,
+        metavar="GB",
+        help="SSD budget in GB for TurnPrefixCache cold tier. 0 = disabled.",
+    )
     # Chunked prefill
     serve_parser.add_argument(
         "--chunked-prefill-tokens",
@@ -1489,6 +1534,35 @@ Examples:
         type=int,
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
+    )
+    bench_parser.add_argument(
+        "--use-turn-cache",
+        action="store_true",
+        default=False,
+        help="Enable TurnPrefixCache (conversation-turn-level prefix trie). "
+             "Recommended for hybrid models (Qwen3.5-27B, etc.).",
+    )
+    bench_parser.add_argument(
+        "--turn-cache-stride",
+        type=int,
+        default=512,
+        metavar="N",
+        help="Tokens between permanent recurrent checkpoints in TurnPrefixCache. "
+             "0 = checkpoint every turn (eager). Default: 512.",
+    )
+    bench_parser.add_argument(
+        "--turn-cache-memory-gb",
+        type=float,
+        default=8.0,
+        metavar="GB",
+        help="RAM budget in GB for TurnPrefixCache KV data. Default: 8.0.",
+    )
+    bench_parser.add_argument(
+        "--turn-cache-ssd-gb",
+        type=float,
+        default=0.0,
+        metavar="GB",
+        help="SSD budget in GB for TurnPrefixCache cold tier. 0 = disabled.",
     )
 
     # Detokenizer benchmark
