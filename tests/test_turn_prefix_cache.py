@@ -235,3 +235,47 @@ def test_release_all_nodes_in_path():
     cache.release(path)
     assert n1.ref_count == 0
     assert n2.ref_count == 0
+
+
+def test_find_checkpoint_ancestor_returns_self_if_has_recurrent():
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+    n = cache.insert(cache.root, seg([1]), [], [], state)
+    path = [n]
+    ancestor = cache.find_checkpoint_ancestor(path)
+    assert ancestor is n
+
+
+def test_find_checkpoint_ancestor_walks_up():
+    cache = make_cache(stride=10000)
+    state = mx.zeros((1,))
+    # sys node: permanent checkpoint (is_system_prompt=True)
+    n_sys = cache.insert(cache.root, seg(list(range(50)), role="system"),
+                          [], [], state, is_system_prompt=True)
+    # user node: not a checkpoint (stride not met, temp gets pruned after child added)
+    n_user = cache.insert(n_sys, seg([100, 101]), [], [], state)
+    # asst node: not a checkpoint, prunes n_user's temp recurrent
+    n_asst = cache.insert(n_user, seg([200]), [], [], state)
+    # n_user's recurrent was pruned; n_sys still has permanent recurrent
+    assert n_user.recurrent_state is None
+    path = [n_sys, n_user, n_asst]
+    ancestor = cache.find_checkpoint_ancestor(path)
+    assert ancestor is n_sys
+
+
+def test_find_checkpoint_ancestor_returns_none_when_no_checkpoint():
+    cache = make_cache(stride=10000)
+    # No state stored, stride too high → no permanent checkpoints (except root which isn't in path)
+    n = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    ancestor = cache.find_checkpoint_ancestor([n])
+    assert ancestor is None
+
+
+def test_find_checkpoint_ancestor_returns_leaf_if_leaf_has_recurrent():
+    cache = make_cache(stride=10000)
+    state = mx.zeros((1,))
+    n = cache.insert(cache.root, seg([1]), [], [], state)
+    # n is a leaf → has temp recurrent
+    assert n.recurrent_state is not None
+    ancestor = cache.find_checkpoint_ancestor([n])
+    assert ancestor is n

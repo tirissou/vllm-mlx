@@ -193,3 +193,23 @@ class TurnPrefixCache:
         with self._lock:
             for node in path:
                 node.ref_count = max(0, node.ref_count - 1)
+
+    def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode | None:
+        """Return the deepest node in path that has a recurrent state, or None.
+
+        Prioritizes permanent checkpoints over temporary leaf states when searching
+        backward through the path.
+        """
+        # First pass: look for deepest permanent checkpoint with recurrent state
+        for node in reversed(path):
+            if (node.is_permanent_checkpoint and
+                node.recurrent_state is not None and
+                not isinstance(node.recurrent_state, SSDRef)):
+                return node
+
+        # Fallback: if no permanent checkpoint found, return deepest node with recurrent state
+        for node in reversed(path):
+            if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
+                return node
+
+        return None
