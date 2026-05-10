@@ -326,59 +326,60 @@ class TurnPrefixCache:
         """)
         conn.execute("DELETE FROM nodes")
 
-        stack = list(self.root.children.values())
-        i = 0
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children.values())
+        with self._lock:
+            stack = list(self.root.children.values())
+            i = 0
+            while stack:
+                node = stack.pop()
+                stack.extend(node.children.values())
 
-            kv_path = os.path.join(persist_dir, f"kv_{i}.safetensors")
-            rec_path: str | None = None
+                kv_path = os.path.join(persist_dir, f"kv_{i}.safetensors")
+                rec_path: str | None = None
 
-            if isinstance(node.kv_arrays, list) and node.kv_arrays:
-                tensors: dict[str, np.ndarray] = {}
-                for j, arr in enumerate(node.kv_arrays):
-                    # Convert to float32 if bfloat16 to avoid numpy conversion issues
-                    if arr.dtype == mx.bfloat16:
-                        arr = arr.astype(mx.float32)
-                    tensors[f"kv_{j}"] = np.array(arr)
-                    if node.kv_scales:
-                        tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
-                tmp = kv_path + ".tmp"
-                st_save(tensors, tmp)
-                os.replace(tmp, kv_path)
-
-            if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
-                rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
-                tensors = {}
-                state = node.recurrent_state
-                items = state if isinstance(state, (list, tuple)) else [state]
-                for k, item in enumerate(items):
-                    sub = item if isinstance(item, (list, tuple)) else [item]
-                    for m, arr in enumerate(sub):
+                if isinstance(node.kv_arrays, list) and node.kv_arrays:
+                    tensors: dict[str, np.ndarray] = {}
+                    for j, arr in enumerate(node.kv_arrays):
                         # Convert to float32 if bfloat16 to avoid numpy conversion issues
-                        if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                        if arr.dtype == mx.bfloat16:
                             arr = arr.astype(mx.float32)
-                        tensors[f"r_{k}_{m}"] = np.array(arr)
-                tmp = rec_path + ".tmp"
-                st_save(tensors, tmp)
-                os.replace(tmp, rec_path)
+                        tensors[f"kv_{j}"] = np.array(arr)
+                        if node.kv_scales:
+                            tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
+                    tmp = kv_path + ".tmp"
+                    st_save(tensors, tmp)
+                    os.replace(tmp, kv_path)
 
-            parent_hash = node.parent.context_hash if node.parent is not None else 0
-            conn.execute(
-                "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    node.context_hash,
-                    parent_hash,
-                    np.array(node.token_ids, dtype=np.int32).tobytes(),
-                    kv_path,
-                    rec_path,
-                    node.last_used,
-                    node.tokens_since_checkpoint,
-                    int(node.is_permanent_checkpoint),
-                ),
-            )
-            i += 1
+                if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
+                    rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
+                    tensors = {}
+                    state = node.recurrent_state
+                    items = state if isinstance(state, (list, tuple)) else [state]
+                    for k, item in enumerate(items):
+                        sub = item if isinstance(item, (list, tuple)) else [item]
+                        for m, arr in enumerate(sub):
+                            # Convert to float32 if bfloat16 to avoid numpy conversion issues
+                            if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                                arr = arr.astype(mx.float32)
+                            tensors[f"r_{k}_{m}"] = np.array(arr)
+                    tmp = rec_path + ".tmp"
+                    st_save(tensors, tmp)
+                    os.replace(tmp, rec_path)
+
+                parent_hash = node.parent.context_hash if node.parent is not None else 0
+                conn.execute(
+                    "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        node.context_hash,
+                        parent_hash,
+                        np.array(node.token_ids, dtype=np.int32).tobytes(),
+                        kv_path,
+                        rec_path,
+                        node.last_used,
+                        node.tokens_since_checkpoint,
+                        int(node.is_permanent_checkpoint),
+                    ),
+                )
+                i += 1
 
         conn.commit()
         conn.close()
@@ -434,7 +435,28 @@ class TurnPrefixCache:
             if rec_path and os.path.exists(rec_path):
                 try:
                     tensors = st_load(rec_path)
-                    recurrent_state = tensors  # kept as dict for now
+                    # Reconstruct nested structure from r_k_m keys
+                    state_dict = {}
+                    max_k = -1
+                    for key in tensors.keys():
+                        if key.startswith("r_"):
+                            parts = key.split("_")
+                            k = int(parts[1])
+                            max_k = max(max_k, k)
+
+                    if max_k >= 0:
+                        state_list = []
+                        for k in range(max_k + 1):
+                            layer_list = []
+                            m = 0
+                            while f"r_{k}_{m}" in tensors:
+                                layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
+                                m += 1
+                            if layer_list:
+                                state_list.append(layer_list if len(layer_list) > 1 else layer_list[0])
+                        recurrent_state = state_list if len(state_list) > 1 else (state_list[0] if state_list else None)
+                    else:
+                        recurrent_state = None
                 except Exception as e:
                     logger.warning(f"[turn_cache] recurrent load failed for {ctx_hash}: {e}")
 
@@ -450,15 +472,16 @@ class TurnPrefixCache:
             )
             hash_to_node[ctx_hash] = node
 
-        # Link parent→child
-        for row in rows:
-            ctx_hash, parent_hash = row[0], row[1]
-            if ctx_hash not in hash_to_node:
-                continue
-            node = hash_to_node[ctx_hash]
-            parent = hash_to_node.get(parent_hash, self.root)
-            node.parent = parent
-            parent.children[ctx_hash] = node
-            self._memory_bytes += _node_data_bytes(node)
-            if node.is_evictable:
-                heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+        # Link parent→child INSIDE lock (modifies shared state)
+        with self._lock:
+            for row in rows:
+                ctx_hash, parent_hash = row[0], row[1]
+                if ctx_hash not in hash_to_node:
+                    continue
+                node = hash_to_node[ctx_hash]
+                parent = hash_to_node.get(parent_hash, self.root)
+                node.parent = parent
+                parent.children[ctx_hash] = node
+                self._memory_bytes += _node_data_bytes(node)
+                if node.is_evictable:
+                    heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
