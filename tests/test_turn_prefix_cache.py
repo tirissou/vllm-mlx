@@ -2,6 +2,7 @@ import pytest
 import mlx.core as mx
 from vllm_mlx.turn_prefix_cache import (
     Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, _context_hash, _node_data_bytes,
+    _quantize_kv, _dequantize_kv,
 )
 
 
@@ -361,3 +362,43 @@ def test_evicted_node_removed_from_parent_children():
     h = node.context_hash
     cache._evict_if_needed()
     assert h not in cache.root.children
+
+
+def test_quantize_roundtrip_within_tolerance():
+    arr = mx.array([[0.5, -0.3, 0.8, -1.2, 0.0, 1.0, -1.0, 0.25]], dtype=mx.bfloat16)
+    q, scales = _quantize_kv([arr])
+    restored = _dequantize_kv(q, scales)
+    diff = mx.abs(restored[0].astype(mx.float32) - arr.astype(mx.float32))
+    # Max quantization error <= range/127 ≈ 2/127 ≈ 0.016 for this data
+    assert mx.max(diff).item() < 0.02
+
+
+def test_quantize_preserves_sign():
+    arr = mx.array([-1.0, 0.0, 1.0], dtype=mx.bfloat16)
+    q, scales = _quantize_kv([arr])
+    restored = _dequantize_kv(q, scales)
+    assert restored[0][0].item() < 0
+    assert restored[0][2].item() > 0
+
+
+def test_quantize_zero_array():
+    arr = mx.zeros((4, 4), dtype=mx.bfloat16)
+    q, scales = _quantize_kv([arr])
+    restored = _dequantize_kv(q, scales)
+    assert mx.max(mx.abs(restored[0])).item() == 0.0
+
+
+def test_insert_quantizes_when_kv_dtype_int8():
+    cache = make_cache(stride=512, kv_dtype="int8")
+    kv = [mx.ones((1, 4, 3, 256), dtype=mx.bfloat16)]
+    node = cache.insert(cache.root, seg([1, 2, 3]), kv, None, None)
+    assert node.kv_arrays is not None
+    assert node.kv_arrays[0].dtype == mx.int8
+    assert node.kv_scales is not None
+
+
+def test_insert_skips_quantization_when_bf16():
+    cache = make_cache(stride=512, kv_dtype="bf16")
+    kv = [mx.ones((1, 4, 3, 256), dtype=mx.bfloat16)]
+    node = cache.insert(cache.root, seg([1, 2, 3]), kv, [1.0], None)
+    assert node.kv_arrays[0].dtype == mx.bfloat16

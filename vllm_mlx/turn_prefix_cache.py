@@ -103,6 +103,32 @@ def _node_data_bytes(node: TurnNode) -> int:
     return total
 
 
+def _quantize_kv(
+    kv_arrays: list[mx.array],
+) -> tuple[list[mx.array], list[float]]:
+    """Quantize bf16 KV arrays to int8 with per-tensor scale."""
+    quantized: list[mx.array] = []
+    scales: list[float] = []
+    for arr in kv_arrays:
+        arr_f32 = arr.astype(mx.float32)
+        max_val = mx.max(mx.abs(arr_f32)).item()
+        scale = max_val / 127.0 if max_val > 0 else 1.0
+        q = mx.clip(mx.round(arr_f32 / scale), -127, 127).astype(mx.int8)
+        quantized.append(q)
+        scales.append(scale)
+    return quantized, scales
+
+
+def _dequantize_kv(
+    kv_int8: list[mx.array], scales: list[float]
+) -> list[mx.array]:
+    """Dequantize int8 KV arrays back to bf16."""
+    return [
+        (arr.astype(mx.float32) * scale).astype(mx.bfloat16)
+        for arr, scale in zip(kv_int8, scales)
+    ]
+
+
 class TurnPrefixCache:
     def __init__(self, config: TurnPrefixCacheConfig) -> None:
         self.config = config
@@ -146,11 +172,17 @@ class TurnPrefixCache:
                 or tokens_since >= self.config.checkpoint_stride
             )
 
+            # Quantize KV if configured
+            stored_kv = kv_arrays
+            stored_scales = kv_scales
+            if self.config.kv_dtype == "int8" and kv_arrays:
+                stored_kv, stored_scales = _quantize_kv(kv_arrays)
+
             node = TurnNode(
                 token_ids=segment.token_ids,
                 context_hash=h,
-                kv_arrays=kv_arrays,
-                kv_scales=kv_scales,
+                kv_arrays=stored_kv,
+                kv_scales=stored_scales,
                 recurrent_state=recurrent_state,
                 tokens_since_checkpoint=tokens_since if not is_permanent else 0,
                 parent=parent,
