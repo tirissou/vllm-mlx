@@ -298,3 +298,167 @@ class TurnPrefixCache:
         """Evict LRU leaves until memory is within budget."""
         with self._lock:
             self._evict_if_needed_unlocked()
+
+    # ── Disk persistence ───────────────────────────────────────────────────
+
+    def save(self, persist_dir: str) -> None:
+        """Save all trie nodes to persist_dir (SQLite index + per-node safetensors)."""
+        from safetensors.numpy import save_file as st_save
+
+        os.makedirs(persist_dir, exist_ok=True)
+        meta = {"version": _CACHE_FORMAT_VERSION, "model_fingerprint": ""}
+        with open(os.path.join(persist_dir, "meta.json"), "w") as f:
+            json.dump(meta, f)
+
+        db_path = os.path.join(persist_dir, "turn_cache_index.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                context_hash INTEGER PRIMARY KEY,
+                parent_hash INTEGER,
+                token_ids_blob BLOB NOT NULL,
+                kv_file_path TEXT NOT NULL,
+                recurrent_file_path TEXT,
+                last_used REAL NOT NULL,
+                tokens_since_checkpoint INTEGER NOT NULL,
+                is_permanent_checkpoint INTEGER NOT NULL
+            )
+        """)
+        conn.execute("DELETE FROM nodes")
+
+        stack = list(self.root.children.values())
+        i = 0
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+
+            kv_path = os.path.join(persist_dir, f"kv_{i}.safetensors")
+            rec_path: str | None = None
+
+            if isinstance(node.kv_arrays, list) and node.kv_arrays:
+                tensors: dict[str, np.ndarray] = {}
+                for j, arr in enumerate(node.kv_arrays):
+                    # Convert to float32 if bfloat16 to avoid numpy conversion issues
+                    if arr.dtype == mx.bfloat16:
+                        arr = arr.astype(mx.float32)
+                    tensors[f"kv_{j}"] = np.array(arr)
+                    if node.kv_scales:
+                        tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
+                tmp = kv_path + ".tmp"
+                st_save(tensors, tmp)
+                os.replace(tmp, kv_path)
+
+            if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
+                rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
+                tensors = {}
+                state = node.recurrent_state
+                items = state if isinstance(state, (list, tuple)) else [state]
+                for k, item in enumerate(items):
+                    sub = item if isinstance(item, (list, tuple)) else [item]
+                    for m, arr in enumerate(sub):
+                        # Convert to float32 if bfloat16 to avoid numpy conversion issues
+                        if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                            arr = arr.astype(mx.float32)
+                        tensors[f"r_{k}_{m}"] = np.array(arr)
+                tmp = rec_path + ".tmp"
+                st_save(tensors, tmp)
+                os.replace(tmp, rec_path)
+
+            parent_hash = node.parent.context_hash if node.parent is not None else 0
+            conn.execute(
+                "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    node.context_hash,
+                    parent_hash,
+                    np.array(node.token_ids, dtype=np.int32).tobytes(),
+                    kv_path,
+                    rec_path,
+                    node.last_used,
+                    node.tokens_since_checkpoint,
+                    int(node.is_permanent_checkpoint),
+                ),
+            )
+            i += 1
+
+        conn.commit()
+        conn.close()
+
+    def load(self, persist_dir: str) -> None:
+        """Load trie from persist_dir. Silently ignores missing/corrupt files."""
+        from safetensors.numpy import load_file as st_load
+
+        meta_path = os.path.join(persist_dir, "meta.json")
+        if not os.path.exists(meta_path):
+            return
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get("version") != _CACHE_FORMAT_VERSION:
+            logger.warning(
+                f"[turn_cache] version mismatch: disk={meta.get('version')} "
+                f"expected={_CACHE_FORMAT_VERSION} — starting empty"
+            )
+            return
+
+        db_path = os.path.join(persist_dir, "turn_cache_index.db")
+        if not os.path.exists(db_path):
+            return
+
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("SELECT * FROM nodes").fetchall()
+        conn.close()
+
+        # Build hash→node map in one pass
+        hash_to_node: dict[int, TurnNode] = {0: self.root}
+        for row in rows:
+            (ctx_hash, parent_hash, tok_blob, kv_path, rec_path,
+             last_used, tokens_since, is_perm) = row
+
+            token_ids = list(np.frombuffer(tok_blob, dtype=np.int32))
+
+            kv_arrays: list[mx.array] = []
+            kv_scales: list[float] = []
+            if os.path.exists(kv_path):
+                try:
+                    tensors = st_load(kv_path)
+                    j = 0
+                    while f"kv_{j}" in tensors:
+                        kv_arrays.append(mx.array(tensors[f"kv_{j}"]))
+                        if f"scale_{j}" in tensors:
+                            kv_scales.append(float(tensors[f"scale_{j}"][0]))
+                        j += 1
+                except Exception as e:
+                    logger.warning(f"[turn_cache] skipping node {ctx_hash}: {e}")
+                    continue
+
+            recurrent_state = None
+            if rec_path and os.path.exists(rec_path):
+                try:
+                    tensors = st_load(rec_path)
+                    recurrent_state = tensors  # kept as dict for now
+                except Exception as e:
+                    logger.warning(f"[turn_cache] recurrent load failed for {ctx_hash}: {e}")
+
+            node = TurnNode(
+                token_ids=token_ids,
+                context_hash=ctx_hash,
+                kv_arrays=kv_arrays or None,
+                kv_scales=kv_scales or None,
+                recurrent_state=recurrent_state,
+                tokens_since_checkpoint=tokens_since,
+                is_permanent_checkpoint=bool(is_perm),
+                last_used=last_used,
+            )
+            hash_to_node[ctx_hash] = node
+
+        # Link parent→child
+        for row in rows:
+            ctx_hash, parent_hash = row[0], row[1]
+            if ctx_hash not in hash_to_node:
+                continue
+            node = hash_to_node[ctx_hash]
+            parent = hash_to_node.get(parent_hash, self.root)
+            node.parent = parent
+            parent.children[ctx_hash] = node
+            self._memory_bytes += _node_data_bytes(node)
+            if node.is_evictable:
+                heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))

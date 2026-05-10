@@ -1,5 +1,8 @@
 import pytest
 import mlx.core as mx
+import json
+import tempfile
+from pathlib import Path
 from vllm_mlx.turn_prefix_cache import (
     Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, _context_hash, _node_data_bytes,
     _quantize_kv, _dequantize_kv,
@@ -402,3 +405,42 @@ def test_insert_skips_quantization_when_bf16():
     kv = [mx.ones((1, 4, 3, 256), dtype=mx.bfloat16)]
     node = cache.insert(cache.root, seg([1, 2, 3]), kv, [1.0], None)
     assert node.kv_arrays[0].dtype == mx.bfloat16
+
+
+def test_save_and_load_roundtrip(tmp_path):
+    cache = make_cache(stride=0)
+    state = mx.zeros((2, 3))
+    seg1 = seg(list(range(10)), role="system")
+    kv = [mx.ones((1, 4, 10, 16), dtype=mx.bfloat16)]
+    node = cache.insert(cache.root, seg1, kv, None, state, is_system_prompt=True)
+
+    cache.save(str(tmp_path))
+
+    cache2 = make_cache(stride=0)
+    cache2.load(str(tmp_path))
+    path, has_recurrent = cache2.match([seg1])
+    assert len(path) == 1
+    assert has_recurrent
+
+
+def test_load_version_mismatch(tmp_path):
+    meta = {"version": 9999, "model_fingerprint": "test"}
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    cache = make_cache()
+    cache.load(str(tmp_path))  # must not raise
+    assert len(cache.root.children) == 0  # starts empty
+
+
+def test_load_missing_kv_file_skips_node(tmp_path):
+    cache = make_cache(stride=0)
+    kv = [mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)]
+    cache.insert(cache.root, seg([1, 2, 3]), kv, None, None)
+    cache.save(str(tmp_path))
+
+    # Delete the KV file
+    for f in tmp_path.glob("kv_*.safetensors"):
+        f.unlink()
+        break
+
+    cache2 = make_cache(stride=0)
+    cache2.load(str(tmp_path))  # must not raise
