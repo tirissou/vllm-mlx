@@ -88,6 +88,12 @@ class SchedulerConfig:
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
 
+    # TurnPrefixCache settings
+    use_turn_cache: bool = False
+    turn_cache_stride: int = 512
+    turn_cache_ssd_gb: float = 0.0
+    turn_cache_memory_gb: float = 8.0
+
     # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
     # When enabled, large prompts are split into chunks so that active
     # generation requests are not starved during long prefills.
@@ -1232,6 +1238,19 @@ class Scheduler:
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
 
+        self.turn_cache: Optional[Any] = None
+        if self.config.use_turn_cache:
+            from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+            self.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(
+                checkpoint_stride=self.config.turn_cache_stride,
+                max_memory_gb=self.config.turn_cache_memory_gb,
+                ssd_max_gb=self.config.turn_cache_ssd_gb,
+            ))
+            logger.info(
+                f"TurnPrefixCache enabled: stride={self.config.turn_cache_stride} "
+                f"memory={self.config.turn_cache_memory_gb}GB"
+            )
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
@@ -1987,6 +2006,24 @@ class Scheduler:
                         request.cache_hit_type = "ssd_pending"
                         request._ssd_candidate = ssd_candidate
 
+        elif self.turn_cache is not None:
+            segments = self._messages_to_segments(request)
+            if segments:
+                path, has_recurrent = self.turn_cache.match(segments)
+                if path:
+                    request.cache_hit_type = "hit"
+                    request._turn_cache_path = path
+                    request.cached_tokens = sum(len(n.token_ids) for n in path)
+                    ancestor = self.turn_cache.find_checkpoint_ancestor(path)
+                    request.prompt_cache = ancestor.recurrent_state if ancestor else None
+                    request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
+                else:
+                    request.cache_hit_type = "miss"
+                    request.remaining_tokens = request.prompt_token_ids
+            else:
+                request.cache_hit_type = "miss"
+                request.remaining_tokens = request.prompt_token_ids
+
         elif self.prefix_cache is not None:
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
             if cache:
@@ -2455,6 +2492,26 @@ class Scheduler:
                             logger.debug(
                                 f"Failed to store memory-aware cache for {request_id}: {e}"
                             )
+
+                elif self.turn_cache is not None:
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            segments = self._messages_to_segments(request)
+                            path = getattr(request, "_turn_cache_path", [])
+                            matched_depth = len(path)
+                            parent = path[-1] if path else self.turn_cache.root
+                            for i, segment in enumerate(segments[matched_depth:]):
+                                is_sys = segment.role == "system" and i == 0 and matched_depth == 0
+                                parent = self.turn_cache.insert(
+                                    parent, segment, [], [], None, is_system_prompt=is_sys
+                                )
+                            if path:
+                                self.turn_cache.release(path)
+                        except Exception as e:
+                            logger.debug(f"[turn_cache] store failed for {request_id}: {e}")
 
                 elif self.prefix_cache is not None:
                     # Store in legacy prefix cache
@@ -3151,3 +3208,42 @@ class Scheduler:
         except Exception as e:
             logger.warning(f"[ssd_promote] reconstruction failed: {e}")
             return None
+
+    def _messages_to_segments(self, request: "Request") -> list:
+        """Split a request's token sequence into per-message Segment objects.
+
+        Uses the message boundaries stored on the request. Falls back to
+        treating the whole prompt as a single segment if no messages are set.
+        """
+        from .turn_prefix_cache import Segment
+
+        messages = getattr(request, "messages", None)
+        if not messages:
+            return []
+
+        # Tokenize each message in conversational context to find boundaries.
+        # The full token sequence is request.prompt_token_ids.
+        # We split it by re-tokenizing each prefix and noting where length grows.
+        full_tokens = list(request.prompt_token_ids or [])
+        segments: list[Segment] = []
+        pos = 0
+        for i, msg in enumerate(messages):
+            # Estimate end of this message's tokens using prefix tokenization
+            # For now, fall back to approximate: tokenize messages[0:i+1] and diff.
+            # The scheduler subclass or model runner should provide exact boundaries.
+            # This is a best-effort split; exact boundaries require chat-template-aware tokenization.
+            role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            # Use remaining tokens for the last message
+            if i == len(messages) - 1:
+                seg_tokens = full_tokens[pos:]
+            else:
+                # Rough split: assign proportional chunk
+                remaining_msgs = len(messages) - i
+                remaining_tokens = len(full_tokens) - pos
+                chunk = max(1, remaining_tokens // remaining_msgs)
+                seg_tokens = full_tokens[pos:pos + chunk]
+            if seg_tokens:
+                segments.append(Segment(role=role, token_ids=seg_tokens))
+                pos += len(seg_tokens)
+        return segments

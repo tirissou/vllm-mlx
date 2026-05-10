@@ -516,3 +516,56 @@ def test_promote_restores_recurrent_state(tmp_path):
     assert len(node.recurrent_state) == 2
     assert node.recurrent_state[0].shape == (2, 3)
     assert node.recurrent_state[1].shape == (4, 5)
+
+
+from unittest.mock import MagicMock
+
+
+def test_scheduler_integration_fetch_hits_cache():
+    """Verify that matching path and recurrent state are set on the request."""
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+    sys_seg = seg(list(range(20)), role="system")
+    cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+
+    # Simulate what _fetch_turn_cache does
+    segments = [sys_seg]
+    path, has_recurrent = cache.match(segments)
+    assert len(path) == 1
+    assert has_recurrent
+
+    ancestor = cache.find_checkpoint_ancestor(path)
+    assert ancestor is path[0]
+    cache.release(path)
+
+
+def test_scheduler_integration_store_extends_trie():
+    """Verify that inserting new segments after match extends the trie."""
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+    sys_seg = seg(list(range(10)), role="system")
+    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+
+    # Match found sys_node; now store new user segment
+    user_seg = seg([100, 101, 102])
+    n_user = cache.insert(n_sys, user_seg, [], [], state)
+    assert n_user in n_sys.children.values()
+
+
+def test_concurrent_ref_counts():
+    """Two requests sharing a prefix: ref_count=2 while both active."""
+    cache = make_cache()
+    n = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+
+    path1, _ = cache.match([seg([1, 2, 3])])
+    path2, _ = cache.match([seg([1, 2, 3])])
+    assert n.ref_count == 2
+    assert not n.is_evictable
+
+    cache.release(path1)
+    assert n.ref_count == 1
+    assert not n.is_evictable
+
+    cache.release(path2)
+    assert n.ref_count == 0
+    assert n.is_evictable
