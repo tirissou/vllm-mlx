@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 from vllm_mlx.turn_prefix_cache import (
-    Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, _context_hash, _node_data_bytes,
+    Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, TurnPrefixCache, _context_hash, _node_data_bytes,
     _quantize_kv, _dequantize_kv,
 )
 
@@ -569,3 +569,39 @@ def test_concurrent_ref_counts():
     cache.release(path2)
     assert n.ref_count == 0
     assert n.is_evictable
+
+
+def test_scheduler_stores_and_serves_cache():
+    """Verify that segments are stored and served correctly in a realistic flow."""
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    state = mx.zeros((1,))
+
+    # Session 1: Build the cache
+    sys_seg = seg(list(range(10)), role="system")
+    user_seg = seg([100, 101])
+
+    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+    n_user = cache.insert(n_sys, user_seg, [], [], state)
+
+    # Verify nodes were created
+    assert n_sys is not None
+    assert n_user is not None
+    assert n_user.parent is n_sys
+
+    # Session 2: Same prefix should hit both segments
+    path, has_recurrent = cache.match([sys_seg, user_seg])
+    assert len(path) == 2
+    assert path[0] is n_sys
+    assert path[1] is n_user
+    assert has_recurrent  # leaf has temp recurrent
+
+    # Release and verify can be used again
+    cache.release(path)
+    assert path[0].ref_count == 0
+    assert path[1].ref_count == 0
+
+    # Session 3: Partial match should work
+    path_partial, _ = cache.match([sys_seg])
+    assert len(path_partial) == 1
+    assert path_partial[0] is n_sys
+    cache.release(path_partial)

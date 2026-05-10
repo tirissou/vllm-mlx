@@ -2017,12 +2017,15 @@ class Scheduler:
                     ancestor = self.turn_cache.find_checkpoint_ancestor(path)
                     request.prompt_cache = ancestor.recurrent_state if ancestor else None
                     request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
+                    logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request_id}")
                 else:
                     request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
+                    logger.info(f"[turn_cache] MISS for {request_id}")
             else:
                 request.cache_hit_type = "miss"
                 request.remaining_tokens = request.prompt_token_ids
+                logger.info(f"[turn_cache] MISS (no segments) for {request_id}")
 
         elif self.prefix_cache is not None:
             cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
@@ -2503,6 +2506,10 @@ class Scheduler:
                             path = getattr(request, "_turn_cache_path", [])
                             matched_depth = len(path)
                             parent = path[-1] if path else self.turn_cache.root
+                            # Store segment structure for prefix matching and recurrent state.
+                            # Note: KV arrays are currently passed as empty ([]) for MVP.
+                            # Future enhancement: extract and store actual KV tensors from
+                            # model inference results to enable KV cache reuse on hits.
                             for i, segment in enumerate(segments[matched_depth:]):
                                 is_sys = segment.role == "system" and i == 0 and matched_depth == 0
                                 parent = self.turn_cache.insert(
@@ -3233,7 +3240,6 @@ class Scheduler:
             # The scheduler subclass or model runner should provide exact boundaries.
             # This is a best-effort split; exact boundaries require chat-template-aware tokenization.
             role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
             # Use remaining tokens for the last message
             if i == len(messages) - 1:
                 seg_tokens = full_tokens[pos:]
