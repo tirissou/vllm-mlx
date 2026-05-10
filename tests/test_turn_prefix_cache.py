@@ -961,3 +961,75 @@ def test_mid_prefill_does_not_store_state_away_from_boundary_past_interval():
     cb(uid=1, processed_tokens=15, prompt_cache=mock_cache)
 
     assert req._sys_prompt_state is None, "_sys_prompt_state should not be set away from boundary"
+
+
+def _make_extracted_state(n_layers=2, n_tokens=10):
+    """Build a list of dicts in _extract_cache_states format."""
+    from mlx_lm.models.cache import KVCache
+    return [
+        {
+            "state": (mx.zeros([1, 4, n_tokens, 32]), mx.zeros([1, 4, n_tokens, 32])),
+            "meta_state": (str(n_tokens),),
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        }
+        for _ in range(n_layers)
+    ]
+
+
+def test_store_side_sets_recurrent_state_on_system_segment():
+    """After generation, system segment node gets recurrent_state from _sys_prompt_state."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.block_aware_cache = None
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
+    user_state = _make_extracted_state(n_layers=2, n_tokens=15)
+
+    req = MagicMock()
+    req.prompt_token_ids = sys_tokens + user_tokens
+    req.prefix_boundary = 10
+    req._sys_prompt_state = sys_state
+    req._extracted_cache = [_MockKVLayer(15), _MockKVLayer(15)]  # live objects for user seg
+    req._turn_cache_path = []
+
+    # Call _messages_to_segments and then simulate the store loop
+    segments = sched._messages_to_segments(req)
+    assert len(segments) == 2
+
+    parent = cache.root
+    new_segments = segments  # matched_depth=0, so all segments are new
+    for i, segment in enumerate(new_segments):
+        is_sys = segment.role == "system" and i == 0
+        if is_sys:
+            state = getattr(req, "_sys_prompt_state", None)
+        elif i == len(new_segments) - 1:
+            ec = req._extracted_cache
+            if isinstance(ec, list) and ec and isinstance(ec[0], dict):
+                state = ec
+            else:
+                state = sched._extract_cache_states(ec)
+        else:
+            state = None
+        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
+
+    # System node should have _sys_prompt_state
+    sys_node = list(cache.root.children.values())[0]
+    assert sys_node.recurrent_state is not None
+    assert isinstance(sys_node.recurrent_state, list)
+    assert isinstance(sys_node.recurrent_state[0], dict)
+
+    # User node should have extracted state from _extracted_cache
+    user_node = list(sys_node.children.values())[0]
+    assert user_node.recurrent_state is not None
+    assert isinstance(user_node.recurrent_state, list)
+    assert isinstance(user_node.recurrent_state[0], dict)

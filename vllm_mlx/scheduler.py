@@ -2525,14 +2525,21 @@ class Scheduler:
                             path = getattr(request, "_turn_cache_path", [])
                             matched_depth = len(path)
                             parent = path[-1] if path else self.turn_cache.root
-                            # Store segment structure for prefix matching and recurrent state.
-                            # Note: KV arrays are currently passed as empty ([]) for MVP.
-                            # Future enhancement: extract and store actual KV tensors from
-                            # model inference results to enable KV cache reuse on hits.
-                            for i, segment in enumerate(segments[matched_depth:]):
+                            new_segments = segments[matched_depth:]
+                            for i, segment in enumerate(new_segments):
                                 is_sys = segment.role == "system" and i == 0 and matched_depth == 0
+                                if is_sys:
+                                    state = getattr(request, "_sys_prompt_state", None)
+                                elif i == len(new_segments) - 1:
+                                    ec = request._extracted_cache
+                                    if isinstance(ec, list) and ec and isinstance(ec[0], dict):
+                                        state = ec
+                                    else:
+                                        state = self._extract_cache_states(ec)
+                                else:
+                                    state = None
                                 parent = self.turn_cache.insert(
-                                    parent, segment, [], [], None, is_system_prompt=is_sys
+                                    parent, segment, [], [], state, is_system_prompt=is_sys
                                 )
                             if path:
                                 self.turn_cache.release(path)
