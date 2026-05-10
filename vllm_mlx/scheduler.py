@@ -2599,6 +2599,14 @@ class Scheduler:
                         if not callable(keys_attr) and not callable(values_attr):
                             mx.eval(keys_attr, values_attr)
 
+            # Evaluate sys_prompt_state tensors (defensive: mid_prefill already evaluates
+            # chunked cache, but guard against any unevaluated lazy tensors)
+            sys_state = getattr(request, "_sys_prompt_state", None) if request is not None else None
+            if sys_state and isinstance(sys_state, list):
+                for layer_dict in sys_state:
+                    if isinstance(layer_dict, dict) and "state" in layer_dict:
+                        mx.eval(*layer_dict["state"])
+
             # Release all cache references on the request so Metal buffers
             # can be freed.  The prefix cache (if any) holds its own copy;
             # keeping a second reference here pins the buffers in wired memory
