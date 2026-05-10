@@ -1216,3 +1216,77 @@ def test_save_load_legacy_ssm_format_unchanged():
         and loaded_node.recurrent_state
         and isinstance(loaded_node.recurrent_state[0], dict)
     )
+
+
+def test_cross_session_system_prompt_cache_hit_with_real_state():
+    """Full path: session 1 stores sys state; session 2 fetches it and skips sys prefill.
+
+    Simulates:
+      Session 1: full prefill of [sys_tokens + user_hi], mid_prefill captures sys state,
+                 store side inserts both segments with real recurrent_state.
+      Session 2: same sys_tokens, different user_yo → trie HIT on sys node,
+                 request.prompt_cache is non-None, cached_tokens == len(sys_tokens).
+    """
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.block_aware_cache = None
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(20))
+    user_hi = [100, 101]
+    user_yo = [200, 201]
+
+    # --- Session 1 store ---
+    sys_state = _make_extracted_state(n_layers=2, n_tokens=len(sys_tokens))
+    user_state = _make_extracted_state(n_layers=2, n_tokens=len(sys_tokens) + len(user_hi))
+
+    req1 = MagicMock()
+    req1.prompt_token_ids = sys_tokens + user_hi
+    req1.prefix_boundary = len(sys_tokens)
+    req1._sys_prompt_state = sys_state
+    req1._turn_cache_path = []
+
+    segs1 = sched._messages_to_segments(req1)
+    parent = cache.root
+    for i, segment in enumerate(segs1):
+        is_sys = segment.role == "system" and i == 0
+        state = sys_state if is_sys else user_state
+        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
+
+    # --- Session 2 fetch ---
+    req2 = MagicMock()
+    req2.prompt_token_ids = sys_tokens + user_yo
+    req2.prefix_boundary = len(sys_tokens)
+    req2.request_id = "session2"
+
+    segs2 = sched._messages_to_segments(req2)
+    path, has_recurrent = cache.match(segs2)
+
+    assert path, "Expected trie HIT on system segment"
+    ancestor = cache.find_checkpoint_ancestor(path)
+    assert ancestor is not None, "Expected a checkpoint ancestor with recurrent_state"
+
+    raw_state = ancestor.recurrent_state
+    assert isinstance(raw_state, list) and isinstance(raw_state[0], dict)
+
+    reconstructed = sched._reconstruct_cache_from_states(raw_state)
+    assert reconstructed is not None, "Reconstruction failed"
+
+    # Simulate what scheduler sets on the request
+    req2.prompt_cache = reconstructed
+    req2.cached_tokens = sum(len(n.token_ids) for n in path)
+    req2.remaining_tokens = req2.prompt_token_ids[req2.cached_tokens:]
+
+    assert req2.cached_tokens == len(sys_tokens), (
+        f"Expected {len(sys_tokens)} cached tokens, got {req2.cached_tokens}"
+    )
+    assert req2.remaining_tokens == user_yo
+    assert req2.prompt_cache is not None
+
+    cache.release(path)
