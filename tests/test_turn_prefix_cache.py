@@ -801,3 +801,32 @@ def test_cross_session_hit_via_prefix_boundary():
     assert len(path) >= 1
     assert path[0] is n_sys
     cache.release(path)
+
+
+def test_turn_cache_requires_chunked_prefill_nonzero():
+    """Scheduler raises ValueError if use_turn_cache=True and chunked_prefill_tokens=0."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    with pytest.raises(ValueError, match="chunked-prefill-tokens"):
+        Scheduler(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=0),
+        )
+
+
+def test_turn_cache_with_chunked_prefill_does_not_raise():
+    """Scheduler does not raise when use_turn_cache=True and chunked_prefill_tokens>0."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    # Should raise something else (missing model internals) but NOT ValueError about chunked prefill
+    try:
+        Scheduler(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192),
+        )
+    except ValueError as e:
+        assert "chunked-prefill-tokens" not in str(e), f"Unexpected chunked-prefill error: {e}"
+    except Exception:
+        pass  # Other init errors from MagicMock model are expected

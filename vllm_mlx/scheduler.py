@@ -1151,6 +1151,13 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
 
+        # Validate TurnPrefixCache configuration
+        if self.config.use_turn_cache and self.config.chunked_prefill_tokens == 0:
+            raise ValueError(
+                "TurnPrefixCache requires --chunked-prefill-tokens to be set. "
+                "Set --chunked-prefill-tokens 8192 or higher."
+            )
+
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
 
