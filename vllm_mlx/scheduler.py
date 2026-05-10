@@ -2025,7 +2025,16 @@ class Scheduler:
                     request.cache_hit_type = "hit"
                     request._turn_cache_path = path
                     ancestor = self.turn_cache.find_checkpoint_ancestor(path)
-                    request.prompt_cache = ancestor.recurrent_state if ancestor else None
+                    raw_state = ancestor.recurrent_state if ancestor else None
+                    if (
+                        raw_state is not None
+                        and isinstance(raw_state, list)
+                        and raw_state
+                        and isinstance(raw_state[0], dict)
+                    ):
+                        request.prompt_cache = self._reconstruct_cache_from_states(raw_state)
+                    else:
+                        request.prompt_cache = raw_state
                     if request.prompt_cache is not None:
                         # We have real KV state — skip those tokens.
                         request.cached_tokens = sum(len(n.token_ids) for n in path)

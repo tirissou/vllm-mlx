@@ -969,7 +969,7 @@ def _make_extracted_state(n_layers=2, n_tokens=10):
     return [
         {
             "state": (mx.zeros([1, 4, n_tokens, 32]), mx.zeros([1, 4, n_tokens, 32])),
-            "meta_state": (str(n_tokens),),
+            "meta_state": "",  # KVCache.meta_state is a string
             "class_name": "KVCache",
             "class_ref": KVCache,
         }
@@ -1032,3 +1032,57 @@ def test_store_side_sets_recurrent_state_on_system_segment():
     assert user_node.recurrent_state is not None
     assert isinstance(user_node.recurrent_state, list)
     assert isinstance(user_node.recurrent_state[0], dict)
+
+
+def test_fetch_reconstructs_dict_state_into_prompt_cache():
+    """On turn_cache HIT, request.prompt_cache is reconstructed cache objects, not raw dicts."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.block_aware_cache = None
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 13))
+    sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
+
+    sys_seg = Segment(role="system", token_ids=sys_tokens)
+    sys_node = cache.insert(cache.root, sys_seg, [], [], sys_state, is_system_prompt=True)
+
+    # Fetch: request with same system tokens but different user tokens
+    req = MagicMock()
+    req.prompt_token_ids = sys_tokens + user_tokens
+    req.prefix_boundary = 10
+    req.request_id = "test-fetch"
+
+    segments = sched._messages_to_segments(req)
+    path, has_recurrent = cache.match(segments)
+    assert path, "Expected a trie match on sys_tokens"
+
+    ancestor = cache.find_checkpoint_ancestor(path)
+    assert ancestor is not None
+    raw_state = ancestor.recurrent_state
+
+    # Apply the reconstruction logic we're about to add
+    if (
+        raw_state is not None
+        and isinstance(raw_state, list)
+        and raw_state
+        and isinstance(raw_state[0], dict)
+    ):
+        prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+    else:
+        prompt_cache = raw_state
+
+    assert prompt_cache is not None, "prompt_cache should be non-None after reconstruction"
+    assert isinstance(prompt_cache, list)
+    assert len(prompt_cache) == 2
+    # Each element should be a KVCache-like object with .state and .offset
+    for layer in prompt_cache:
+        assert hasattr(layer, "offset"), f"Expected .offset on {type(layer)}"
+        assert layer.offset == 10
