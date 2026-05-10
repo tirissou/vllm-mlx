@@ -291,3 +291,69 @@ def test_find_checkpoint_ancestor_skips_ssdref_nodes():
     # Should skip n1 and return n2
     ancestor = cache.find_checkpoint_ancestor([n1, n2])
     assert ancestor is n2
+
+
+def _make_kv(n_tokens=1):
+    """Small real KV arrays for memory-tracked tests."""
+    return [mx.zeros((1, 4, n_tokens, 256), dtype=mx.bfloat16)]
+
+
+def _kv_scales():
+    return [1.0]
+
+
+def test_lru_evicts_oldest_leaf():
+    cache = make_cache(max_gb=0.0)
+    n1 = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
+    n2 = cache.insert(cache.root, seg([2]), _make_kv(), _kv_scales(), None)
+    n1.last_used = 1.0
+    n2.last_used = 2.0
+    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    cache._evict_if_needed()
+    assert n1.kv_arrays is None      # evicted
+    assert n2.kv_arrays is not None  # kept
+
+
+def test_pinned_node_not_evicted():
+    cache = make_cache(max_gb=0.0)
+    node = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
+    node.ref_count = 1
+    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    cache._evict_if_needed()
+    assert node.kv_arrays is not None
+
+
+def test_eviction_cascade_to_parent():
+    cache = make_cache(max_gb=0.0)
+    n1 = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
+    n2 = cache.insert(n1, seg([2]), _make_kv(), _kv_scales(), None)
+    n1.last_used = 0.5
+    n2.last_used = 1.0
+    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    cache._evict_if_needed()
+    assert n2.kv_arrays is None  # leaf evicted first
+    assert n1.kv_arrays is None  # cascades since n1 now has no children
+
+
+def test_cascade_stops_at_sibling():
+    cache = make_cache(max_gb=0.0)
+    n1 = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
+    n2a = cache.insert(n1, seg([2]), _make_kv(), _kv_scales(), None)
+    n2b = cache.insert(n1, seg([3]), _make_kv(), _kv_scales(), None)
+    n2a.last_used = 1.0
+    n2b.last_used = 2.0
+    n1.last_used = 0.5
+    # Force eviction of only n2a (one step)
+    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    cache._evict_if_needed()
+    assert n2a.kv_arrays is None      # evicted
+    assert n1.kv_arrays is not None   # n1 still has n2b
+
+
+def test_evicted_node_removed_from_parent_children():
+    cache = make_cache(max_gb=0.0)
+    node = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
+    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    h = node.context_hash
+    cache._evict_if_needed()
+    assert h not in cache.root.children

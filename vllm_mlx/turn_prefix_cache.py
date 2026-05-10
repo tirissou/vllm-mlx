@@ -214,3 +214,28 @@ class TurnPrefixCache:
                 return node
 
         return None
+
+    def _evict_node(self, node: TurnNode) -> None:
+        """Free a node's data and remove it from its parent. Internal — caller holds lock."""
+        self._memory_bytes -= _node_data_bytes(node)
+        node.kv_arrays = None
+        node.kv_scales = None
+        node.recurrent_state = None
+
+        parent = node.parent
+        if parent is not None and node.context_hash in parent.children:
+            del parent.children[node.context_hash]
+            # Parent may now be a leaf — recursively evict if evictable
+            if parent.is_evictable and parent is not self.root:
+                self._evict_node(parent)
+
+    def _evict_if_needed(self) -> None:
+        """Evict LRU leaves until memory is within budget."""
+        max_bytes = int(self.config.max_memory_gb * 1024**3)
+        with self._lock:
+            while self._memory_bytes > max_bytes and self._eviction_heap:
+                _, _, node = heapq.heappop(self._eviction_heap)
+                # Lazy deletion: node may no longer be evictable
+                if not node.is_evictable:
+                    continue
+                self._evict_node(node)
