@@ -2541,6 +2541,8 @@ class Scheduler:
                                 if is_sys:
                                     state = getattr(request, "_sys_prompt_state", None)
                                 elif i == len(new_segments) - 1:
+                                    # Invariant: the last new segment is the user/assistant turn
+                                    # and _extracted_cache covers prompt+output for this turn.
                                     ec = request._extracted_cache
                                     if isinstance(ec, list) and ec and isinstance(ec[0], dict):
                                         state = ec
@@ -2614,6 +2616,7 @@ class Scheduler:
             if request is not None:
                 request.prompt_cache = None
                 request._extracted_cache = None
+                request._sys_prompt_state = None
 
             # Remove from running
             if request_id in self.running:
