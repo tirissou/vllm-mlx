@@ -1,7 +1,7 @@
 import pytest
 import mlx.core as mx
 from vllm_mlx.turn_prefix_cache import (
-    Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, _context_hash,
+    Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, _context_hash, _node_data_bytes,
 )
 
 
@@ -303,24 +303,27 @@ def _kv_scales():
 
 
 def test_lru_evicts_oldest_leaf():
-    cache = make_cache(max_gb=0.0)
+    cache = make_cache(max_gb=100.0)  # HIGH during insert to prevent auto-eviction
     n1 = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
     n2 = cache.insert(cache.root, seg([2]), _make_kv(), _kv_scales(), None)
     n1.last_used = 1.0
     n2.last_used = 2.0
-    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    # Set budget to allow only the newer (n2) node, forcing n1's eviction
+    node_size = _node_data_bytes(n1)
+    cache.config.max_memory_gb = (node_size + 512) / (1024**3)  # Budget for ~1 node plus buffer
     cache._evict_if_needed()
-    assert n1.kv_arrays is None      # evicted
-    assert n2.kv_arrays is not None  # kept
+    assert n1.kv_arrays is None      # evicted (oldest)
+    assert n2.kv_arrays is not None  # kept (newer)
 
 
 def test_pinned_node_not_evicted():
-    cache = make_cache(max_gb=0.0)
+    cache = make_cache(max_gb=100.0)  # HIGH during insert to prevent auto-eviction
     node = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
     node.ref_count = 1
-    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    # Set budget to 0 to force eviction attempt; ref_count should protect it
+    cache.config.max_memory_gb = 0.0
     cache._evict_if_needed()
-    assert node.kv_arrays is not None
+    assert node.kv_arrays is not None  # pinned by ref_count, should not be evicted
 
 
 def test_eviction_cascade_to_parent():
@@ -336,18 +339,19 @@ def test_eviction_cascade_to_parent():
 
 
 def test_cascade_stops_at_sibling():
-    cache = make_cache(max_gb=0.0)
+    cache = make_cache(max_gb=100.0)  # HIGH during insert to prevent auto-eviction
     n1 = cache.insert(cache.root, seg([1]), _make_kv(), _kv_scales(), None)
     n2a = cache.insert(n1, seg([2]), _make_kv(), _kv_scales(), None)
     n2b = cache.insert(n1, seg([3]), _make_kv(), _kv_scales(), None)
     n2a.last_used = 1.0
     n2b.last_used = 2.0
     n1.last_used = 0.5
-    # Force eviction of only n2a (one step)
-    cache._memory_bytes = int(cache.config.max_memory_gb * 1024**3) + 1
+    # Set budget to allow n1 + n2b but not n2a; cascade stops because n1 still has n2b
+    node_size = _node_data_bytes(n2a)
+    cache.config.max_memory_gb = (node_size * 2 + 512) / (1024**3)
     cache._evict_if_needed()
-    assert n2a.kv_arrays is None      # evicted
-    assert n1.kv_arrays is not None   # n1 still has n2b
+    assert n2a.kv_arrays is None      # evicted (oldest leaf)
+    assert n1.kv_arrays is not None   # n1 still has n2b, so cascade stops
 
 
 def test_evicted_node_removed_from_parent_children():
