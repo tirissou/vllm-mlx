@@ -485,3 +485,90 @@ class TurnPrefixCache:
                 self._memory_bytes += _node_data_bytes(node)
                 if node.is_evictable:
                     heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+
+    # ── SSD offloading ─────────────────────────────────────────────────────
+
+    def _ssd_path(self, node: TurnNode, suffix: str) -> str:
+        ssd_dir = self.config.ssd_dir or os.path.join(
+            self.config.persist_dir or "/tmp", "ssd"
+        )
+        os.makedirs(ssd_dir, exist_ok=True)
+        return os.path.join(ssd_dir, f"{node.context_hash & 0xFFFFFFFFFFFFFFFF:016x}_{suffix}.safetensors")
+
+    def _spill_to_ssd(self, node: TurnNode) -> None:
+        """Write node's KV (and recurrent if present) to SSD; replace with SSDRef."""
+        from safetensors.numpy import save_file as st_save
+
+        if isinstance(node.kv_arrays, list) and node.kv_arrays:
+            path = self._ssd_path(node, "kv")
+            tensors: dict[str, np.ndarray] = {}
+            for j, arr in enumerate(node.kv_arrays):
+                # Convert to float32 if bfloat16 to avoid numpy conversion issues
+                if arr.dtype == mx.bfloat16:
+                    arr = arr.astype(mx.float32)
+                tensors[f"kv_{j}"] = np.array(arr)
+                if node.kv_scales:
+                    tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
+            tmp = path + ".tmp"
+            st_save(tensors, tmp)
+            os.replace(tmp, path)
+            size = os.path.getsize(path)
+            node.kv_arrays = SSDRef(file_path=path, size_bytes=size)
+            node.kv_scales = None
+
+        if (
+            node.recurrent_state is not None
+            and not isinstance(node.recurrent_state, SSDRef)
+        ):
+            path = self._ssd_path(node, "rec")
+            tensors = {}
+            state = node.recurrent_state
+            items = state if isinstance(state, (list, tuple)) else [state]
+            for k, item in enumerate(items):
+                sub = item if isinstance(item, (list, tuple)) else [item]
+                for m, arr in enumerate(sub):
+                    # Convert to float32 if bfloat16 to avoid numpy conversion issues
+                    if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                        arr = arr.astype(mx.float32)
+                    tensors[f"r_{k}_{m}"] = np.array(arr)
+            tmp = path + ".tmp"
+            st_save(tensors, tmp)
+            os.replace(tmp, path)
+            size = os.path.getsize(path)
+            node.recurrent_state = SSDRef(file_path=path, size_bytes=size)
+
+    def _promote_from_ssd(self, node: TurnNode) -> bool:
+        """Load node's KV from SSD back into RAM. Returns False on error."""
+        from safetensors.numpy import load_file as st_load
+
+        if isinstance(node.kv_arrays, SSDRef):
+            path = node.kv_arrays.file_path
+            if not os.path.exists(path):
+                logger.warning(f"[turn_cache] SSD file missing: {path}")
+                return False
+            try:
+                tensors = st_load(path)
+                kv_arrays: list[mx.array] = []
+                kv_scales: list[float] = []
+                j = 0
+                while f"kv_{j}" in tensors:
+                    kv_arrays.append(mx.array(tensors[f"kv_{j}"]))
+                    if f"scale_{j}" in tensors:
+                        kv_scales.append(float(tensors[f"scale_{j}"][0]))
+                    j += 1
+                node.kv_arrays = kv_arrays
+                node.kv_scales = kv_scales or None
+            except Exception as e:
+                logger.warning(f"[turn_cache] SSD promote failed: {e}")
+                return False
+
+        if isinstance(node.recurrent_state, SSDRef):
+            path = node.recurrent_state.file_path
+            if os.path.exists(path):
+                try:
+                    node.recurrent_state = st_load(path)
+                except Exception as e:
+                    logger.warning(f"[turn_cache] SSD recurrent promote failed: {e}")
+                    node.recurrent_state = None
+
+        return True

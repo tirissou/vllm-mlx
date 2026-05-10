@@ -444,3 +444,48 @@ def test_load_missing_kv_file_skips_node(tmp_path):
 
     cache2 = make_cache(stride=0)
     cache2.load(str(tmp_path))  # must not raise
+
+
+def make_ssd_cache(tmp_path, stride=512):
+    return TurnPrefixCache(TurnPrefixCacheConfig(
+        checkpoint_stride=stride,
+        max_memory_gb=8.0,
+        kv_dtype="bf16",
+        ssd_max_gb=10.0,
+        ssd_dir=str(tmp_path),
+    ))
+
+
+def test_spill_replaces_kv_with_ssdref(tmp_path):
+    cache = make_ssd_cache(tmp_path)
+    kv = [mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)]
+    node = cache.insert(cache.root, seg([1, 2, 3]), kv, [1.0], None)
+    cache._spill_to_ssd(node)
+    assert isinstance(node.kv_arrays, SSDRef)
+
+
+def test_spill_trie_still_matchable(tmp_path):
+    cache = make_ssd_cache(tmp_path)
+    node = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    cache._spill_to_ssd(node)
+    path, _ = cache.match([seg([1, 2, 3])])
+    assert len(path) == 1
+
+
+def test_promote_restores_arrays(tmp_path):
+    cache = make_ssd_cache(tmp_path)
+    kv = [mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)]
+    node = cache.insert(cache.root, seg([1, 2, 3]), kv, [1.0], None)
+    cache._spill_to_ssd(node)
+    assert isinstance(node.kv_arrays, SSDRef)
+    success = cache._promote_from_ssd(node)
+    assert success
+    assert isinstance(node.kv_arrays, list)
+
+
+def test_promote_returns_false_on_missing_file(tmp_path):
+    cache = make_ssd_cache(tmp_path)
+    node = cache.insert(cache.root, seg([1]), [], [], None)
+    node.kv_arrays = SSDRef(file_path="/nonexistent/file.safetensors", size_bytes=0)
+    result = cache._promote_from_ssd(node)
+    assert result is False
