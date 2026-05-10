@@ -1408,7 +1408,7 @@ class Scheduler:
             # monkey-patches inside _install_chunked_prefill.
             mid_prefill_cb = None
             save_interval = self.config.mid_prefill_save_interval
-            if save_interval > 0 and self.memory_aware_cache is not None:
+            if save_interval > 0 and (self.memory_aware_cache is not None or self.turn_cache is not None):
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
             _install_chunked_prefill(
@@ -1530,41 +1530,43 @@ class Scheduler:
             if not at_prefix_boundary and total_cached - last_save < save_interval:
                 return
 
-            # Extract immutable state snapshots
-            extracted = self._extract_cache_states(prompt_cache)
-            if not extracted:
-                return
+            # memory_aware_cache: save intermediate state for prefix cache reuse
+            if self.memory_aware_cache is not None:
+                extracted = self._extract_cache_states(prompt_cache)
+                if extracted:
+                    reconstructed = self._reconstruct_cache_from_states(extracted)
+                    if reconstructed:
+                        prefix_tokens = list(request.prompt_token_ids[:total_cached])
+                        old_key = getattr(request, "_mid_prefill_cache_key", None)
+                        if old_key is not None:
+                            self.memory_aware_cache.remove(list(old_key))
+                        _t0 = _time.monotonic()
+                        stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
+                        _dt = _time.monotonic() - _t0
+                        if stored:
+                            request._mid_prefill_last_save = total_cached
+                            request._mid_prefill_cache_key = tuple(prefix_tokens)
+                            logger.info(
+                                f"[mid_prefill_cache] request={request_id[:12]} "
+                                f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
+                                f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
+                                f"store_time={_dt:.3f}s"
+                            )
+                        else:
+                            logger.debug(
+                                f"[mid_prefill_cache] request={request_id[:12]} "
+                                f"store rejected for {total_cached} tokens"
+                            )
 
-            # Reconstruct cache objects (directly usable by BatchGenerator)
-            reconstructed = self._reconstruct_cache_from_states(extracted)
-            if not reconstructed:
-                return
-
-            prefix_tokens = list(request.prompt_token_ids[:total_cached])
-
-            # Remove previous intermediate entry to avoid memory waste
-            old_key = getattr(request, "_mid_prefill_cache_key", None)
-            if old_key is not None:
-                self.memory_aware_cache.remove(list(old_key))
-
-            _t0 = _time.monotonic()
-            stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
-            _dt = _time.monotonic() - _t0
-
-            if stored:
-                request._mid_prefill_last_save = total_cached
-                request._mid_prefill_cache_key = tuple(prefix_tokens)
-                logger.info(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
-                    f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
-                    f"store_time={_dt:.3f}s"
-                )
-            else:
-                logger.debug(
-                    f"[mid_prefill_cache] request={request_id[:12]} "
-                    f"store rejected for {total_cached} tokens"
-                )
+            # turn_cache: capture system-segment state at prefix_boundary
+            if at_prefix_boundary and self.turn_cache is not None:
+                extracted = self._extract_cache_states(prompt_cache)
+                if extracted:
+                    request._sys_prompt_state = extracted
+                    logger.info(
+                        f"[turn_cache] sys_prompt_state captured at boundary={prefix_boundary} "
+                        f"layers={len(extracted)} for {request_id[:12]}"
+                    )
 
         return _mid_prefill_save
 

@@ -862,3 +862,83 @@ def test_turn_cache_disables_memory_aware_cache():
     assert sched.memory_aware_cache is None, (
         "memory_aware_cache should be None when use_turn_cache=True"
     )
+
+
+def _make_minimal_scheduler_with_turn_cache():
+    """Minimal scheduler object suitable for testing mid_prefill callback."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.requests = {}
+    sched.uid_to_request_id = {}
+    return sched
+
+
+class _MockKVLayer:
+    """Minimal KVCache-like object with .state and .meta_state."""
+    def __init__(self, n_tokens):
+        self._n = n_tokens
+
+    @property
+    def state(self):
+        return (mx.zeros([1, 4, self._n, 32]), mx.zeros([1, 4, self._n, 32]))
+
+    @property
+    def meta_state(self):
+        return (str(self._n),)
+
+    def __class_getitem__(cls, item):
+        return cls
+
+
+def test_mid_prefill_stores_sys_prompt_state_at_boundary():
+    """_mid_prefill_save sets request._sys_prompt_state at prefix_boundary."""
+    from unittest.mock import MagicMock
+    sched = _make_minimal_scheduler_with_turn_cache()
+
+    req = MagicMock()
+    req.prompt_token_ids = list(range(15))  # 10 sys + 5 user
+    req.prefix_boundary = 10
+    req.cached_tokens = 0
+    sched.requests["req1"] = req
+    sched.uid_to_request_id[1] = "req1"
+
+    mock_cache = [_MockKVLayer(10), _MockKVLayer(10)]  # 2 layers, 10 tokens processed
+
+    cb = sched._make_mid_prefill_save_callback(save_interval=8192)
+    cb(uid=1, processed_tokens=10, prompt_cache=mock_cache)
+
+    assert hasattr(req, "_sys_prompt_state"), "_sys_prompt_state not set"
+    assert req._sys_prompt_state is not None
+    assert isinstance(req._sys_prompt_state, list)
+    assert len(req._sys_prompt_state) == 2
+    assert isinstance(req._sys_prompt_state[0], dict)
+    assert "state" in req._sys_prompt_state[0]
+    assert "class_name" in req._sys_prompt_state[0]
+
+
+def test_mid_prefill_does_not_store_state_away_from_boundary():
+    """_mid_prefill_save does NOT set _sys_prompt_state when not at prefix_boundary."""
+    from unittest.mock import MagicMock
+    sched = _make_minimal_scheduler_with_turn_cache()
+
+    req = MagicMock()
+    req.prompt_token_ids = list(range(20))
+    req.prefix_boundary = 10
+    req.cached_tokens = 0
+    req._mid_prefill_last_save = 0  # Avoid MagicMock returning a Mock for this
+    req._sys_prompt_state = None    # Pre-set so we can detect if callback writes it
+    sched.requests["req1"] = req
+    sched.uid_to_request_id[1] = "req1"
+
+    mock_cache = [_MockKVLayer(5)]  # Only 5 tokens processed, not at boundary
+
+    cb = sched._make_mid_prefill_save_callback(save_interval=8192)
+    cb(uid=1, processed_tokens=5, prompt_cache=mock_cache)
+
+    # _sys_prompt_state should remain None — callback returns early due to throttle
+    assert req._sys_prompt_state is None
