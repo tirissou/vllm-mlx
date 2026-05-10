@@ -167,3 +167,71 @@ def test_stride_zero_makes_every_node_permanent():
     # Neither should have recurrent pruned
     assert n1.recurrent_state is not None
     assert n2.recurrent_state is not None
+
+
+def test_match_full():
+    cache = make_cache()
+    n1 = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    n2 = cache.insert(n1, seg([4, 5]), [], [], None)
+    path, _ = cache.match([seg([1, 2, 3]), seg([4, 5])])
+    assert path == [n1, n2]
+
+
+def test_match_partial():
+    cache = make_cache()
+    n1 = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    cache.insert(n1, seg([4, 5]), [], [], None)
+    path, _ = cache.match([seg([1, 2, 3]), seg([99])])  # second seg not in trie
+    assert path == [n1]
+
+
+def test_match_empty():
+    cache = make_cache()
+    path, has_recurrent = cache.match([seg([99])])
+    assert path == []
+    assert not has_recurrent
+
+
+def test_match_updates_last_used():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1]), [], [], None)
+    node.last_used = 0.0
+    cache.match([seg([1])])
+    assert node.last_used > 0.0
+
+
+def test_match_reports_has_recurrent():
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+    node = cache.insert(cache.root, seg([1]), [], [], state)
+    _, has_recurrent = cache.match([seg([1])])
+    assert has_recurrent
+
+
+def test_match_increments_ref_count():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1]), [], [], None)
+    assert node.ref_count == 0
+    cache.match([seg([1])])
+    assert node.ref_count == 1
+
+
+def test_release_decrements_ref_count():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1]), [], [], None)
+    path, _ = cache.match([seg([1])])
+    assert node.ref_count == 1
+    cache.release(path)
+    assert node.ref_count == 0
+
+
+def test_release_all_nodes_in_path():
+    cache = make_cache()
+    n1 = cache.insert(cache.root, seg([1]), [], [], None)
+    n2 = cache.insert(n1, seg([2]), [], [], None)
+    path, _ = cache.match([seg([1]), seg([2])])
+    assert n1.ref_count == 1
+    assert n2.ref_count == 1
+    cache.release(path)
+    assert n1.ref_count == 0
+    assert n2.ref_count == 0

@@ -170,3 +170,26 @@ class TurnPrefixCache:
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
             return node
+
+    def match(self, segments: list[Segment]) -> tuple[list[TurnNode], bool]:
+        """Walk trie matching segments. Returns (path, has_recurrent_at_deepest)."""
+        path: list[TurnNode] = []
+        node = self.root
+        now = time.time()
+        with self._lock:
+            for segment in segments:
+                h = _context_hash(node.context_hash, segment.token_ids)
+                if h not in node.children:
+                    break
+                node = node.children[h]
+                node.last_used = now
+                node.ref_count += 1
+                path.append(node)
+        has_recurrent = bool(path) and path[-1].recurrent_state is not None
+        return path, has_recurrent
+
+    def release(self, path: list[TurnNode]) -> None:
+        """Decrement ref_count for all nodes in a matched path. Call on request completion."""
+        with self._lock:
+            for node in path:
+                node.ref_count = max(0, node.ref_count - 1)
