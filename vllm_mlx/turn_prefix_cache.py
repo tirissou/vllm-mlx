@@ -75,3 +75,85 @@ def _context_hash(parent_hash: int, token_ids: list[int]) -> int:
     )
     digest = hashlib.sha256(data).digest()
     return struct.unpack("<q", digest[:8])[0]
+
+
+def _node_data_bytes(node: TurnNode) -> int:
+    """Estimate bytes used by a node's kv_arrays and recurrent_state."""
+    total = 0
+    if isinstance(node.kv_arrays, list):
+        for arr in node.kv_arrays:
+            # Use shape+dtype to avoid triggering lazy eval
+            nbytes = 1
+            for d in arr.shape:
+                nbytes *= d
+            nbytes *= arr.itemsize
+            total += nbytes
+    if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
+        state = node.recurrent_state
+        items = state if isinstance(state, (list, tuple)) else [state]
+        for item in items:
+            sub = item if isinstance(item, (list, tuple)) else [item]
+            for arr in sub:
+                if hasattr(arr, "shape"):
+                    nbytes = 1
+                    for d in arr.shape:
+                        nbytes *= d
+                    nbytes *= arr.itemsize
+                    total += nbytes
+    return total
+
+
+class TurnPrefixCache:
+    def __init__(self, config: TurnPrefixCacheConfig) -> None:
+        self.config = config
+        self.root = TurnNode(
+            token_ids=[],
+            context_hash=0,
+            kv_arrays=None,
+            kv_scales=None,
+            recurrent_state=None,
+            tokens_since_checkpoint=0,
+            parent=None,
+            is_permanent_checkpoint=True,  # root acts as checkpoint anchor
+        )
+        self._lock = threading.Lock()
+        self._eviction_heap: list[tuple[float, int, TurnNode]] = []
+        self._memory_bytes: int = 0
+
+    def insert(
+        self,
+        parent: TurnNode,
+        segment: Segment,
+        kv_arrays: list[mx.array],
+        kv_scales: list[float],
+        recurrent_state: Any | None,
+        is_system_prompt: bool = False,
+    ) -> TurnNode:
+        h = _context_hash(parent.context_hash, segment.token_ids)
+        with self._lock:
+            if h in parent.children:
+                node = parent.children[h]
+                node.last_used = time.time()
+                return node
+
+            # Compute tokens_since_checkpoint from nearest permanent checkpoint ancestor
+            if parent.is_permanent_checkpoint:
+                tokens_since = len(segment.token_ids)
+            else:
+                tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
+
+            node = TurnNode(
+                token_ids=segment.token_ids,
+                context_hash=h,
+                kv_arrays=kv_arrays,
+                kv_scales=kv_scales,
+                recurrent_state=recurrent_state,  # temp checkpoint (leaf)
+                tokens_since_checkpoint=tokens_since,
+                parent=parent,
+                is_permanent_checkpoint=False,
+            )
+            parent.children[h] = node
+
+            self._memory_bytes += _node_data_bytes(node)
+            heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+            return node

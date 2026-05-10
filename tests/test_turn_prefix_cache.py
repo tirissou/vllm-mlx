@@ -49,3 +49,58 @@ def test_config_defaults():
     assert cfg.kv_dtype == "int8"
     assert cfg.persist_dir is None
     assert cfg.ssd_max_gb == 0.0
+
+
+from vllm_mlx.turn_prefix_cache import TurnPrefixCache
+
+
+def make_cache(stride=512, max_gb=8.0, kv_dtype="bf16"):
+    return TurnPrefixCache(TurnPrefixCacheConfig(
+        checkpoint_stride=stride, max_memory_gb=max_gb, kv_dtype=kv_dtype
+    ))
+
+
+def test_insert_creates_child_of_root():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1, 2, 3]), kv_arrays=[], kv_scales=[], recurrent_state=None)
+    assert node in cache.root.children.values()
+
+
+def test_insert_sets_token_ids():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    assert node.token_ids == [1, 2, 3]
+
+
+def test_insert_node_is_leaf():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    assert node.is_leaf
+
+
+def test_insert_sets_parent():
+    cache = make_cache()
+    node = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    assert node.parent is cache.root
+
+
+def test_insert_idempotent_same_segment():
+    cache = make_cache()
+    n1 = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    n2 = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    assert n1 is n2  # same node returned
+
+
+def test_insert_chained():
+    cache = make_cache()
+    n1 = cache.insert(cache.root, seg([1]), [], [], None)
+    n2 = cache.insert(n1, seg([2]), [], [], None)
+    assert n2.parent is n1
+    assert n2 in n1.children.values()
+
+
+def test_insert_context_hash_differs_at_different_depths():
+    cache = make_cache()
+    n1 = cache.insert(cache.root, seg([1, 2, 3]), [], [], None)
+    n2 = cache.insert(n1, seg([1, 2, 3]), [], [], None)  # same tokens, different parent
+    assert n1.context_hash != n2.context_hash
