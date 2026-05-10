@@ -169,6 +169,7 @@ class TurnPrefixCache:
 
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+            self._evict_if_needed_unlocked()
             return node
 
     def match(self, segments: list[Segment]) -> tuple[list[TurnNode], bool]:
@@ -215,27 +216,53 @@ class TurnPrefixCache:
 
         return None
 
+    def _walk_nodes(self, node: TurnNode) -> list[TurnNode]:
+        """DFS walk to collect all nodes in subtree."""
+        result = [node]
+        for child in node.children.values():
+            result.extend(self._walk_nodes(child))
+        return result
+
     def _evict_node(self, node: TurnNode) -> None:
         """Free a node's data and remove it from its parent. Internal — caller holds lock."""
-        self._memory_bytes -= _node_data_bytes(node)
-        node.kv_arrays = None
-        node.kv_scales = None
-        node.recurrent_state = None
+        to_evict = [node]
+        while to_evict:
+            current = to_evict.pop()
+            self._memory_bytes -= _node_data_bytes(current)
+            current.kv_arrays = None
+            current.kv_scales = None
+            current.recurrent_state = None
 
-        parent = node.parent
-        if parent is not None and node.context_hash in parent.children:
-            del parent.children[node.context_hash]
-            # Parent may now be a leaf — recursively evict if evictable
-            if parent.is_evictable and parent is not self.root:
-                self._evict_node(parent)
+            parent = current.parent
+            if parent is not None and current.context_hash in parent.children:
+                del parent.children[current.context_hash]
+                if parent.is_evictable and parent is not self.root:
+                    to_evict.append(parent)
+
+    def _evict_if_needed_unlocked(self) -> None:
+        """Evict LRU leaves until memory is within budget. Caller must hold lock."""
+        max_bytes = int(self.config.max_memory_gb * 1024**3)
+        while self._memory_bytes > max_bytes and self._eviction_heap:
+            _, _, node = heapq.heappop(self._eviction_heap)
+            # Lazy deletion: node may no longer be evictable
+            if not node.is_evictable:
+                continue
+            self._evict_node(node)
+
+        # Rebuild heap periodically if bloated
+        # (heap can accumulate skipped nodes from lazy deletion)
+        if len(self._eviction_heap) > 200:
+            nodes = []
+            for child in self.root.children.values():
+                nodes.extend(self._walk_nodes(child))
+            self._eviction_heap = [
+                (n.last_used, id(n), n)
+                for n in nodes
+                if n.is_evictable and n is not self.root
+            ]
+            heapq.heapify(self._eviction_heap)
 
     def _evict_if_needed(self) -> None:
         """Evict LRU leaves until memory is within budget."""
-        max_bytes = int(self.config.max_memory_gb * 1024**3)
         with self._lock:
-            while self._memory_bytes > max_bytes and self._eviction_heap:
-                _, _, node = heapq.heappop(self._eviction_heap)
-                # Lazy deletion: node may no longer be evictable
-                if not node.is_evictable:
-                    continue
-                self._evict_node(node)
+            self._evict_if_needed_unlocked()
