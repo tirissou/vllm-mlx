@@ -279,3 +279,15 @@ def test_find_checkpoint_ancestor_returns_leaf_if_leaf_has_recurrent():
     assert n.recurrent_state is not None
     ancestor = cache.find_checkpoint_ancestor([n])
     assert ancestor is n
+
+
+def test_find_checkpoint_ancestor_skips_ssdref_nodes():
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+    n1 = cache.insert(cache.root, seg([1]), [], [], state)
+    n2 = cache.insert(n1, seg([2]), [], [], state)
+    # Simulate n1's state being spilled to SSD
+    n1.recurrent_state = SSDRef(file_path="/tmp/state.bin", size_bytes=1024)
+    # Should skip n1 and return n2
+    ancestor = cache.find_checkpoint_ancestor([n1, n2])
+    assert ancestor is n2
