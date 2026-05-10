@@ -1086,3 +1086,79 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
     for layer in prompt_cache:
         assert hasattr(layer, "offset"), f"Expected .offset on {type(layer)}"
         assert layer.offset == 10
+
+
+def test_save_load_dict_format_recurrent_state():
+    """TurnNode with dict-format recurrent_state survives a save/load round-trip."""
+    import tempfile
+    from mlx_lm.models.cache import KVCache
+    from vllm_mlx.scheduler import Scheduler
+
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+
+    extracted = [
+        {
+            "state": (mx.zeros([1, 4, 10, 32]), mx.zeros([1, 4, 10, 32])),
+            "meta_state": "",
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        },
+        {
+            "state": (mx.ones([1, 4, 10, 32]), mx.ones([1, 4, 10, 32])),
+            "meta_state": "",
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        },
+    ]
+    mx.eval(*[t for d in extracted for t in d["state"]])
+
+    seg_sys = Segment(role="system", token_ids=list(range(10)))
+    cache.insert(cache.root, seg_sys, [], [], extracted, is_system_prompt=True)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache.save(tmpdir)
+
+        cache2 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+        cache2.load(tmpdir)
+
+    assert len(cache2.root.children) == 1
+    loaded_node = list(cache2.root.children.values())[0]
+    assert loaded_node.recurrent_state is not None
+    assert isinstance(loaded_node.recurrent_state, list)
+    assert len(loaded_node.recurrent_state) == 2
+    assert isinstance(loaded_node.recurrent_state[0], dict)
+    assert loaded_node.recurrent_state[0]["class_name"] == "KVCache"
+    assert loaded_node.recurrent_state[0]["class_ref"] is not None
+
+    # Verify reconstruction works on loaded state
+    sched = object.__new__(Scheduler)
+    reconstructed = sched._reconstruct_cache_from_states(loaded_node.recurrent_state)
+    assert reconstructed is not None
+    assert len(reconstructed) == 2
+    assert reconstructed[0].offset == 10
+
+
+def test_save_load_legacy_ssm_format_unchanged():
+    """Legacy SSM raw-tensor recurrent_state still round-trips correctly."""
+    import tempfile
+
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    legacy_state = [mx.zeros([4, 32]), mx.ones([4, 32])]
+    mx.eval(*legacy_state)
+
+    seg_l = Segment(role="user", token_ids=[1, 2, 3])
+    cache.insert(cache.root, seg_l, [], [], legacy_state)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache.save(tmpdir)
+        cache2 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+        cache2.load(tmpdir)
+
+    loaded_node = list(cache2.root.children.values())[0]
+    assert loaded_node.recurrent_state is not None
+    # Legacy format: not a list of dicts
+    assert not (
+        isinstance(loaded_node.recurrent_state, list)
+        and loaded_node.recurrent_state
+        and isinstance(loaded_node.recurrent_state[0], dict)
+    )

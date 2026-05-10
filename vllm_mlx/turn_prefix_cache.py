@@ -351,19 +351,40 @@ class TurnPrefixCache:
 
                 if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
                     rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
-                    tensors = {}
+                    tensors: dict[str, np.ndarray] = {}
                     state = node.recurrent_state
-                    items = state if isinstance(state, (list, tuple)) else [state]
-                    for k, item in enumerate(items):
-                        sub = item if isinstance(item, (list, tuple)) else [item]
-                        for m, arr in enumerate(sub):
-                            # Convert to float32 if bfloat16 to avoid numpy conversion issues
-                            if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
-                                arr = arr.astype(mx.float32)
-                            tensors[f"r_{k}_{m}"] = np.array(arr)
-                    tmp = rec_path + ".tmp"
-                    st_save(tensors, tmp)
-                    os.replace(tmp, rec_path)
+
+                    if isinstance(state, list) and state and isinstance(state[0], dict):
+                        # Dict format (_extract_cache_states output)
+                        for li, layer_dict in enumerate(state):
+                            for j, arr in enumerate(layer_dict.get("state", ())):
+                                if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                                    arr = arr.astype(mx.float32)
+                                tensors[f"ext_{li}_state_{j}"] = np.array(arr)
+                            meta = layer_dict.get("meta_state", ())
+                            if isinstance(meta, (list, tuple)):
+                                for j, s in enumerate(meta):
+                                    tensors[f"ext_{li}_meta_{j}"] = np.frombuffer(
+                                        str(s).encode(), dtype=np.uint8
+                                    )
+                            cn = layer_dict.get("class_name", "")
+                            tensors[f"ext_{li}_class"] = np.frombuffer(
+                                cn.encode(), dtype=np.uint8
+                            )
+                    else:
+                        # Legacy SSM raw-tensor format
+                        items = state if isinstance(state, (list, tuple)) else [state]
+                        for k, item in enumerate(items):
+                            sub = item if isinstance(item, (list, tuple)) else [item]
+                            for m, arr in enumerate(sub):
+                                if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                                    arr = arr.astype(mx.float32)
+                                tensors[f"r_{k}_{m}"] = np.array(arr)
+
+                    if tensors:
+                        tmp = rec_path + ".tmp"
+                        st_save(tensors, tmp)
+                        os.replace(tmp, rec_path)
 
                 parent_hash = node.parent.context_hash if node.parent is not None else 0
                 conn.execute(
@@ -435,28 +456,65 @@ class TurnPrefixCache:
             if rec_path and os.path.exists(rec_path):
                 try:
                     tensors = st_load(rec_path)
-                    # Reconstruct nested structure from r_k_m keys
-                    state_dict = {}
-                    max_k = -1
-                    for key in tensors.keys():
-                        if key.startswith("r_"):
-                            parts = key.split("_")
-                            k = int(parts[1])
-                            max_k = max(max_k, k)
 
-                    if max_k >= 0:
+                    if any(k.startswith("ext_") for k in tensors):
+                        # Dict format
+                        import importlib
+                        cache_mod = importlib.import_module("mlx_lm.models.cache")
+
+                        layer_indices = sorted({
+                            int(k.split("_")[1])
+                            for k in tensors
+                            if k.startswith("ext_")
+                        })
                         state_list = []
-                        for k in range(max_k + 1):
-                            layer_list = []
-                            m = 0
-                            while f"r_{k}_{m}" in tensors:
-                                layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
-                                m += 1
-                            if layer_list:
-                                state_list.append(layer_list if len(layer_list) > 1 else layer_list[0])
-                        recurrent_state = state_list if len(state_list) > 1 else (state_list[0] if state_list else None)
+                        for li in layer_indices:
+                            state_parts = []
+                            j = 0
+                            while f"ext_{li}_state_{j}" in tensors:
+                                state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
+                                j += 1
+                            meta_parts = []
+                            j = 0
+                            while f"ext_{li}_meta_{j}" in tensors:
+                                meta_parts.append(
+                                    bytes(tensors[f"ext_{li}_meta_{j}"]).decode()
+                                )
+                                j += 1
+                            cn = ""
+                            if f"ext_{li}_class" in tensors:
+                                cn = bytes(tensors[f"ext_{li}_class"]).decode()
+                            state_list.append({
+                                "state": tuple(state_parts),
+                                "meta_state": tuple(meta_parts) if meta_parts else "",
+                                "class_name": cn,
+                                "class_ref": getattr(cache_mod, cn, None),
+                            })
+                        recurrent_state = state_list or None
+
                     else:
-                        recurrent_state = None
+                        # Legacy SSM format
+                        max_k = -1
+                        for key in tensors.keys():
+                            if key.startswith("r_"):
+                                k = int(key.split("_")[1])
+                                max_k = max(max_k, k)
+                        if max_k >= 0:
+                            state_list = []
+                            for k in range(max_k + 1):
+                                layer_list = []
+                                m = 0
+                                while f"r_{k}_{m}" in tensors:
+                                    layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
+                                    m += 1
+                                if layer_list:
+                                    state_list.append(
+                                        layer_list if len(layer_list) > 1 else layer_list[0]
+                                    )
+                            recurrent_state = (
+                                state_list if len(state_list) > 1
+                                else (state_list[0] if state_list else None)
+                            )
                 except Exception as e:
                     logger.warning(f"[turn_cache] recurrent load failed for {ctx_hash}: {e}")
 
