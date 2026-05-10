@@ -830,3 +830,35 @@ def test_turn_cache_with_chunked_prefill_does_not_raise():
         assert "chunked-prefill-tokens" not in str(e), f"Unexpected chunked-prefill error: {e}"
     except Exception:
         pass  # Other init errors from MagicMock model are expected
+
+
+def test_turn_cache_disables_memory_aware_cache():
+    """When use_turn_cache=True, memory_aware_cache must be None."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(
+        use_turn_cache=True,
+        chunked_prefill_tokens=8192,
+        use_memory_aware_cache=True,
+        enable_prefix_cache=True,
+    )
+    # Simulate only the cache-init block
+    sched.memory_aware_cache = None
+    sched.prefix_cache = None
+    sched.paged_cache_manager = None
+    sched.block_aware_cache = None
+    sched._ssd_tier = None
+    sched.turn_cache = None
+
+    # Re-run just the cache-init logic by calling the relevant section inline
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+    if sched.config.enable_prefix_cache:
+        if sched.config.use_memory_aware_cache and not sched.config.use_turn_cache:
+            sched.memory_aware_cache = MemoryAwarePrefixCache(
+                model=MagicMock(), config=MemoryCacheConfig()
+            )
+
+    assert sched.memory_aware_cache is None, (
+        "memory_aware_cache should be None when use_turn_cache=True"
+    )

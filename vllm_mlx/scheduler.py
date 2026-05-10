@@ -1203,7 +1203,7 @@ class Scheduler:
                     f"Paged cache enabled: block_size={self.config.paged_cache_block_size}, "
                     f"max_blocks={self.config.max_cache_blocks}"
                 )
-            elif self.config.use_memory_aware_cache:
+            elif self.config.use_memory_aware_cache and not self.config.use_turn_cache:
                 # Use memory-aware cache (recommended for large models)
                 cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.cache_memory_mb,
