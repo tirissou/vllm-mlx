@@ -1243,13 +1243,16 @@ async def lifespan(app: FastAPI):
 
     cleanup_exc: BaseException | None = None
     try:
-        # Shutdown: Save cache to disk BEFORE stopping engine
+        # Shutdown: Save cache to disk BEFORE stopping engine.
+        # Use the async wrapper so the blocking I/O runs off the event loop,
+        # and so it shares the same path (stream-binding, error handling) as
+        # the residency-manager-driven save in _persist_engine_state.
         if (
             _residency_manager is None
             and _engine is not None
             and hasattr(_engine, "save_cache_to_disk")
         ):
-            _save_prefix_cache_to_disk()
+            await _run_blocking_engine_cache_io(_save_prefix_cache_to_disk, _engine)
 
         # Shutdown: Close MCP connections and stop engine
         if _lifecycle_task is not None:

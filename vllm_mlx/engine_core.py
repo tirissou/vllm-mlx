@@ -110,6 +110,7 @@ class EngineCore:
         self._task: Optional[asyncio.Task] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+        self._worker_executor: Optional[ThreadPoolExecutor] = None
 
         logger.debug(f"Engine {self._engine_id} initialized")
 
@@ -152,6 +153,7 @@ class EngineCore:
 
         loop = asyncio.get_running_loop()
         worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+        self._worker_executor = worker
         worker_stream_bound = False
         model_thread_stream_bound = False
         use_worker_thread = True
@@ -331,6 +333,7 @@ class EngineCore:
                 else:
                     self.scheduler._close_batch_generator()
             finally:
+                self._worker_executor = None
                 worker.shutdown(wait=True)
 
     async def add_request(
@@ -628,7 +631,19 @@ class EngineCore:
         return self.scheduler.get_cache_stats()
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
-        """Save prefix cache to disk."""
+        """Save prefix cache to disk.
+
+        MLX arrays computed on the engine worker thread are stream-affine:
+        they must be evaluated from the same thread that bound their stream.
+        If the worker executor is still alive (normal shutdown path), we submit
+        the save to it so it runs with the correct GPU stream bound.
+        """
+        executor = self._worker_executor
+        if executor is not None:
+            try:
+                return executor.submit(self.scheduler.save_cache_to_disk, cache_dir).result()
+            except RuntimeError:
+                pass  # executor already shut down
         return self.scheduler.save_cache_to_disk(cache_dir)
 
     def load_cache_from_disk(self, cache_dir: str) -> int:

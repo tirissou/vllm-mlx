@@ -3010,17 +3010,42 @@ class Scheduler:
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
+        result = False
         if self.memory_aware_cache is not None:
-            return self.memory_aware_cache.save_to_disk(cache_dir)
-        logger.info("[cache_persist] no memory-aware cache to save")
-        return False
+            result = self.memory_aware_cache.save_to_disk(cache_dir)
+        else:
+            logger.info("[cache_persist] no memory-aware cache to save")
+
+        if self.turn_cache is not None:
+            import os
+            turn_dir = os.path.join(cache_dir, "turn_cache")
+            try:
+                self.turn_cache.save(turn_dir)
+                logger.info(f"[cache_persist] TurnPrefixCache saved to {turn_dir}")
+                result = True
+            except Exception as e:
+                logger.error(f"[cache_persist] TurnPrefixCache save failed: {e}")
+
+        return result
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
+        count = 0
         if self.memory_aware_cache is not None:
-            return self.memory_aware_cache.load_from_disk(cache_dir)
-        logger.info("[cache_persist] no memory-aware cache to load into")
-        return 0
+            count = self.memory_aware_cache.load_from_disk(cache_dir)
+        else:
+            logger.info("[cache_persist] no memory-aware cache to load into")
+
+        if self.turn_cache is not None:
+            import os
+            turn_dir = os.path.join(cache_dir, "turn_cache")
+            try:
+                self.turn_cache.load(turn_dir)
+                logger.info(f"[cache_persist] TurnPrefixCache loaded from {turn_dir}")
+            except Exception as e:
+                logger.error(f"[cache_persist] TurnPrefixCache load failed: {e}")
+
+        return count
 
     def clear_prefix_cache(self) -> None:
         """Clear the in-memory prefix cache (keeps disk cache untouched)."""
