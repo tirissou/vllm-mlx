@@ -993,7 +993,6 @@ def test_store_side_sets_recurrent_state_on_system_segment():
     sys_tokens = list(range(10))
     user_tokens = list(range(10, 15))
     sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
-    user_state = _make_extracted_state(n_layers=2, n_tokens=15)
 
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + user_tokens

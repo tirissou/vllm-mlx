@@ -2510,6 +2510,7 @@ class Scheduler:
                             # memory can be reclaimed (the quantized copy
                             # lives inside the prefix cache now).
                             request._extracted_cache = None
+                            request._sys_prompt_state = None
                         except Exception as e:
                             logger.debug(
                                 f"Failed to store memory-aware cache for {request_id}: {e}"
@@ -2536,6 +2537,8 @@ class Scheduler:
                                         state = ec
                                     else:
                                         state = self._extract_cache_states(ec)
+                                        if not state:
+                                            state = None
                                 else:
                                     state = None
                                 parent = self.turn_cache.insert(
