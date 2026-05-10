@@ -55,6 +55,60 @@ def test_config_defaults():
     assert cfg.ssd_max_gb == 0.0
 
 
+def test_node_data_bytes_counts_dict_format_recurrent_state():
+    """_node_data_bytes correctly accounts for dict-format recurrent_state tensor sizes."""
+    from mlx_lm.models.cache import KVCache
+
+    # 2 layers, each with keys+values of shape [1, 4, 10, 32] in float32 = 4 bytes/elem
+    # Each tensor: 1*4*10*32 = 1280 elements * 4 bytes = 5120 bytes
+    # 2 tensors (K+V) per layer, 2 layers → 4 * 5120 = 20480 bytes total
+    extracted = [
+        {
+            "state": (
+                mx.zeros([1, 4, 10, 32], dtype=mx.float32),
+                mx.zeros([1, 4, 10, 32], dtype=mx.float32),
+            ),
+            "meta_state": "",
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        },
+        {
+            "state": (
+                mx.zeros([1, 4, 10, 32], dtype=mx.float32),
+                mx.zeros([1, 4, 10, 32], dtype=mx.float32),
+            ),
+            "meta_state": "",
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        },
+    ]
+
+    node = TurnNode(
+        token_ids=[1],
+        context_hash=1,
+        kv_arrays=[],
+        kv_scales=[],
+        recurrent_state=extracted,
+        tokens_since_checkpoint=0,
+    )
+
+    expected_bytes = 4 * (1 * 4 * 10 * 32 * 4)  # 4 tensors, float32
+    assert _node_data_bytes(node) == expected_bytes
+
+
+def test_node_data_bytes_zero_for_empty_state():
+    """_node_data_bytes returns 0 when recurrent_state is None."""
+    node = TurnNode(
+        token_ids=[1],
+        context_hash=1,
+        kv_arrays=[],
+        kv_scales=[],
+        recurrent_state=None,
+        tokens_since_checkpoint=0,
+    )
+    assert _node_data_bytes(node) == 0
+
+
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 

@@ -82,7 +82,6 @@ def _node_data_bytes(node: TurnNode) -> int:
     total = 0
     if isinstance(node.kv_arrays, list):
         for arr in node.kv_arrays:
-            # Use shape+dtype to avoid triggering lazy eval
             nbytes = 1
             for d in arr.shape:
                 nbytes *= d
@@ -90,16 +89,28 @@ def _node_data_bytes(node: TurnNode) -> int:
             total += nbytes
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
         state = node.recurrent_state
-        items = state if isinstance(state, (list, tuple)) else [state]
-        for item in items:
-            sub = item if isinstance(item, (list, tuple)) else [item]
-            for arr in sub:
-                if hasattr(arr, "shape"):
-                    nbytes = 1
-                    for d in arr.shape:
-                        nbytes *= d
-                    nbytes *= arr.itemsize
-                    total += nbytes
+        if isinstance(state, list) and state and isinstance(state[0], dict):
+            # Dict format (_extract_cache_states): sum tensor sizes in each layer's state tuple
+            for layer_dict in state:
+                for arr in layer_dict.get("state", ()):
+                    if hasattr(arr, "shape"):
+                        nbytes = 1
+                        for d in arr.shape:
+                            nbytes *= d
+                        nbytes *= arr.itemsize
+                        total += nbytes
+        else:
+            # Legacy SSM raw-tensor format
+            items = state if isinstance(state, (list, tuple)) else [state]
+            for item in items:
+                sub = item if isinstance(item, (list, tuple)) else [item]
+                for arr in sub:
+                    if hasattr(arr, "shape"):
+                        nbytes = 1
+                        for d in arr.shape:
+                            nbytes *= d
+                        nbytes *= arr.itemsize
+                        total += nbytes
     return total
 
 
