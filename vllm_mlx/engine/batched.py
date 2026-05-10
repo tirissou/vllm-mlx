@@ -779,9 +779,11 @@ class BatchedEngine(BaseEngine):
             logits_processors=kwargs.pop("logits_processors", None),
         )
 
+        prefix_boundary = kwargs.pop("prefix_boundary", 0)
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            prefix_boundary=prefix_boundary,
         )
 
         text = clean_output_text(output.output_text)
@@ -947,6 +949,15 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             enable_thinking=enable_thinking,
         )
+
+        # Compute prefix boundary for turn cache (same as stream_chat)
+        prefix_boundary = self._compute_prefix_boundary(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if prefix_boundary > 0:
+            kwargs["prefix_boundary"] = prefix_boundary
 
         return await self.generate(
             prompt=prompt,

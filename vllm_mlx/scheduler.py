@@ -2013,10 +2013,18 @@ class Scheduler:
                 if path:
                     request.cache_hit_type = "hit"
                     request._turn_cache_path = path
-                    request.cached_tokens = sum(len(n.token_ids) for n in path)
                     ancestor = self.turn_cache.find_checkpoint_ancestor(path)
                     request.prompt_cache = ancestor.recurrent_state if ancestor else None
-                    request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
+                    if request.prompt_cache is not None:
+                        # We have real KV state — skip those tokens.
+                        request.cached_tokens = sum(len(n.token_ids) for n in path)
+                        request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
+                    else:
+                        # Segment matched but no KV state yet (MVP: empty arrays).
+                        # Process the full prompt so output is correct; keep _turn_cache_path
+                        # so the store pass knows which segments are already in the trie.
+                        request.cached_tokens = 0
+                        request.remaining_tokens = request.prompt_token_ids
                     logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request_id}")
                 else:
                     request.cache_hit_type = "miss"
@@ -3219,37 +3227,24 @@ class Scheduler:
     def _messages_to_segments(self, request: "Request") -> list:
         """Split a request's token sequence into per-message Segment objects.
 
-        Uses the message boundaries stored on the request. Falls back to
-        treating the whole prompt as a single segment if no messages are set.
+        Uses prefix_boundary (the exact token count before the last user message,
+        computed from the chat template) to split into a system-prompt segment and
+        a user segment.  This gives a stable, session-independent segment hash for
+        the system prompt so cross-session cache hits work correctly.
+
+        Falls back to an empty list when no usable boundary is available.
         """
         from .turn_prefix_cache import Segment
 
-        messages = getattr(request, "messages", None)
-        if not messages:
+        full_tokens = list(request.prompt_token_ids or [])
+        if not full_tokens:
             return []
 
-        # Tokenize each message in conversational context to find boundaries.
-        # The full token sequence is request.prompt_token_ids.
-        # We split it by re-tokenizing each prefix and noting where length grows.
-        full_tokens = list(request.prompt_token_ids or [])
-        segments: list[Segment] = []
-        pos = 0
-        for i, msg in enumerate(messages):
-            # Estimate end of this message's tokens using prefix tokenization
-            # For now, fall back to approximate: tokenize messages[0:i+1] and diff.
-            # The scheduler subclass or model runner should provide exact boundaries.
-            # This is a best-effort split; exact boundaries require chat-template-aware tokenization.
-            role = msg.get("role", "user") if isinstance(msg, dict) else getattr(msg, "role", "user")
-            # Use remaining tokens for the last message
-            if i == len(messages) - 1:
-                seg_tokens = full_tokens[pos:]
-            else:
-                # Rough split: assign proportional chunk
-                remaining_msgs = len(messages) - i
-                remaining_tokens = len(full_tokens) - pos
-                chunk = max(1, remaining_tokens // remaining_msgs)
-                seg_tokens = full_tokens[pos:pos + chunk]
-            if seg_tokens:
-                segments.append(Segment(role=role, token_ids=seg_tokens))
-                pos += len(seg_tokens)
-        return segments
+        prefix_boundary = getattr(request, "prefix_boundary", 0)
+        if prefix_boundary > 0 and prefix_boundary < len(full_tokens):
+            return [
+                Segment(role="system", token_ids=full_tokens[:prefix_boundary]),
+                Segment(role="user", token_ids=full_tokens[prefix_boundary:]),
+            ]
+
+        return []

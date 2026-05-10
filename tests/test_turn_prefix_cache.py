@@ -717,3 +717,87 @@ def test_gap_reconstruction_finds_ancestor():
     ancestor2 = cache.find_checkpoint_ancestor(path2)
     assert ancestor2 is n_sys  # falls back to sys permanent checkpoint
     cache.release(path2)
+
+
+def test_messages_to_segments_uses_prefix_boundary():
+    """Scheduler _messages_to_segments splits on prefix_boundary, not proportionally.
+
+    This is the fix for the cross-session system-prompt cache miss: both sessions
+    share the same prefix_boundary (len of system-prompt tokens), so the system-prompt
+    segment hash is stable across sessions with different user messages.
+    """
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler
+
+    # Build a minimal scheduler mock that has _messages_to_segments
+    sched = object.__new__(Scheduler)
+
+    # Simulate prompt_token_ids for [sys_prompt (10 tokens) + user "hi" (2 tokens)]
+    sys_tokens = list(range(10))
+    user_tokens_hi = [100, 101]
+    user_tokens_yo = [200, 201]
+
+    def make_request(user_tokens, boundary):
+        req = MagicMock()
+        req.prompt_token_ids = sys_tokens + user_tokens
+        req.prefix_boundary = boundary
+        return req
+
+    # Both sessions have the same prefix_boundary (system prompt length)
+    req1 = make_request(user_tokens_hi, 10)
+    req2 = make_request(user_tokens_yo, 10)
+
+    segs1 = sched._messages_to_segments(req1)
+    segs2 = sched._messages_to_segments(req2)
+
+    # Both produce two segments
+    assert len(segs1) == 2
+    assert len(segs2) == 2
+
+    # System prompt segment is IDENTICAL across sessions → same cache hash
+    assert segs1[0].token_ids == segs2[0].token_ids == sys_tokens
+    assert segs1[0].role == "system"
+
+    # User segments differ → different hash → no spurious hit beyond sys prompt
+    assert segs1[1].token_ids == user_tokens_hi
+    assert segs2[1].token_ids == user_tokens_yo
+    assert segs1[1].token_ids != segs2[1].token_ids
+
+
+def test_cross_session_hit_via_prefix_boundary():
+    """End-to-end: session 1 stores sys-prompt segment; session 2 gets a hit on it."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler
+    import mlx.core as mx
+
+    sched = object.__new__(Scheduler)
+
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(20))
+    user_hi = [100]
+    user_yo = [200]
+
+    def make_request(user_tokens):
+        req = MagicMock()
+        req.prompt_token_ids = sys_tokens + user_tokens
+        req.prefix_boundary = len(sys_tokens)  # exact system-prompt boundary
+        return req
+
+    # Session 1 store: insert sys segment + user-hi segment
+    req1 = make_request(user_hi)
+    segs1 = sched._messages_to_segments(req1)
+    assert len(segs1) == 2
+    n_sys = cache.insert(cache.root, segs1[0], [], [], None, is_system_prompt=True)
+    cache.insert(n_sys, segs1[1], [], [], None)
+
+    # Session 2 fetch: same system prompt, different user message
+    req2 = make_request(user_yo)
+    segs2 = sched._messages_to_segments(req2)
+    path, _ = cache.match(segs2)
+
+    # Must hit the system-prompt segment
+    assert len(path) >= 1
+    assert path[0] is n_sys
+    cache.release(path)
