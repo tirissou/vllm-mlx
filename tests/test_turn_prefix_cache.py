@@ -605,3 +605,115 @@ def test_scheduler_stores_and_serves_cache():
     assert len(path_partial) == 1
     assert path_partial[0] is n_sys
     cache.release(path_partial)
+
+
+# ── Integration tests ──────────────────────────────────────────────────────
+
+
+def test_multiturn_continuation():
+    """Session A stores [sys, u1, a1]; session A extended gets full hit on all three."""
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+
+    sys_seg = seg(list(range(50)), role="system")
+    u1_seg = seg([100, 101, 102])
+    a1_seg = seg([200, 201])
+
+    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+    n_u1 = cache.insert(n_sys, u1_seg, [], [], state)
+    n_a1 = cache.insert(n_u1, a1_seg, [], [], state)
+
+    # Next request: same [sys, u1, a1] prefix → full hit
+    path, has_recurrent = cache.match([sys_seg, u1_seg, a1_seg])
+    assert len(path) == 3
+    assert path[0] is n_sys
+    assert path[1] is n_u1
+    assert path[2] is n_a1
+    assert has_recurrent
+    cache.release(path)
+
+
+def test_cross_session_system_prompt_reuse():
+    """Session B with same system prompt gets immediate recurrent state hit."""
+    cache = make_cache(stride=10000)  # high stride so only sys_prompt gets permanent checkpoint
+    state = mx.zeros((1,))
+
+    sys_seg = seg(list(range(50)), role="system")
+    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+    assert n_sys.is_permanent_checkpoint
+
+    # Session B: same system prompt
+    path, has_recurrent = cache.match([sys_seg])
+    assert len(path) == 1
+    assert has_recurrent  # permanent checkpoint → recurrent available immediately
+    cache.release(path)
+
+
+def test_mid_session_branching():
+    """Two sessions share [sys, u1, a1] but diverge at u2."""
+    cache = make_cache(stride=0)
+    state = mx.zeros((1,))
+
+    sys_seg = seg(list(range(10)), role="system")
+    u1_seg = seg([100])
+    a1_seg = seg([200])
+    u2a_seg = seg([300])   # branch A
+    u2b_seg = seg([400])   # branch B
+
+    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+    n_u1 = cache.insert(n_sys, u1_seg, [], [], state)
+    n_a1 = cache.insert(n_u1, a1_seg, [], [], state)
+    n_u2a = cache.insert(n_a1, u2a_seg, [], [], state)
+    n_u2b = cache.insert(n_a1, u2b_seg, [], [], state)
+
+    # Branch A
+    path_a, _ = cache.match([sys_seg, u1_seg, a1_seg, u2a_seg])
+    assert len(path_a) == 4
+    assert path_a[3] is n_u2a
+    cache.release(path_a)
+
+    # Branch B
+    path_b, _ = cache.match([sys_seg, u1_seg, a1_seg, u2b_seg])
+    assert len(path_b) == 4
+    assert path_b[3] is n_u2b
+    cache.release(path_b)
+
+    # Shared nodes are the same objects
+    assert path_a[0] is path_b[0]  # sys
+    assert path_a[1] is path_b[1]  # u1
+    assert path_a[2] is path_b[2]  # a1
+
+
+def test_gap_reconstruction_finds_ancestor():
+    """When branch point has no recurrent, nearest checkpoint ancestor is identified."""
+    cache = make_cache(stride=10000)
+    state = mx.zeros((1,))
+
+    sys_seg = seg(list(range(50)), role="system")
+    u1_seg = seg([100, 101])
+    a1_seg = seg([200])
+
+    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
+    n_u1 = cache.insert(n_sys, u1_seg, [], [], state)
+    n_a1 = cache.insert(n_u1, a1_seg, [], [], state)
+    # n_u1's temp recurrent was pruned when n_a1 was added (stride not met)
+    assert n_u1.recurrent_state is None
+
+    path, has_recurrent = cache.match([sys_seg, u1_seg, a1_seg])
+    assert has_recurrent  # n_a1 is leaf → has temp recurrent
+    ancestor = cache.find_checkpoint_ancestor(path)
+    # Deepest permanent checkpoint with recurrent is n_sys
+    assert ancestor is n_sys
+    cache.release(path)
+
+    # Now add a child to n_a1 — its temp recurrent is pruned
+    u2_seg = seg([300])
+    cache.insert(n_a1, u2_seg, [], [], state)
+    assert n_a1.recurrent_state is None  # pruned
+
+    # New request ending at n_a1: no recurrent at n_a1, walk up to n_sys
+    path2, has_recurrent2 = cache.match([sys_seg, u1_seg, a1_seg])
+    assert not has_recurrent2
+    ancestor2 = cache.find_checkpoint_ancestor(path2)
+    assert ancestor2 is n_sys  # falls back to sys permanent checkpoint
+    cache.release(path2)
