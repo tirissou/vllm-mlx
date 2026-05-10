@@ -891,9 +891,6 @@ class _MockKVLayer:
     def meta_state(self):
         return (str(self._n),)
 
-    def __class_getitem__(cls, item):
-        return cls
-
 
 def test_mid_prefill_stores_sys_prompt_state_at_boundary():
     """_mid_prefill_save sets request._sys_prompt_state at prefix_boundary."""
@@ -942,3 +939,25 @@ def test_mid_prefill_does_not_store_state_away_from_boundary():
 
     # _sys_prompt_state should remain None — callback returns early due to throttle
     assert req._sys_prompt_state is None
+
+
+def test_mid_prefill_does_not_store_state_away_from_boundary_past_interval():
+    """_mid_prefill_save does NOT set _sys_prompt_state when past save_interval but not at boundary."""
+    from unittest.mock import MagicMock
+    sched = _make_minimal_scheduler_with_turn_cache()
+
+    req = MagicMock()
+    req.prompt_token_ids = list(range(30))
+    req.prefix_boundary = 20
+    req.cached_tokens = 0
+    req._mid_prefill_last_save = 0
+    req._sys_prompt_state = None
+    sched.requests["req1"] = req
+    sched.uid_to_request_id[1] = "req1"
+
+    # processed_tokens=15 exceeds save_interval=10, but is NOT at prefix_boundary=20
+    mock_cache = [_MockKVLayer(15)]
+    cb = sched._make_mid_prefill_save_callback(save_interval=10)
+    cb(uid=1, processed_tokens=15, prompt_cache=mock_cache)
+
+    assert req._sys_prompt_state is None, "_sys_prompt_state should not be set away from boundary"

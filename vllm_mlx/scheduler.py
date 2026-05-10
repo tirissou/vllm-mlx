@@ -1505,7 +1505,8 @@ class Scheduler:
         prompt_cache).  It extracts the cache state (immutable MLX array
         snapshots), reconstructs KVCache objects, and stores them in the
         memory-aware prefix cache so that a subsequent request with the same
-        prompt prefix can skip the already-computed tokens.
+        prompt prefix can skip the already-computed tokens. For turn_cache,
+        it also captures the system-prompt state at the prefix boundary.
         """
         import time as _time
 
@@ -1563,6 +1564,7 @@ class Scheduler:
                 extracted = self._extract_cache_states(prompt_cache)
                 if extracted:
                     request._sys_prompt_state = extracted
+                    request._mid_prefill_last_save = total_cached
                     logger.info(
                         f"[turn_cache] sys_prompt_state captured at boundary={prefix_boundary} "
                         f"layers={len(extracted)} for {request_id[:12]}"
