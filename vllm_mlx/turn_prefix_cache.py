@@ -507,7 +507,8 @@ class TurnPrefixCache:
                 if arr.dtype == mx.bfloat16:
                     arr = arr.astype(mx.float32)
                 tensors[f"kv_{j}"] = np.array(arr)
-                if node.kv_scales:
+                # Only save scale if it exists and we have enough scales
+                if node.kv_scales and j < len(node.kv_scales):
                     tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
             tmp = path + ".tmp"
             st_save(tensors, tmp)
@@ -566,7 +567,31 @@ class TurnPrefixCache:
             path = node.recurrent_state.file_path
             if os.path.exists(path):
                 try:
-                    node.recurrent_state = st_load(path)
+                    tensors = st_load(path)
+                    # Reconstruct nested structure from flat dict keys r_{k}_{m}
+                    state_list = []
+                    k = 0
+                    max_k = -1
+                    for key in tensors.keys():
+                        if key.startswith("r_"):
+                            parts = key.split("_")
+                            if len(parts) >= 3:
+                                try:
+                                    k_idx = int(parts[1])
+                                    max_k = max(max_k, k_idx)
+                                except ValueError:
+                                    pass
+
+                    for k in range(max_k + 1):
+                        layer_list = []
+                        m = 0
+                        while f"r_{k}_{m}" in tensors:
+                            layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
+                            m += 1
+                        if layer_list:
+                            state_list.append(layer_list if len(layer_list) > 1 else layer_list[0])
+
+                    node.recurrent_state = state_list if len(state_list) > 1 else (state_list[0] if state_list else None)
                 except Exception as e:
                     logger.warning(f"[turn_cache] SSD recurrent promote failed: {e}")
                     node.recurrent_state = None

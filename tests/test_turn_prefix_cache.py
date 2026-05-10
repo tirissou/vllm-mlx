@@ -489,3 +489,30 @@ def test_promote_returns_false_on_missing_file(tmp_path):
     node.kv_arrays = SSDRef(file_path="/nonexistent/file.safetensors", size_bytes=0)
     result = cache._promote_from_ssd(node)
     assert result is False
+
+
+def test_promote_restores_recurrent_state(tmp_path):
+    """Regression test: recurrent state is properly reconstructed from SSD."""
+    cache = make_ssd_cache(tmp_path)
+    # Create nested recurrent state structure (list of layers)
+    state = [mx.ones((2, 3)), mx.ones((4, 5))]
+    kv = [mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)]
+    node = cache.insert(cache.root, seg([1, 2, 3]), kv, [1.0], state)
+
+    # Verify before spill
+    assert isinstance(node.recurrent_state, list)
+    assert len(node.recurrent_state) == 2
+
+    # Spill and promote
+    cache._spill_to_ssd(node)
+    assert isinstance(node.kv_arrays, SSDRef)
+    assert isinstance(node.recurrent_state, SSDRef)
+
+    success = cache._promote_from_ssd(node)
+    assert success
+
+    # Verify recurrent state is restored as list
+    assert isinstance(node.recurrent_state, list)
+    assert len(node.recurrent_state) == 2
+    assert node.recurrent_state[0].shape == (2, 3)
+    assert node.recurrent_state[1].shape == (4, 5)
