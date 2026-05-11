@@ -1016,21 +1016,47 @@ class BatchedEngine(BaseEngine):
                     for k, v in chat_template_kwargs.items():
                         if k != "add_generation_prompt":
                             kwargs[k] = v
+
+                messages_to_use = prefix_messages
                 try:
-                    prefix_text = tokenizer.apply_chat_template(prefix_messages, **kwargs)
+                    prefix_text = tokenizer.apply_chat_template(messages_to_use, **kwargs)
                 except TypeError as e:
                     try:
                         prefix_text = tokenizer.apply_chat_template(
-                            prefix_messages,
+                            messages_to_use,
                             tokenize=False,
                             add_generation_prompt=False,
                         )
                     except Exception as e2:
-                        logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e2).__name__}: {e2}")
-                        return 0
+                        # If "No user query found", add dummy user message
+                        if "No user query" in str(e2) and not any(m.get("role") == "user" for m in prefix_messages):
+                            messages_to_use = list(prefix_messages) + [{"role": "user", "content": ""}]
+                            try:
+                                prefix_text = tokenizer.apply_chat_template(
+                                    messages_to_use,
+                                    tokenize=False,
+                                    add_generation_prompt=False,
+                                )
+                                logger.info(f"[DEBUG] _lcp_closed: added dummy user msg for {[m.get('role') for m in prefix_messages]}")
+                            except Exception as e3:
+                                logger.info(f"[DEBUG] _lcp_closed: still failed after dummy user: {type(e3).__name__}: {e3}")
+                                return 0
+                        else:
+                            logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e2).__name__}: {e2}")
+                            return 0
                 except Exception as e:
-                    logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e).__name__}: {e}")
-                    return 0
+                    # If "No user query found", add dummy user message
+                    if "No user query" in str(e) and not any(m.get("role") == "user" for m in prefix_messages):
+                        messages_to_use = list(prefix_messages) + [{"role": "user", "content": ""}]
+                        try:
+                            prefix_text = tokenizer.apply_chat_template(messages_to_use, **kwargs)
+                            logger.info(f"[DEBUG] _lcp_closed: added dummy user msg for {[m.get('role') for m in prefix_messages]}")
+                        except Exception as e2:
+                            logger.info(f"[DEBUG] _lcp_closed: still failed after dummy user: {type(e2).__name__}: {e2}")
+                            return 0
+                    else:
+                        logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e).__name__}: {e}")
+                        return 0
                 prefix_tokens = tokenizer.encode(prefix_text)
                 lcp = 0
                 for j in range(min(len(full_tokens), len(prefix_tokens))):
