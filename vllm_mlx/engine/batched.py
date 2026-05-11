@@ -991,22 +991,33 @@ class BatchedEngine(BaseEngine):
         """Compute token boundaries for cache segmentation.
 
         Returns (prefix_boundary, sys_end_boundary, turn_boundaries):
-          - prefix_boundary: tokens before the last user message (dynamic per turn)
-          - sys_end_boundary: tokens before the first user message (stable across turns)
-          - turn_boundaries: tokens before each intermediate user message (between first and last)
+          - prefix_boundary: tokens before the last turn-start message
+          - sys_end_boundary: tokens before the first non-system message (stable)
+          - turn_boundaries: tokens before each intermediate turn-start message
+
+        A "turn-start" is a message that begins a new cacheable segment:
+          - any user message, OR
+          - any assistant message whose previous message is a tool result
+            (= start of a new agentic step in tool-use conversations)
 
         Uses LCP comparisons so that chat-template quirks (e.g. Qwen3 <think>
         markers appended to the last assistant turn) don't shift the boundary.
         """
-        # Collect all user message indices
-        all_user_indices = []
+        # Collect all turn-start indices (user messages + agentic assistant restarts)
+        turn_start_indices = []
         for i, m in enumerate(messages):
-            if m.get("role") == "user":
-                all_user_indices.append(i)
-        if not all_user_indices or all_user_indices[-1] == 0:
+            role = m.get("role")
+            if role == "system":
+                continue
+            prev_role = messages[i - 1].get("role") if i > 0 else None
+            if role == "user":
+                turn_start_indices.append(i)
+            elif role == "assistant" and prev_role == "tool":
+                turn_start_indices.append(i)
+
+        if len(turn_start_indices) < 2:
+            # Need at least two turn-starts to have a meaningful prefix boundary
             return 0, 0, []
-        first_user_idx = all_user_indices[0]
-        last_user_idx = all_user_indices[-1]
         try:
             template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -1025,8 +1036,10 @@ class BatchedEngine(BaseEngine):
 
             def _lcp(dummy_idx: int) -> int:
                 dummy_messages = list(messages)
+                # Drop tool_calls/tool_call_id so the LCP falls at the start
+                # of this message's content rather than somewhere inside it.
                 dummy_messages[dummy_idx] = {
-                    **messages[dummy_idx],
+                    "role": messages[dummy_idx]["role"],
                     "content": "XXXXXXXXXX",
                 }
                 dummy_prompt = self._apply_chat_template(
@@ -1042,18 +1055,20 @@ class BatchedEngine(BaseEngine):
                     lcp = j + 1
                 return lcp
 
-            # prefix_boundary: before the last user message
-            prefix_boundary = _lcp(last_user_idx)
+            first_idx = turn_start_indices[0]
+            last_idx = turn_start_indices[-1]
 
-            # sys_end_boundary: before the first user message (stable across all turns)
-            if first_user_idx == last_user_idx:
-                sys_end_boundary = prefix_boundary  # single-user turn, same point
-                return prefix_boundary, sys_end_boundary, []
-            else:
-                sys_end_boundary = _lcp(first_user_idx)
+            # sys_end_boundary: before the first turn-start (stable across all turns)
+            sys_end_boundary = _lcp(first_idx)
 
-            # Intermediate boundaries: before each user message between first and last
-            turn_boundaries = [_lcp(idx) for idx in all_user_indices[1:-1]]
+            # prefix_boundary: before the last turn-start message
+            prefix_boundary = _lcp(last_idx)
+
+            if prefix_boundary <= sys_end_boundary:
+                return 0, 0, []
+
+            # Intermediate boundaries: before each turn-start between first and last
+            turn_boundaries = [_lcp(idx) for idx in turn_start_indices[1:-1]]
 
             return prefix_boundary, sys_end_boundary, turn_boundaries
         except Exception:

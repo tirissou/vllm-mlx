@@ -2607,6 +2607,9 @@ class Scheduler:
                             _tb = getattr(request, "turn_boundaries", None)
                             turn_boundaries = _tb if isinstance(_tb, list) else []
                             turn_boundary_states = getattr(request, "_turn_boundary_states", {}) or {}
+                            # parent_before_user tracks the node that will be the parent
+                            # of both the user structural node AND the response node.
+                            parent_before_user = parent
                             for i, segment in enumerate(new_segments):
                                 abs_idx = matched_depth + i
                                 is_sys = segment.role == "system" and abs_idx == 0
@@ -2614,14 +2617,11 @@ class Scheduler:
                                 if is_sys:
                                     state = getattr(request, "_sys_prompt_state", None)
                                 elif is_last:
-                                    # Last new segment: _extracted_cache covers prompt+output
-                                    ec = request._extracted_cache
-                                    if isinstance(ec, list) and ec and isinstance(ec[0], dict):
-                                        state = ec
-                                    else:
-                                        state = self._extract_cache_states(ec)
-                                        if not state:
-                                            state = None
+                                    # User segment stored as structural node (no KV).
+                                    # The completed exchange (user_tokens + output_tokens)
+                                    # is stored as a sibling conversation node below so
+                                    # the next turn's history segment can hit it.
+                                    state = None
                                 elif segment.role == "conversation":
                                     # History segment h (0-indexed), h = abs_idx - 1
                                     h = abs_idx - 1
@@ -2636,6 +2636,44 @@ class Scheduler:
                                 parent = self.turn_cache.insert(
                                     parent, segment, [], [], state, is_system_prompt=is_sys
                                 )
+                                if not is_last:
+                                    parent_before_user = parent
+
+                            # Store the completed exchange (user_tokens + output_tokens) as a
+                            # conversation node under the same parent as the user node.
+                            # On the next turn this exchange becomes a history segment
+                            # (conv = user_tokens+output_tokens) and will match here,
+                            # providing a deep cache hit that includes the response.
+                            prefix_boundary = getattr(request, "prefix_boundary", 0)
+                            if (
+                                request.output_token_ids
+                                and prefix_boundary > 0
+                                and request.prompt_token_ids
+                                and new_segments
+                            ):
+                                from .turn_prefix_cache import Segment as _Seg
+                                response_tokens = (
+                                    list(request.prompt_token_ids[prefix_boundary:])
+                                    + list(request.output_token_ids)
+                                )
+                                ec = request._extracted_cache
+                                if isinstance(ec, list) and ec and isinstance(ec[0], dict):
+                                    resp_state = ec
+                                else:
+                                    resp_state = self._extract_cache_states(ec) or None
+                                self.turn_cache.insert(
+                                    parent_before_user,
+                                    _Seg(role="conversation", token_ids=response_tokens),
+                                    [], [], resp_state, is_system_prompt=False,
+                                )
+                                logger.info(
+                                    f"[turn_cache] stored response node: "
+                                    f"{len(response_tokens)} tokens "
+                                    f"({len(request.prompt_token_ids) - prefix_boundary} user "
+                                    f"+ {len(request.output_token_ids)} output) "
+                                    f"for {request_id[:12]}"
+                                )
+
                             if path:
                                 self.turn_cache.release(path)
                         except Exception as e:
