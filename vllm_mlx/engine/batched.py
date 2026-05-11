@@ -953,7 +953,11 @@ class BatchedEngine(BaseEngine):
         # Compute turn boundaries for turn cache (same as stream_chat)
         turn_boundaries = self._compute_turn_boundaries(
             messages,
+            tools=template_tools,
+            num_images=len(all_images),
+            num_audios=len(all_audios),
             chat_template_kwargs=chat_template_kwargs,
+            enable_thinking=enable_thinking,
         )
         logger.info(f"[turn_cache] chat() computed turn_boundaries={turn_boundaries}")
         kwargs["turn_boundaries"] = turn_boundaries
@@ -972,7 +976,11 @@ class BatchedEngine(BaseEngine):
     def _compute_turn_boundaries(
         self,
         messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        num_images: int = 0,
+        num_audios: int = 0,
         chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
     ) -> list[int]:
         """Compute exact token boundaries for cache segmentation by parsing template output.
 
@@ -996,7 +1004,12 @@ class BatchedEngine(BaseEngine):
             boundary_kwargs_with_no_gen = {**boundary_kwargs, "add_generation_prompt": False}
 
             full_prompt = self._apply_chat_template(
-                messages, chat_template_kwargs=boundary_kwargs_with_no_gen
+                messages,
+                tools=tools,
+                num_images=num_images,
+                num_audios=num_audios,
+                chat_template_kwargs=boundary_kwargs_with_no_gen,
+                enable_thinking=enable_thinking,
             )
             full_tokens = tokenizer.encode(full_prompt)
             logger.info(f"[turn_cache] _compute_turn_boundaries: full_prompt len={len(full_prompt)}, full_tokens len={len(full_tokens)}")
@@ -1017,7 +1030,12 @@ class BatchedEngine(BaseEngine):
 
                 try:
                     prefix_prompt = self._apply_chat_template(
-                        prefix, chat_template_kwargs=boundary_kwargs_with_no_gen
+                        prefix,
+                        tools=tools,
+                        num_images=num_images,
+                        num_audios=num_audios,
+                        chat_template_kwargs=boundary_kwargs_with_no_gen,
+                        enable_thinking=enable_thinking,
                     )
                 except Exception as e:
                     logger.info(f"[turn_cache] prefix i={i}: template failed: {e}")
@@ -1147,7 +1165,11 @@ class BatchedEngine(BaseEngine):
         # Compute turn boundaries for cache
         turn_boundaries = self._compute_turn_boundaries(
             messages,
+            tools=template_tools,
+            num_images=len(all_images),
+            num_audios=len(all_audios),
             chat_template_kwargs=chat_template_kwargs,
+            enable_thinking=enable_thinking,
         )
         logger.info(f"[turn_cache] stream_chat() computed turn_boundaries={turn_boundaries}")
         kwargs["turn_boundaries"] = turn_boundaries
