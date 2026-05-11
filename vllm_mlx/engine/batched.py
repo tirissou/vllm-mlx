@@ -1018,18 +1018,18 @@ class BatchedEngine(BaseEngine):
                             kwargs[k] = v
                 try:
                     prefix_text = tokenizer.apply_chat_template(prefix_messages, **kwargs)
-                except TypeError:
+                except TypeError as e:
                     try:
                         prefix_text = tokenizer.apply_chat_template(
                             prefix_messages,
                             tokenize=False,
                             add_generation_prompt=False,
                         )
-                    except Exception:
-                        logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}")
+                    except Exception as e2:
+                        logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e2).__name__}: {e2}")
                         return 0
-                except Exception:
-                    logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}")
+                except Exception as e:
+                    logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e).__name__}: {e}")
                     return 0
                 prefix_tokens = tokenizer.encode(prefix_text)
                 lcp = 0
