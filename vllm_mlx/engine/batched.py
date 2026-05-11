@@ -1000,9 +1000,9 @@ class BatchedEngine(BaseEngine):
             full_prompt = self._apply_chat_template(
                 messages, chat_template_kwargs=chat_template_kwargs
             )
-            logger.debug(f"[DEBUG] _compute_turn_boundaries: full_prompt length={len(full_prompt)}")
+            logger.info(f"[DEBUG] _compute_turn_boundaries: full_prompt length={len(full_prompt)}, preview={full_prompt[:100]}")
             full_tokens = tokenizer.encode(full_prompt)
-            logger.debug(f"[DEBUG] _compute_turn_boundaries: full_tokens length={len(full_tokens)}")
+            logger.info(f"[DEBUG] _compute_turn_boundaries: full_tokens length={len(full_tokens)}")
             if not full_tokens:
                 logger.info(f"[DEBUG] _compute_turn_boundaries: tokenizer.encode returned empty")
                 return []
@@ -1026,8 +1026,10 @@ class BatchedEngine(BaseEngine):
                             add_generation_prompt=False,
                         )
                     except Exception:
+                        logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}")
                         return 0
                 except Exception:
+                    logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}")
                     return 0
                 prefix_tokens = tokenizer.encode(prefix_text)
                 lcp = 0
@@ -1035,14 +1037,15 @@ class BatchedEngine(BaseEngine):
                     if full_tokens[j] != prefix_tokens[j]:
                         break
                     lcp = j + 1
+                logger.debug(f"[DEBUG] _lcp_closed({[m.get('role') for m in prefix_messages]}): prefix_len={len(prefix_text)}, prefix_tokens={len(prefix_tokens)}, lcp={lcp}")
                 return lcp
 
             boundaries: list[int] = []
 
             B_sys = _lcp_closed([messages[0]])
-            logger.debug(f"[DEBUG] _compute_turn_boundaries: B_sys={B_sys}, len(full_tokens)={len(full_tokens)}")
+            logger.info(f"[DEBUG] _compute_turn_boundaries: B_sys={B_sys}, len(full_tokens)={len(full_tokens)}")
             if B_sys <= 0 or B_sys >= len(full_tokens):
-                logger.info(f"[DEBUG] _compute_turn_boundaries: B_sys out of range")
+                logger.info(f"[DEBUG] _compute_turn_boundaries: B_sys out of range (B_sys={B_sys}, full_tokens={len(full_tokens)})")
                 return []
             boundaries.append(B_sys)
 
