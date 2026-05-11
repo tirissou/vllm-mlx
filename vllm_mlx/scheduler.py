@@ -2097,8 +2097,15 @@ class Scheduler:
                     else:
                         request.prompt_cache = raw_state
                     if request.prompt_cache is not None:
-                        # We have real KV state — skip those tokens.
-                        request.cached_tokens = sum(len(n.token_ids) for n in path)
+                        # cached_tokens must equal the KV coverage of the ancestor, not the
+                        # full matched depth. Structural nodes (no KV state) may sit deeper
+                        # in the path than the ancestor; skipping past them with mismatched
+                        # KV coverage corrupts the attention context and produces gibberish.
+                        ancestor_idx = next(
+                            (i for i, n in enumerate(path) if n is ancestor),
+                            len(path) - 1,
+                        )
+                        request.cached_tokens = sum(len(n.token_ids) for n in path[: ancestor_idx + 1])
                         request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
                     else:
                         # Segment matched but no KV state yet (MVP: empty arrays).
