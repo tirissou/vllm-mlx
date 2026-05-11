@@ -1055,20 +1055,50 @@ class BatchedEngine(BaseEngine):
                     lcp = j + 1
                 return lcp
 
+            # Collect end-of-message token IDs for backward scan in _lcp_end
+            _eos_ids: set[int] = set()
+            if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+                _eos_ids.add(tokenizer.eos_token_id)
+            if hasattr(tokenizer, "convert_tokens_to_ids"):
+                for _tok_name in ("<|im_end|>", "<|eot_id|>"):
+                    try:
+                        _tid = tokenizer.convert_tokens_to_ids(_tok_name)
+                        if isinstance(_tid, int) and _tid != getattr(tokenizer, "unk_token_id", None):
+                            _eos_ids.add(_tid)
+                    except Exception:
+                        pass
+
+            def _lcp_end(dummy_idx: int) -> int:
+                """Position just after the end-of-message token preceding message[dummy_idx].
+
+                Shifts the boundary from start of message content (_lcp) to just
+                after the preceding <|im_end|> token, so that segments begin with
+                the inter-turn separator (e.g. '\\n<|im_start|>user\\n'). This makes
+                response_tokens = prompt[prefix_boundary:] + output_token_ids exactly
+                equal to the next turn's conversation segment, enabling cache hits.
+                """
+                content_start = _lcp(dummy_idx)
+                if not _eos_ids:
+                    return content_start
+                for i in range(content_start - 1, max(-1, content_start - 20), -1):
+                    if real_tokens[i] in _eos_ids:
+                        return i + 1
+                return content_start
+
             first_idx = turn_start_indices[0]
             last_idx = turn_start_indices[-1]
 
-            # sys_end_boundary: before the first turn-start (stable across all turns)
-            sys_end_boundary = _lcp(first_idx)
+            # sys_end_boundary: just after end-of-message token before first turn-start
+            sys_end_boundary = _lcp_end(first_idx)
 
-            # prefix_boundary: before the last turn-start message
-            prefix_boundary = _lcp(last_idx)
+            # prefix_boundary: just after end-of-message token before last turn-start
+            prefix_boundary = _lcp_end(last_idx)
 
             if prefix_boundary <= sys_end_boundary:
                 return 0, 0, []
 
-            # Intermediate boundaries: before each turn-start between first and last
-            turn_boundaries = [_lcp(idx) for idx in turn_start_indices[1:-1]]
+            # Intermediate boundaries: just after end-of-message before each intermediate turn-start
+            turn_boundaries = [_lcp_end(idx) for idx in turn_start_indices[1:-1]]
 
             return prefix_boundary, sys_end_boundary, turn_boundaries
         except Exception:
