@@ -2589,56 +2589,39 @@ class Scheduler:
                             matched_depth = len(path)
                             parent = path[-1] if path else self.turn_cache.root
                             new_segments = segments[matched_depth:]
-                            _tb = getattr(request, "turn_boundaries", None)
-                            turn_boundaries = _tb if isinstance(_tb, list) else []
-                            turn_boundary_states = getattr(request, "_turn_boundary_states", {}) or {}
-                            # parent_before_user tracks the node that will be the parent
-                            # of both the user structural node AND the response node.
+                            _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+                            _boundary_states = getattr(request, "_boundary_states", None) or {}
                             parent_before_user = parent
+
                             for i, segment in enumerate(new_segments):
                                 abs_idx = matched_depth + i
                                 is_sys = segment.role == "system" and abs_idx == 0
                                 is_last = i == len(new_segments) - 1
-                                if is_sys:
-                                    state = getattr(request, "_sys_prompt_state", None)
-                                elif is_last:
-                                    # User segment stored as structural node (no KV).
-                                    # The completed exchange (user_tokens + output_tokens)
-                                    # is stored as a sibling conversation node below so
-                                    # the next turn's history segment can hit it.
+
+                                if is_last:
                                     state = None
-                                elif segment.role == "conversation":
-                                    # History segment h (0-indexed), h = abs_idx - 1
-                                    h = abs_idx - 1
-                                    if h < len(turn_boundaries):
-                                        # Intermediate history: state at turn_boundaries[h]
-                                        state = turn_boundary_states.get(h)
-                                    else:
-                                        # Last history segment: state at prefix_boundary
-                                        state = getattr(request, "_conv_end_state", None)
+                                elif abs_idx < len(_turn_boundaries):
+                                    state = _boundary_states.get(_turn_boundaries[abs_idx])
                                 else:
                                     state = None
+
                                 parent = self.turn_cache.insert(
                                     parent, segment, [], [], state, is_system_prompt=is_sys
                                 )
                                 if not is_last:
                                     parent_before_user = parent
 
-                            # Store the completed exchange (user_tokens + output_tokens) as a
-                            # conversation node under the same parent as the user node.
-                            # On the next turn this exchange becomes a history segment
-                            # (conv = user_tokens+output_tokens) and will match here,
-                            # providing a deep cache hit that includes the response.
-                            prefix_boundary = getattr(request, "prefix_boundary", 0)
+                            # Store completed exchange as a response node under parent_before_user.
+                            last_boundary = _turn_boundaries[-1] if _turn_boundaries else 0
                             if (
                                 request.output_token_ids
-                                and prefix_boundary > 0
+                                and last_boundary > 0
                                 and request.prompt_token_ids
                                 and new_segments
                             ):
                                 from .turn_prefix_cache import Segment as _Seg
                                 response_tokens = (
-                                    list(request.prompt_token_ids[prefix_boundary:])
+                                    list(request.prompt_token_ids[last_boundary:])
                                     + list(request.output_token_ids)
                                 )
                                 ec = request._extracted_cache
@@ -2654,7 +2637,7 @@ class Scheduler:
                                 logger.info(
                                     f"[turn_cache] stored response node: "
                                     f"{len(response_tokens)} tokens "
-                                    f"({len(request.prompt_token_ids) - prefix_boundary} user "
+                                    f"({len(request.prompt_token_ids) - last_boundary} user "
                                     f"+ {len(request.output_token_ids)} output) "
                                     f"for {request_id[:12]}"
                                 )
@@ -2712,10 +2695,11 @@ class Scheduler:
                     for layer_dict in _state:
                         if isinstance(layer_dict, dict) and "state" in layer_dict:
                             mx.eval(*layer_dict["state"])
-            if request is not None:
-                for _state in getattr(request, "_turn_boundary_states", {}).values():
-                    if isinstance(_state, list):
-                        for layer_dict in _state:
+            _b_states = getattr(request, "_boundary_states", None) if request is not None else None
+            if _b_states and isinstance(_b_states, dict):
+                for _bstate in _b_states.values():
+                    if isinstance(_bstate, list):
+                        for layer_dict in _bstate:
                             if isinstance(layer_dict, dict) and "state" in layer_dict:
                                 mx.eval(*layer_dict["state"])
 
@@ -2729,6 +2713,7 @@ class Scheduler:
                 request._sys_prompt_state = None
                 request._conv_end_state = None
                 request._turn_boundary_states = {}
+                request._boundary_states = {}
 
             # Remove from running
             if request_id in self.running:

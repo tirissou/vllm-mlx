@@ -2056,3 +2056,119 @@ def test_mid_prefill_saves_multiple_boundaries():
     assert 50 in req._boundary_states
     assert 100 in req._boundary_states
     assert 150 in req._boundary_states
+
+
+def test_store_side_uses_boundary_states():
+    """After generation, nodes get state from _boundary_states[B_k]."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.block_aware_cache = None
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    B_sys = 10
+
+    sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
+    req = MagicMock()
+    req.prompt_token_ids = sys_tokens + user_tokens
+    req._turn_boundaries = [B_sys]
+    req._boundary_states = {B_sys: sys_state}
+    req._extracted_cache = _make_extracted_state(n_layers=2, n_tokens=15)
+    req._turn_cache_path = []
+    req.output_token_ids = [500, 501]
+
+    segments = sched._messages_to_segments(req)
+    assert len(segments) == 2
+
+    parent = cache.root
+    matched_depth = 0
+    new_segments = segments
+    _turn_boundaries = req._turn_boundaries
+    _boundary_states = req._boundary_states
+    parent_before_user = parent
+
+    for i, segment in enumerate(new_segments):
+        abs_idx = matched_depth + i
+        is_sys = segment.role == "system" and abs_idx == 0
+        is_last = i == len(new_segments) - 1
+
+        if is_last:
+            state = None
+        elif abs_idx < len(_turn_boundaries):
+            state = _boundary_states.get(_turn_boundaries[abs_idx])
+        else:
+            state = None
+
+        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
+        if not is_last:
+            parent_before_user = parent
+
+    sys_node = list(cache.root.children.values())[0]
+    assert sys_node.recurrent_state is not None
+    assert sys_node.recurrent_state is sys_state
+
+    user_node = list(sys_node.children.values())[0]
+    assert user_node.recurrent_state is None  # user = structural
+
+
+def test_store_side_conv_node_gets_boundary_state():
+    """Conv node gets _boundary_states[B_1], not sys state."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.block_aware_cache = None
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(10))
+    conv_tokens = list(range(10, 25))
+    user_tokens = [200, 201]
+    B_sys = 10
+    B_1 = 25
+
+    sys_state = _make_extracted_state(n_layers=1, n_tokens=10)
+    conv_state = _make_extracted_state(n_layers=1, n_tokens=25)
+
+    req = MagicMock()
+    req.prompt_token_ids = sys_tokens + conv_tokens + user_tokens
+    req._turn_boundaries = [B_sys, B_1]
+    req._boundary_states = {B_sys: sys_state, B_1: conv_state}
+    req._extracted_cache = _make_extracted_state(n_layers=1, n_tokens=27)
+    req._turn_cache_path = []
+    req.output_token_ids = [999]
+
+    segments = sched._messages_to_segments(req)
+    assert len(segments) == 3
+
+    parent = cache.root
+    _turn_boundaries = req._turn_boundaries
+    _boundary_states = req._boundary_states
+    parent_before_user = parent
+
+    for i, segment in enumerate(segments):
+        is_sys = segment.role == "system" and i == 0
+        is_last = i == len(segments) - 1
+        if is_last:
+            state = None
+        elif i < len(_turn_boundaries):
+            state = _boundary_states.get(_turn_boundaries[i])
+        else:
+            state = None
+        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
+        if not is_last:
+            parent_before_user = parent
+
+    sys_node = list(cache.root.children.values())[0]
+    conv_node = list(sys_node.children.values())[0]
+    assert conv_node.recurrent_state is conv_state
