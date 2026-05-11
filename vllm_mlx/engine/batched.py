@@ -955,8 +955,7 @@ class BatchedEngine(BaseEngine):
             messages,
             chat_template_kwargs=chat_template_kwargs,
         )
-        if turn_boundaries:
-            kwargs["turn_boundaries"] = turn_boundaries
+        kwargs["turn_boundaries"] = turn_boundaries
 
         return await self.generate(
             prompt=prompt,
@@ -1118,8 +1117,7 @@ class BatchedEngine(BaseEngine):
             messages,
             chat_template_kwargs=chat_template_kwargs,
         )
-        if turn_boundaries:
-            kwargs["turn_boundaries"] = turn_boundaries
+        kwargs["turn_boundaries"] = turn_boundaries
 
         async for output in self.stream_generate(
             prompt=prompt,
