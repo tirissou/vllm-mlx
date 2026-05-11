@@ -1773,3 +1773,139 @@ def test_engine_core_add_request_accepts_turn_boundaries():
     assert core.scheduler.add_request.called
     added_req = core.scheduler.add_request.call_args[0][0]
     assert added_req._turn_boundaries == [10, 30]
+
+
+# ── _messages_to_segments (new implementation) tests ──────────────────────
+
+def _make_request_with_boundaries(prompt_token_ids, turn_boundaries):
+    """Create a MagicMock request with _turn_boundaries."""
+    from unittest.mock import MagicMock
+    req = MagicMock()
+    req.prompt_token_ids = prompt_token_ids
+    req._turn_boundaries = turn_boundaries
+    return req
+
+
+def test_messages_to_segments_new_single_turn():
+    """Single turn: [B_sys] → [system, user] segments."""
+    from vllm_mlx.scheduler import Scheduler
+    sched = object.__new__(Scheduler)
+
+    # full_tokens = [0..9=sys, 10..14=user]
+    req = _make_request_with_boundaries(
+        prompt_token_ids=list(range(15)),
+        turn_boundaries=[10],  # B_sys = 10
+    )
+    segs = sched._messages_to_segments(req)
+
+    assert len(segs) == 2, f"Expected 2 segments, got {len(segs)}"
+    assert segs[0].role == "system"
+    assert segs[0].token_ids == list(range(10))
+    assert segs[1].role == "user"
+    assert segs[1].token_ids == list(range(10, 15))
+
+
+def test_messages_to_segments_new_two_boundaries():
+    """Two boundaries: [B_sys, B_1] → [system, conversation, user]."""
+    from vllm_mlx.scheduler import Scheduler
+    sched = object.__new__(Scheduler)
+
+    # full = [0..9=sys, 10..14=conv, 15..19=user]
+    req = _make_request_with_boundaries(
+        prompt_token_ids=list(range(20)),
+        turn_boundaries=[10, 15],  # B_sys=10, B_1=15
+    )
+    segs = sched._messages_to_segments(req)
+
+    assert len(segs) == 3, f"Expected 3 segments, got {len(segs)}"
+    assert segs[0].role == "system"
+    assert segs[0].token_ids == list(range(10))
+    assert segs[1].role == "conversation"
+    assert segs[1].token_ids == list(range(10, 15))
+    assert segs[2].role == "user"
+    assert segs[2].token_ids == list(range(15, 20))
+
+
+def test_messages_to_segments_new_no_boundaries():
+    """No boundaries → empty list."""
+    from vllm_mlx.scheduler import Scheduler
+    sched = object.__new__(Scheduler)
+
+    req = _make_request_with_boundaries(
+        prompt_token_ids=list(range(10)),
+        turn_boundaries=[],
+    )
+    segs = sched._messages_to_segments(req)
+
+    assert segs == []
+
+
+def test_messages_to_segments_new_boundary_at_end():
+    """Boundary at or beyond end → empty list (invalid)."""
+    from vllm_mlx.scheduler import Scheduler
+    sched = object.__new__(Scheduler)
+
+    req = _make_request_with_boundaries(
+        prompt_token_ids=list(range(10)),
+        turn_boundaries=[10],  # B_sys == len(full_tokens)
+    )
+    segs = sched._messages_to_segments(req)
+
+    assert segs == []
+
+
+def test_messages_to_segments_new_three_boundaries():
+    """Three boundaries: [B_sys, B_1, B_2] → [system, conv, conv, user]."""
+    from vllm_mlx.scheduler import Scheduler
+    sched = object.__new__(Scheduler)
+
+    # full = [0..4=sys, 5..9=conv1, 10..14=conv2, 15..19=user]
+    req = _make_request_with_boundaries(
+        prompt_token_ids=list(range(20)),
+        turn_boundaries=[5, 10, 15],  # B_sys=5, B_1=10, B_2=15
+    )
+    segs = sched._messages_to_segments(req)
+
+    assert len(segs) == 4, f"Expected 4 segments, got {len(segs)}"
+    assert segs[0].role == "system"
+    assert segs[0].token_ids == list(range(5))
+    assert segs[1].role == "conversation"
+    assert segs[1].token_ids == list(range(5, 10))
+    assert segs[2].role == "conversation"
+    assert segs[2].token_ids == list(range(10, 15))
+    assert segs[3].role == "user"
+    assert segs[3].token_ids == list(range(15, 20))
+
+
+def test_messages_to_segments_new_sys_stable():
+    """System segment is stable across requests with different user messages."""
+    from vllm_mlx.scheduler import Scheduler
+    sched = object.__new__(Scheduler)
+
+    sys_tokens = list(range(10))
+    user_hi = [100, 101]
+    user_yo = [200, 201]
+
+    req1 = _make_request_with_boundaries(
+        prompt_token_ids=sys_tokens + user_hi,
+        turn_boundaries=[10],  # B_sys = 10
+    )
+    req2 = _make_request_with_boundaries(
+        prompt_token_ids=sys_tokens + user_yo,
+        turn_boundaries=[10],  # Same B_sys
+    )
+
+    segs1 = sched._messages_to_segments(req1)
+    segs2 = sched._messages_to_segments(req2)
+
+    assert len(segs1) == 2
+    assert len(segs2) == 2
+
+    # Both have the same system segment
+    assert segs1[0].token_ids == segs2[0].token_ids == sys_tokens
+    assert segs1[0].role == "system"
+
+    # User segments differ
+    assert segs1[1].token_ids == user_hi
+    assert segs2[1].token_ids == user_yo
+    assert segs1[1].token_ids != segs2[1].token_ids

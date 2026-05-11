@@ -3420,17 +3420,15 @@ class Scheduler:
     def _messages_to_segments(self, request: "Request") -> list:
         """Split a request's token sequence into per-message Segment objects.
 
-        Produces one segment per conversation boundary:
-          1. system: tokens[0:sys_end_boundary] — stable across all turns.
-          2. hist_1: tokens[sys_end_boundary:turn_boundaries[0]] — first turn pair (u+a).
-          3. hist_2: tokens[turn_boundaries[0]:turn_boundaries[1]] — second turn pair.
-          ...
-          N. hist_last: tokens[turn_boundaries[-1]:prefix_boundary] — last prior turn.
-          N+1. user: tokens[prefix_boundary:] — the current user message.
+        Uses _turn_boundaries = [B_sys, B_1, ..., B_{N-1}] computed by
+        _compute_turn_boundaries in batched.py.
 
-        Splitting history into per-turn segments lets the trie accumulate one
-        node per completed turn instead of one monolithic blob, enabling cache
-        hits that grow with each turn rather than resetting to sys_end only.
+        Produces:
+          1. Segment(role="system",       token_ids=full[0      : B_sys ])
+          2. Segment(role="conversation", token_ids=full[B_sys  : B_1  ])  (if N >= 2)
+          ...
+          k. Segment(role="conversation", token_ids=full[B_{k-2}: B_{k-1}])
+          k+1. Segment(role="user",       token_ids=full[B_{N-1}:       ])
         """
         from .turn_prefix_cache import Segment
 
@@ -3438,35 +3436,25 @@ class Scheduler:
         if not full_tokens:
             return []
 
-        prefix_boundary = getattr(request, "prefix_boundary", 0)
-        sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
-        _tb = getattr(request, "turn_boundaries", None)
-        turn_boundaries = _tb if isinstance(_tb, list) else []
-
-        if sys_end_boundary <= 0 or sys_end_boundary >= len(full_tokens):
+        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+        if not _turn_boundaries:
             return []
 
-        segments = [Segment(role="system", token_ids=full_tokens[:sys_end_boundary])]
+        B_sys = _turn_boundaries[0]
+        if B_sys <= 0 or B_sys >= len(full_tokens):
+            return []
 
-        if prefix_boundary > sys_end_boundary:
-            # Build sorted list of all intermediate split points
-            split_points = sorted(set(turn_boundaries))
-            # Walk history boundaries: sys_end → tb[0] → tb[1] → ... → prefix_boundary
-            prev = sys_end_boundary
-            for bp in split_points:
-                if sys_end_boundary < bp < prefix_boundary:
-                    segments.append(Segment(
-                        role="conversation",
-                        token_ids=full_tokens[prev:bp],
-                    ))
-                    prev = bp
-            # Final history segment up to prefix_boundary
-            segments.append(Segment(
-                role="conversation",
-                token_ids=full_tokens[prev:prefix_boundary],
-            ))
+        segments: list[Segment] = [
+            Segment(role="system", token_ids=full_tokens[:B_sys])
+        ]
 
-        if prefix_boundary < len(full_tokens):
-            segments.append(Segment(role="user", token_ids=full_tokens[prefix_boundary:]))
+        prev = B_sys
+        for B_k in _turn_boundaries[1:]:
+            if B_k > prev and B_k < len(full_tokens):
+                segments.append(Segment(role="conversation", token_ids=full_tokens[prev:B_k]))
+                prev = B_k
+
+        if prev < len(full_tokens):
+            segments.append(Segment(role="user", token_ids=full_tokens[prev:]))
 
         return segments if len(segments) > 1 else []
