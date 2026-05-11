@@ -781,11 +781,13 @@ class BatchedEngine(BaseEngine):
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
         sys_end_boundary = kwargs.pop("sys_end_boundary", 0)
+        turn_boundaries = kwargs.pop("turn_boundaries", [])
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
             sys_end_boundary=sys_end_boundary,
+            turn_boundaries=turn_boundaries,
         )
 
         text = clean_output_text(output.output_text)
@@ -875,11 +877,13 @@ class BatchedEngine(BaseEngine):
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
         sys_end_boundary = kwargs.pop("sys_end_boundary", 0)
+        turn_boundaries = kwargs.pop("turn_boundaries", [])
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
             sys_end_boundary=sys_end_boundary,
+            turn_boundaries=turn_boundaries,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -955,7 +959,7 @@ class BatchedEngine(BaseEngine):
         )
 
         # Compute prefix boundary for turn cache (same as stream_chat)
-        prefix_boundary, sys_end_boundary = self._compute_prefix_boundary(
+        prefix_boundary, sys_end_boundary, turn_boundaries = self._compute_prefix_boundary(
             messages,
             tools,
             chat_template_kwargs=chat_template_kwargs,
@@ -964,6 +968,8 @@ class BatchedEngine(BaseEngine):
             kwargs["prefix_boundary"] = prefix_boundary
         if sys_end_boundary > 0:
             kwargs["sys_end_boundary"] = sys_end_boundary
+        if turn_boundaries:
+            kwargs["turn_boundaries"] = turn_boundaries
 
         return await self.generate(
             prompt=prompt,
@@ -981,26 +987,26 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, list[int]]:
         """Compute token boundaries for cache segmentation.
 
-        Returns (prefix_boundary, sys_end_boundary):
+        Returns (prefix_boundary, sys_end_boundary, turn_boundaries):
           - prefix_boundary: tokens before the last user message (dynamic per turn)
           - sys_end_boundary: tokens before the first user message (stable across turns)
+          - turn_boundaries: tokens before each intermediate user message (between first and last)
 
         Uses LCP comparisons so that chat-template quirks (e.g. Qwen3 <think>
         markers appended to the last assistant turn) don't shift the boundary.
         """
-        # Find first and last user message indices
-        first_user_idx = None
-        last_user_idx = None
+        # Collect all user message indices
+        all_user_indices = []
         for i, m in enumerate(messages):
             if m.get("role") == "user":
-                if first_user_idx is None:
-                    first_user_idx = i
-                last_user_idx = i
-        if last_user_idx is None or last_user_idx == 0:
-            return 0, 0
+                all_user_indices.append(i)
+        if not all_user_indices or all_user_indices[-1] == 0:
+            return 0, 0, []
+        first_user_idx = all_user_indices[0]
+        last_user_idx = all_user_indices[-1]
         try:
             template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -1042,12 +1048,16 @@ class BatchedEngine(BaseEngine):
             # sys_end_boundary: before the first user message (stable across all turns)
             if first_user_idx == last_user_idx:
                 sys_end_boundary = prefix_boundary  # single-user turn, same point
+                return prefix_boundary, sys_end_boundary, []
             else:
                 sys_end_boundary = _lcp(first_user_idx)
 
-            return prefix_boundary, sys_end_boundary
+            # Intermediate boundaries: before each user message between first and last
+            turn_boundaries = [_lcp(idx) for idx in all_user_indices[1:-1]]
+
+            return prefix_boundary, sys_end_boundary, turn_boundaries
         except Exception:
-            return 0, 0
+            return 0, 0, []
 
     async def stream_chat(
         self,
@@ -1110,7 +1120,7 @@ class BatchedEngine(BaseEngine):
         )
 
         # Compute prefix boundary for cache
-        prefix_boundary, sys_end_boundary = self._compute_prefix_boundary(
+        prefix_boundary, sys_end_boundary, turn_boundaries = self._compute_prefix_boundary(
             messages,
             tools,
             chat_template_kwargs=chat_template_kwargs,
@@ -1119,6 +1129,8 @@ class BatchedEngine(BaseEngine):
             kwargs["prefix_boundary"] = prefix_boundary
         if sys_end_boundary > 0:
             kwargs["sys_end_boundary"] = sys_end_boundary
+        if turn_boundaries:
+            kwargs["turn_boundaries"] = turn_boundaries
 
         async for output in self.stream_generate(
             prompt=prompt,

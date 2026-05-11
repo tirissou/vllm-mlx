@@ -1550,13 +1550,20 @@ class Scheduler:
 
             prefix_boundary = getattr(request, "prefix_boundary", 0)
             sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
+            _tb = getattr(request, "turn_boundaries", None)
+            turn_boundaries = _tb if isinstance(_tb, list) else []
 
             # Boundaries where we always save regardless of throttle:
             # - sys_end_boundary: end of system prompt (for turn_cache sys node)
+            # - turn_boundaries[i]: end of each intermediate turn (for per-turn trie nodes)
             # - prefix_boundary: end of conversation history before last user (for turn_cache conv node)
             at_sys_end = sys_end_boundary > 0 and total_cached == sys_end_boundary
             at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
-            at_any_boundary = at_sys_end or at_prefix_boundary
+            at_turn_boundary_idx = next(
+                (i for i, b in enumerate(turn_boundaries) if b > 0 and total_cached == b),
+                -1,
+            )
+            at_any_boundary = at_sys_end or at_prefix_boundary or at_turn_boundary_idx >= 0
 
             # Throttle: only save every save_interval tokens,
             # unless we're at a cache boundary.
@@ -1604,7 +1611,18 @@ class Scheduler:
                             f"[turn_cache] sys_end_state captured at boundary={sys_end_boundary} "
                             f"layers={len(extracted)} for {request_id[:12]}"
                         )
-                    if at_prefix_boundary and not at_sys_end:
+                    if at_turn_boundary_idx >= 0 and not at_sys_end:
+                        # State at end of an intermediate turn → stored on per-turn trie node
+                        if not hasattr(request, "_turn_boundary_states"):
+                            request._turn_boundary_states = {}
+                        request._turn_boundary_states[at_turn_boundary_idx] = extracted
+                        request._mid_prefill_last_save = total_cached
+                        logger.info(
+                            f"[turn_cache] turn_boundary_state[{at_turn_boundary_idx}] captured at "
+                            f"boundary={turn_boundaries[at_turn_boundary_idx]} "
+                            f"layers={len(extracted)} for {request_id[:12]}"
+                        )
+                    if at_prefix_boundary and not at_sys_end and at_turn_boundary_idx < 0:
                         # State at end of conversation history → stored on conv trie node
                         request._conv_end_state = extracted
                         request._mid_prefill_last_save = total_cached
@@ -2579,17 +2597,17 @@ class Scheduler:
                             matched_depth = len(path)
                             parent = path[-1] if path else self.turn_cache.root
                             new_segments = segments[matched_depth:]
+                            _tb = getattr(request, "turn_boundaries", None)
+                            turn_boundaries = _tb if isinstance(_tb, list) else []
+                            turn_boundary_states = getattr(request, "_turn_boundary_states", {}) or {}
                             for i, segment in enumerate(new_segments):
-                                is_sys = segment.role == "system" and i == 0 and matched_depth == 0
-                                is_conv = segment.role == "conversation" and not is_sys
+                                abs_idx = matched_depth + i
+                                is_sys = segment.role == "system" and abs_idx == 0
+                                is_last = i == len(new_segments) - 1
                                 if is_sys:
                                     state = getattr(request, "_sys_prompt_state", None)
-                                elif is_conv and i < len(new_segments) - 1:
-                                    # Conversation history segment: state captured at prefix_boundary
-                                    state = getattr(request, "_conv_end_state", None)
-                                elif i == len(new_segments) - 1:
-                                    # Invariant: the last new segment is the user/assistant turn
-                                    # and _extracted_cache covers prompt+output for this turn.
+                                elif is_last:
+                                    # Last new segment: _extracted_cache covers prompt+output
                                     ec = request._extracted_cache
                                     if isinstance(ec, list) and ec and isinstance(ec[0], dict):
                                         state = ec
@@ -2597,6 +2615,15 @@ class Scheduler:
                                         state = self._extract_cache_states(ec)
                                         if not state:
                                             state = None
+                                elif segment.role == "conversation":
+                                    # History segment h (0-indexed), h = abs_idx - 1
+                                    h = abs_idx - 1
+                                    if h < len(turn_boundaries):
+                                        # Intermediate history: state at turn_boundaries[h]
+                                        state = turn_boundary_states.get(h)
+                                    else:
+                                        # Last history segment: state at prefix_boundary
+                                        state = getattr(request, "_conv_end_state", None)
                                 else:
                                     state = None
                                 parent = self.turn_cache.insert(
@@ -2655,6 +2682,12 @@ class Scheduler:
                     for layer_dict in _state:
                         if isinstance(layer_dict, dict) and "state" in layer_dict:
                             mx.eval(*layer_dict["state"])
+            if request is not None:
+                for _state in getattr(request, "_turn_boundary_states", {}).values():
+                    if isinstance(_state, list):
+                        for layer_dict in _state:
+                            if isinstance(layer_dict, dict) and "state" in layer_dict:
+                                mx.eval(*layer_dict["state"])
 
             # Release all cache references on the request so Metal buffers
             # can be freed.  The prefix cache (if any) holds its own copy;
@@ -2665,6 +2698,7 @@ class Scheduler:
                 request._extracted_cache = None
                 request._sys_prompt_state = None
                 request._conv_end_state = None
+                request._turn_boundary_states = {}
 
             # Remove from running
             if request_id in self.running:
@@ -3341,16 +3375,17 @@ class Scheduler:
     def _messages_to_segments(self, request: "Request") -> list:
         """Split a request's token sequence into per-message Segment objects.
 
-        Produces up to three segments:
-          1. system: tokens[0:sys_end_boundary] — stable across all turns with the
-             same system prompt; this is the key that enables cross-session hits.
-          2. conversation: tokens[sys_end_boundary:prefix_boundary] — prior turn
-             history (only present in multi-turn conversations).
-          3. user: tokens[prefix_boundary:] — the current user message.
+        Produces one segment per conversation boundary:
+          1. system: tokens[0:sys_end_boundary] — stable across all turns.
+          2. hist_1: tokens[sys_end_boundary:turn_boundaries[0]] — first turn pair (u+a).
+          3. hist_2: tokens[turn_boundaries[0]:turn_boundaries[1]] — second turn pair.
+          ...
+          N. hist_last: tokens[turn_boundaries[-1]:prefix_boundary] — last prior turn.
+          N+1. user: tokens[prefix_boundary:] — the current user message.
 
-        sys_end_boundary (end of system prompt) is stable across turns.
-        prefix_boundary (before last user message) shifts with each turn.
-        Falls back to an empty list when no usable boundary is available.
+        Splitting history into per-turn segments lets the trie accumulate one
+        node per completed turn instead of one monolithic blob, enabling cache
+        hits that grow with each turn rather than resetting to sys_end only.
         """
         from .turn_prefix_cache import Segment
 
@@ -3360,6 +3395,8 @@ class Scheduler:
 
         prefix_boundary = getattr(request, "prefix_boundary", 0)
         sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
+        _tb = getattr(request, "turn_boundaries", None)
+        turn_boundaries = _tb if isinstance(_tb, list) else []
 
         if sys_end_boundary <= 0 or sys_end_boundary >= len(full_tokens):
             return []
@@ -3367,10 +3404,21 @@ class Scheduler:
         segments = [Segment(role="system", token_ids=full_tokens[:sys_end_boundary])]
 
         if prefix_boundary > sys_end_boundary:
-            # Multi-turn: include conversation history as a separate segment
+            # Build sorted list of all intermediate split points
+            split_points = sorted(set(turn_boundaries))
+            # Walk history boundaries: sys_end → tb[0] → tb[1] → ... → prefix_boundary
+            prev = sys_end_boundary
+            for bp in split_points:
+                if sys_end_boundary < bp < prefix_boundary:
+                    segments.append(Segment(
+                        role="conversation",
+                        token_ids=full_tokens[prev:bp],
+                    ))
+                    prev = bp
+            # Final history segment up to prefix_boundary
             segments.append(Segment(
                 role="conversation",
-                token_ids=full_tokens[sys_end_boundary:prefix_boundary],
+                token_ids=full_tokens[prev:prefix_boundary],
             ))
 
         if prefix_boundary < len(full_tokens):

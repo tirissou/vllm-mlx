@@ -1299,3 +1299,273 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     assert req2.prompt_cache is not None
 
     cache.release(path)
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn diagnostic tests
+# ---------------------------------------------------------------------------
+
+def _make_multi_turn_request(prompt_token_ids, prefix_boundary, sys_end_boundary):
+    """Create a MagicMock request with the given token ids and boundaries."""
+    from unittest.mock import MagicMock
+    req = MagicMock()
+    req.prompt_token_ids = prompt_token_ids
+    req.prefix_boundary = prefix_boundary
+    req.sys_end_boundary = sys_end_boundary
+    return req
+
+
+def test_segment1_tokens_stable_across_turns():
+    """Segment 1 (sys) must have identical token_ids for turns 1, 2, and 3.
+
+    This is the fundamental invariant for cross-turn sys hits: if token_ids differ,
+    the segment hash differs and the cache misses.
+    """
+    from vllm_mlx.scheduler import Scheduler
+
+    sched = object.__new__(Scheduler)
+
+    sys_tokens = list(range(100))           # 100-token system prompt
+    user1 = list(range(100, 120))           # turn-1 user
+    asst1 = list(range(200, 250))           # turn-1 assistant (output appended by client)
+    user2 = list(range(300, 315))           # turn-2 user
+    asst2 = list(range(400, 430))           # turn-2 assistant
+    user3 = list(range(500, 510))           # turn-3 user
+
+    seb = len(sys_tokens)  # stable sys_end_boundary
+
+    # Turn 1
+    pb1 = seb  # first_user == last_user → prefix == sys_end
+    req1 = _make_multi_turn_request(sys_tokens + user1, pb1, seb)
+    segs1 = sched._messages_to_segments(req1)
+
+    # Turn 2
+    pb2 = seb + len(user1) + len(asst1)
+    req2 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2, pb2, seb)
+    segs2 = sched._messages_to_segments(req2)
+
+    # Turn 3
+    pb3 = pb2 + len(user2) + len(asst2)
+    req3 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2 + asst2 + user3, pb3, seb)
+    segs3 = sched._messages_to_segments(req3)
+
+    # All must return at least 2 segments (sys + user)
+    assert len(segs1) >= 2, f"Turn 1 has {len(segs1)} segments"
+    assert len(segs2) >= 2, f"Turn 2 has {len(segs2)} segments"
+    assert len(segs3) >= 2, f"Turn 3 has {len(segs3)} segments"
+
+    # Segment 1 must be the same object content across all turns
+    assert segs1[0].role == "system"
+    assert segs2[0].role == "system"
+    assert segs3[0].role == "system"
+    assert segs1[0].token_ids == sys_tokens, "Turn 1 seg0 ≠ sys_tokens"
+    assert segs2[0].token_ids == sys_tokens, "Turn 2 seg0 ≠ sys_tokens"
+    assert segs3[0].token_ids == sys_tokens, "Turn 3 seg0 ≠ sys_tokens"
+
+    # The context hashes (used for trie lookup) must be equal
+    from vllm_mlx.turn_prefix_cache import _context_hash, TurnPrefixCache, TurnPrefixCacheConfig
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    h1 = _context_hash(cache.root.context_hash, segs1[0].token_ids)
+    h2 = _context_hash(cache.root.context_hash, segs2[0].token_ids)
+    h3 = _context_hash(cache.root.context_hash, segs3[0].token_ids)
+    assert h1 == h2 == h3, f"Hashes differ: {h1} {h2} {h3}"
+
+
+def test_multi_turn_sys_hit_each_turn():
+    """After storing turn 1, turns 2 and 3 must get a trie HIT on the sys segment."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler
+
+    sched = object.__new__(Scheduler)
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(50))
+    user1 = list(range(50, 60))
+    asst1 = list(range(100, 120))
+    user2 = list(range(200, 210))
+    asst2 = list(range(300, 315))
+    user3 = list(range(400, 405))
+
+    seb = len(sys_tokens)
+
+    # --- Turn 1 store ---
+    pb1 = seb
+    req1 = _make_multi_turn_request(sys_tokens + user1, pb1, seb)
+    segs1 = sched._messages_to_segments(req1)
+    assert len(segs1) == 2, f"Turn 1 should have 2 segments, got {len(segs1)}"
+
+    sys_state = _make_extracted_state(n_layers=1, n_tokens=seb)
+    sys_node = cache.insert(cache.root, segs1[0], [], [], sys_state, is_system_prompt=True)
+    cache.insert(sys_node, segs1[1], [], [], None)
+
+    # --- Turn 2 fetch: must hit sys_node ---
+    pb2 = seb + len(user1) + len(asst1)
+    req2 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2, pb2, seb)
+    segs2 = sched._messages_to_segments(req2)
+    assert len(segs2) == 3, f"Turn 2 should have 3 segments, got {len(segs2)}: {[s.role for s in segs2]}"
+    assert segs2[0].token_ids == sys_tokens, "Turn 2 seg0 token mismatch"
+
+    path2, has_rec2 = cache.match(segs2)
+    assert len(path2) >= 1, f"Turn 2 expected sys HIT, got path={path2}"
+    assert path2[0] is sys_node, "Turn 2 did not match sys_node"
+    cached_t2 = sum(len(n.token_ids) for n in path2)
+    assert cached_t2 == seb, f"Turn 2 cached_tokens should be {seb}, got {cached_t2}"
+    cache.release(path2)
+
+    # --- Turn 3 fetch: must also hit sys_node ---
+    pb3 = pb2 + len(user2) + len(asst2)
+    req3 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2 + asst2 + user3, pb3, seb)
+    segs3 = sched._messages_to_segments(req3)
+    assert len(segs3) == 3, f"Turn 3 should have 3 segments, got {len(segs3)}"
+    assert segs3[0].token_ids == sys_tokens, "Turn 3 seg0 token mismatch"
+
+    path3, has_rec3 = cache.match(segs3)
+    assert len(path3) >= 1, f"Turn 3 expected sys HIT, got path={path3}"
+    assert path3[0] is sys_node, "Turn 3 did not match sys_node"
+    cached_t3 = sum(len(n.token_ids) for n in path3)
+    assert cached_t3 == seb, f"Turn 3 cached_tokens should be {seb}, got {cached_t3}"
+    cache.release(path3)
+
+
+def test_conv_segment_grows_each_turn():
+    """Conv segment is unique per turn — no cross-turn conv hits within a single session.
+
+    This is EXPECTED behaviour: same-session caching only provides sys hits.
+    Conv hits happen only in cross-session scenarios (same history, different session).
+    """
+    from vllm_mlx.scheduler import Scheduler
+
+    sched = object.__new__(Scheduler)
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+
+    sys_tokens = list(range(20))
+    user1 = list(range(20, 25))
+    asst1 = list(range(100, 105))
+    user2 = list(range(200, 203))
+    asst2 = list(range(300, 306))
+    user3 = list(range(400, 402))
+    seb = len(sys_tokens)
+
+    pb2 = seb + len(user1) + len(asst1)
+    pb3 = pb2 + len(user2) + len(asst2)
+
+    req2 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2, pb2, seb)
+    req3 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2 + asst2 + user3, pb3, seb)
+
+    segs2 = sched._messages_to_segments(req2)
+    segs3 = sched._messages_to_segments(req3)
+
+    conv2 = segs2[1]  # role="conversation"
+    conv3 = segs3[1]  # role="conversation"
+
+    assert conv2.role == "conversation"
+    assert conv3.role == "conversation"
+    # Conv segments grow → different tokens → different hashes → no cross-turn conv hit
+    assert conv2.token_ids != conv3.token_ids, "Conv segments should differ between turns"
+
+
+def test_multi_turn_conv_stored_after_turn2():
+    """After turn 2 completes, the trie should contain a conv node under sys_node.
+
+    The conv node captures state at prefix_boundary so cross-session turn-2 requests
+    with the same history can skip processing the conversation history.
+    """
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.block_aware_cache = None
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.turn_cache = cache
+
+    sys_tokens = list(range(20))
+    user1 = list(range(20, 25))
+    asst1 = list(range(100, 105))
+    user2 = list(range(200, 203))
+    seb = len(sys_tokens)
+    pb2 = seb + len(user1) + len(asst1)
+
+    # Simulate turn 1 already stored
+    sys_state = _make_extracted_state(n_layers=1, n_tokens=seb)
+    req1 = _make_multi_turn_request(sys_tokens + user1, seb, seb)
+    segs1 = sched._messages_to_segments(req1)
+    sys_node = cache.insert(cache.root, segs1[0], [], [], sys_state, is_system_prompt=True)
+    cache.insert(sys_node, segs1[1], [], [], None)
+
+    # Simulate turn 2: HIT on sys, then store conv + user
+    req2 = MagicMock()
+    req2.prompt_token_ids = sys_tokens + user1 + asst1 + user2
+    req2.prefix_boundary = pb2
+    req2.sys_end_boundary = seb
+    req2._turn_cache_path = [sys_node]  # simulates the fetch hit
+    sys_node.ref_count += 1             # simulate match increment
+
+    conv_state = _make_extracted_state(n_layers=1, n_tokens=pb2)
+    user_state = _make_extracted_state(n_layers=1, n_tokens=pb2 + len(user2))
+    req2._conv_end_state = conv_state
+    req2._extracted_cache = user_state
+
+    segs2 = sched._messages_to_segments(req2)
+    assert len(segs2) == 3, f"Expected 3 segments for turn 2, got {len(segs2)}"
+
+    path = req2._turn_cache_path
+    matched_depth = len(path)  # 1
+    parent = path[-1]          # sys_node
+    new_segments = segs2[matched_depth:]  # [conv, user2]
+
+    inserted_nodes = []
+    for i, segment in enumerate(new_segments):
+        is_sys = segment.role == "system" and i == 0 and matched_depth == 0
+        is_conv = segment.role == "conversation" and not is_sys
+        if is_sys:
+            state = getattr(req2, "_sys_prompt_state", None)
+        elif is_conv and i < len(new_segments) - 1:
+            state = getattr(req2, "_conv_end_state", None)
+        elif i == len(new_segments) - 1:
+            ec = req2._extracted_cache
+            state = ec if isinstance(ec, list) and ec and isinstance(ec[0], dict) else None
+        else:
+            state = None
+        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
+        inserted_nodes.append(parent)
+
+    cache.release(path)
+
+    conv_node = inserted_nodes[0]
+    user2_node = inserted_nodes[1]
+
+    # Conv node should be under sys_node with the conv_state
+    assert conv_node in sys_node.children.values(), "Conv node not under sys_node"
+    assert conv_node.recurrent_state == conv_state, "Conv node has wrong state"
+    expected_conv_tokens = (sys_tokens + user1 + asst1 + user2)[seb:pb2]
+    assert conv_node.token_ids == expected_conv_tokens, f"Conv tokens wrong: {conv_node.token_ids[:5]}..."
+
+    # Cross-session turn-2: same prompt as turn 2 → full hit on [sys, conv, user2] (3 deep)
+    req_cross2 = _make_multi_turn_request(sys_tokens + user1 + asst1 + user2, pb2, seb)
+    segs_cross2 = sched._messages_to_segments(req_cross2)
+    path_cross2, _ = cache.match(segs_cross2)
+    assert len(path_cross2) == 3, f"Cross-session turn-2 expected 3-deep HIT, got {len(path_cross2)}"
+    assert path_cross2[1] is conv_node
+    cached_cross2 = sum(len(n.token_ids) for n in path_cross2)
+    assert cached_cross2 == pb2 + len(user2), f"Expected full prompt cached, got {cached_cross2}"
+    cache.release(path_cross2)
+
+    # Cross-session turn-3 (same history + new user3): only sys + conv matches (NOT full turn-2 conv)
+    # because turn-3's conv segment = user1+asst1+user2+asst2, which is not in the trie yet
+    asst2 = list(range(500, 506))
+    user3 = list(range(600, 603))
+    pb3 = pb2 + len(user2) + len(asst2)
+    req_cross3 = _make_multi_turn_request(
+        sys_tokens + user1 + asst1 + user2 + asst2 + user3, pb3, seb
+    )
+    segs_cross3 = sched._messages_to_segments(req_cross3)
+    path_cross3, _ = cache.match(segs_cross3)
+    # Conv segment for turn-3 is larger than the stored conv node → only sys matches
+    assert len(path_cross3) == 1, (
+        f"Cross-session turn-3 expected only sys hit (1-deep), got {len(path_cross3)}"
+    )
+    assert path_cross3[0] is sys_node
+    cache.release(path_cross3)

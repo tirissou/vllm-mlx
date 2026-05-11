@@ -345,6 +345,7 @@ class EngineCore:
         videos: Optional[List[Any]] = None,
         prefix_boundary: int = 0,
         sys_end_boundary: int = 0,
+        turn_boundaries: Optional[List[int]] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -357,6 +358,7 @@ class EngineCore:
             videos: Optional videos for multimodal
             prefix_boundary: Token count before last user message (dynamic per turn)
             sys_end_boundary: Token count at end of system prompt (stable across turns)
+            turn_boundaries: Token positions before each intermediate user message
 
         Returns:
             The request ID
@@ -375,6 +377,7 @@ class EngineCore:
             videos=videos,
             prefix_boundary=prefix_boundary,
             sys_end_boundary=sys_end_boundary,
+            turn_boundaries=turn_boundaries or [],
         )
 
         # Setup output collector with stream_interval from config
