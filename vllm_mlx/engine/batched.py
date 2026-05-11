@@ -780,7 +780,6 @@ class BatchedEngine(BaseEngine):
         )
 
         turn_boundaries = kwargs.pop("turn_boundaries", [])
-        logger.info(f"[DEBUG] generate() calling _engine.generate with turn_boundaries={turn_boundaries}")
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -956,7 +955,6 @@ class BatchedEngine(BaseEngine):
             messages,
             chat_template_kwargs=chat_template_kwargs,
         )
-        logger.info(f"[DEBUG] chat() computed turn_boundaries={turn_boundaries} for {len(messages)} messages")
         kwargs["turn_boundaries"] = turn_boundaries
 
         return await self.generate(
@@ -1026,11 +1024,9 @@ class BatchedEngine(BaseEngine):
                             if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
                                 boundaries.append(boundary)
 
-            logger.info(f"[DEBUG] _compute_turn_boundaries: computed {boundaries}")
             return boundaries
 
         except Exception as e:
-            logger.info(f"[DEBUG] _compute_turn_boundaries: exception: {type(e).__name__}: {e}")
             return []
 
     async def stream_chat(
@@ -1098,7 +1094,6 @@ class BatchedEngine(BaseEngine):
             messages,
             chat_template_kwargs=chat_template_kwargs,
         )
-        logger.info(f"[DEBUG] stream_chat() computed turn_boundaries={turn_boundaries} for {len(messages)} messages")
         kwargs["turn_boundaries"] = turn_boundaries
 
         async for output in self.stream_generate(
