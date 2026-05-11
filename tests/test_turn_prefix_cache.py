@@ -1742,3 +1742,34 @@ def test_request_no_old_boundary_fields():
     assert not hasattr(req, "prefix_boundary"), "Request should not have prefix_boundary field"
     assert not hasattr(req, "sys_end_boundary"), "Request should not have sys_end_boundary field"
     assert not hasattr(req, "turn_boundaries"), "Request should not have turn_boundaries field"
+
+
+def test_engine_core_add_request_accepts_turn_boundaries():
+    """add_request accepts turn_boundaries (list) and sets _turn_boundaries on Request."""
+    from unittest.mock import MagicMock, AsyncMock
+    import asyncio
+    from vllm_mlx.engine_core import EngineCore
+
+    core = object.__new__(EngineCore)
+    core.config = MagicMock()
+    core.config.stream_interval = 1
+    core.scheduler = MagicMock()
+    core.scheduler.add_request = MagicMock()
+    core._output_collectors = {}
+    core._stream_states = {}
+    core._finished_events = {}
+
+    loop = asyncio.new_event_loop()
+    try:
+        request_id = loop.run_until_complete(
+            core.add_request(
+                prompt="hello",
+                turn_boundaries=[10, 30],
+            )
+        )
+    finally:
+        loop.close()
+
+    assert core.scheduler.add_request.called
+    added_req = core.scheduler.add_request.call_args[0][0]
+    assert added_req._turn_boundaries == [10, 30]

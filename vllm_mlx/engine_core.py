@@ -343,8 +343,6 @@ class EngineCore:
         request_id: Optional[str] = None,
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
-        prefix_boundary: int = 0,
-        sys_end_boundary: int = 0,
         turn_boundaries: Optional[List[int]] = None,
     ) -> str:
         """
@@ -356,9 +354,7 @@ class EngineCore:
             request_id: Optional custom request ID
             images: Optional images for multimodal
             videos: Optional videos for multimodal
-            prefix_boundary: Token count before last user message (dynamic per turn)
-            sys_end_boundary: Token count at end of system prompt (stable across turns)
-            turn_boundaries: Token positions before each intermediate user message
+            turn_boundaries: [B_sys, B_1, ..., B_{N-1}] boundary token positions
 
         Returns:
             The request ID
@@ -375,9 +371,7 @@ class EngineCore:
             sampling_params=sampling_params,
             images=images,
             videos=videos,
-            prefix_boundary=prefix_boundary,
-            sys_end_boundary=sys_end_boundary,
-            turn_boundaries=turn_boundaries or [],
+            _turn_boundaries=turn_boundaries or [],
         )
 
         # Setup output collector with stream_interval from config
