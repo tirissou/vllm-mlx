@@ -779,14 +779,10 @@ class BatchedEngine(BaseEngine):
             logits_processors=kwargs.pop("logits_processors", None),
         )
 
-        prefix_boundary = kwargs.pop("prefix_boundary", 0)
-        sys_end_boundary = kwargs.pop("sys_end_boundary", 0)
         turn_boundaries = kwargs.pop("turn_boundaries", [])
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
-            prefix_boundary=prefix_boundary,
-            sys_end_boundary=sys_end_boundary,
             turn_boundaries=turn_boundaries,
         )
 
@@ -875,14 +871,10 @@ class BatchedEngine(BaseEngine):
             logits_processors=kwargs.pop("logits_processors", None),
         )
 
-        prefix_boundary = kwargs.pop("prefix_boundary", 0)
-        sys_end_boundary = kwargs.pop("sys_end_boundary", 0)
         turn_boundaries = kwargs.pop("turn_boundaries", [])
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
-            prefix_boundary=prefix_boundary,
-            sys_end_boundary=sys_end_boundary,
             turn_boundaries=turn_boundaries,
         )
 
@@ -958,16 +950,11 @@ class BatchedEngine(BaseEngine):
             enable_thinking=enable_thinking,
         )
 
-        # Compute prefix boundary for turn cache (same as stream_chat)
-        prefix_boundary, sys_end_boundary, turn_boundaries = self._compute_prefix_boundary(
+        # Compute turn boundaries for turn cache (same as stream_chat)
+        turn_boundaries = self._compute_turn_boundaries(
             messages,
-            tools,
             chat_template_kwargs=chat_template_kwargs,
         )
-        if prefix_boundary > 0:
-            kwargs["prefix_boundary"] = prefix_boundary
-        if sys_end_boundary > 0:
-            kwargs["sys_end_boundary"] = sys_end_boundary
         if turn_boundaries:
             kwargs["turn_boundaries"] = turn_boundaries
 
@@ -982,127 +969,89 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         )
 
-    def _compute_prefix_boundary(
+    def _compute_turn_boundaries(
         self,
         messages: list[dict[str, Any]],
-        tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[int, int, list[int]]:
-        """Compute token boundaries for cache segmentation.
+    ) -> list[int]:
+        """Compute exact token boundaries for cache segmentation using closed-template LCP.
 
-        Returns (prefix_boundary, sys_end_boundary, turn_boundaries):
-          - prefix_boundary: tokens before the last turn-start message
-          - sys_end_boundary: tokens before the first non-system message (stable)
-          - turn_boundaries: tokens before each intermediate turn-start message
+        Returns [B_sys, B_1, ..., B_{N-1}] where B_k is the token position just after
+        the k-th completed assistant turn (via LCP of closed-template prefix against
+        full_tokens). Returns [] if no system message.
 
-        A "turn-start" is a message that begins a new cacheable segment:
-          - any user message, OR
-          - any assistant message whose previous message is a tool result
-            (= start of a new agentic step in tool-use conversations)
-
-        Uses LCP comparisons so that chat-template quirks (e.g. Qwen3 <think>
-        markers appended to the last assistant turn) don't shift the boundary.
+        Note: `tools` is intentionally absent — tool schemas are embedded in the
+        system prompt in this codebase.
         """
-        # Collect all turn-start indices (user messages + agentic assistant restarts)
-        turn_start_indices = []
-        for i, m in enumerate(messages):
-            role = m.get("role")
-            if role == "system":
-                continue
-            prev_role = messages[i - 1].get("role") if i > 0 else None
-            if role == "user":
-                turn_start_indices.append(i)
-            elif role == "assistant" and prev_role == "tool":
-                turn_start_indices.append(i)
+        if not messages or messages[0].get("role") != "system":
+            return []
 
-        if len(turn_start_indices) < 2:
-            # Need at least two turn-starts to have a meaningful prefix boundary
-            return 0, 0, []
+        tokenizer = self.tokenizer
+        if hasattr(tokenizer, "tokenizer"):
+            tokenizer = tokenizer.tokenizer
+
+        if not hasattr(tokenizer, "apply_chat_template"):
+            return []
+
         try:
-            template_tools = convert_tools_for_template(tools) if tools else None
-
-            # Tokenize the real prompt
-            real_prompt = self._apply_chat_template(
-                messages,
-                template_tools,
-                chat_template_kwargs=chat_template_kwargs,
+            full_prompt = self._apply_chat_template(
+                messages, chat_template_kwargs=chat_template_kwargs
             )
+            full_tokens = tokenizer.encode(full_prompt)
+            if not full_tokens:
+                return []
 
-            tokenizer = self.tokenizer
-            if hasattr(tokenizer, "tokenizer"):
-                tokenizer = tokenizer.tokenizer
-
-            real_tokens = tokenizer.encode(real_prompt)
-
-            def _lcp(dummy_idx: int) -> int:
-                dummy_messages = list(messages)
-                # Drop tool_calls/tool_call_id so the LCP falls at the start
-                # of this message's content rather than somewhere inside it.
-                dummy_messages[dummy_idx] = {
-                    "role": messages[dummy_idx]["role"],
-                    "content": "XXXXXXXXXX",
+            def _lcp_closed(prefix_messages: list[dict]) -> int:
+                kwargs: dict[str, Any] = {
+                    "tokenize": False,
+                    "add_generation_prompt": False,
                 }
-                dummy_prompt = self._apply_chat_template(
-                    dummy_messages,
-                    template_tools,
-                    chat_template_kwargs=chat_template_kwargs,
-                )
-                dummy_tokens = tokenizer.encode(dummy_prompt)
+                if chat_template_kwargs:
+                    for k, v in chat_template_kwargs.items():
+                        if k != "add_generation_prompt":
+                            kwargs[k] = v
+                try:
+                    prefix_text = tokenizer.apply_chat_template(prefix_messages, **kwargs)
+                except TypeError:
+                    try:
+                        prefix_text = tokenizer.apply_chat_template(
+                            prefix_messages,
+                            tokenize=False,
+                            add_generation_prompt=False,
+                        )
+                    except Exception:
+                        return 0
+                except Exception:
+                    return 0
+                prefix_tokens = tokenizer.encode(prefix_text)
                 lcp = 0
-                for j in range(min(len(real_tokens), len(dummy_tokens))):
-                    if real_tokens[j] != dummy_tokens[j]:
+                for j in range(min(len(full_tokens), len(prefix_tokens))):
+                    if full_tokens[j] != prefix_tokens[j]:
                         break
                     lcp = j + 1
                 return lcp
 
-            # Collect end-of-message token IDs for backward scan in _lcp_end
-            _eos_ids: set[int] = set()
-            if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-                _eos_ids.add(tokenizer.eos_token_id)
-            if hasattr(tokenizer, "convert_tokens_to_ids"):
-                for _tok_name in ("<|im_end|>", "<|eot_id|>"):
-                    try:
-                        _tid = tokenizer.convert_tokens_to_ids(_tok_name)
-                        if isinstance(_tid, int) and _tid != getattr(tokenizer, "unk_token_id", None):
-                            _eos_ids.add(_tid)
-                    except Exception:
-                        pass
+            boundaries: list[int] = []
 
-            def _lcp_end(dummy_idx: int) -> int:
-                """Position just after the end-of-message token preceding message[dummy_idx].
+            B_sys = _lcp_closed([messages[0]])
+            if B_sys <= 0 or B_sys >= len(full_tokens):
+                return []
+            boundaries.append(B_sys)
 
-                Shifts the boundary from start of message content (_lcp) to just
-                after the preceding <|im_end|> token, so that segments begin with
-                the inter-turn separator (e.g. '\\n<|im_start|>user\\n'). This makes
-                response_tokens = prompt[prefix_boundary:] + output_token_ids exactly
-                equal to the next turn's conversation segment, enabling cache hits.
-                """
-                content_start = _lcp(dummy_idx)
-                if not _eos_ids:
-                    return content_start
-                for i in range(content_start - 1, max(-1, content_start - 20), -1):
-                    if real_tokens[i] in _eos_ids:
-                        return i + 1
-                return content_start
+            k = 1
+            while 2 * k + 1 <= len(messages):
+                prefix = messages[: 2 * k + 1]
+                if prefix[-1].get("role") != "assistant":
+                    break
+                B_k = _lcp_closed(prefix)
+                if B_k <= boundaries[-1] or B_k >= len(full_tokens):
+                    break
+                boundaries.append(B_k)
+                k += 1
 
-            first_idx = turn_start_indices[0]
-            last_idx = turn_start_indices[-1]
-
-            # sys_end_boundary: just after end-of-message token before first turn-start
-            sys_end_boundary = _lcp_end(first_idx)
-
-            # prefix_boundary: just after end-of-message token before last turn-start
-            prefix_boundary = _lcp_end(last_idx)
-
-            if prefix_boundary <= sys_end_boundary:
-                return 0, 0, []
-
-            # Intermediate boundaries: just after end-of-message before each intermediate turn-start
-            turn_boundaries = [_lcp_end(idx) for idx in turn_start_indices[1:-1]]
-
-            return prefix_boundary, sys_end_boundary, turn_boundaries
+            return boundaries
         except Exception:
-            return 0, 0, []
+            return []
 
     async def stream_chat(
         self,
@@ -1164,16 +1113,11 @@ class BatchedEngine(BaseEngine):
             enable_thinking=enable_thinking,
         )
 
-        # Compute prefix boundary for cache
-        prefix_boundary, sys_end_boundary, turn_boundaries = self._compute_prefix_boundary(
+        # Compute turn boundaries for cache
+        turn_boundaries = self._compute_turn_boundaries(
             messages,
-            tools,
             chat_template_kwargs=chat_template_kwargs,
         )
-        if prefix_boundary > 0:
-            kwargs["prefix_boundary"] = prefix_boundary
-        if sys_end_boundary > 0:
-            kwargs["sys_end_boundary"] = sys_end_boundary
         if turn_boundaries:
             kwargs["turn_boundaries"] = turn_boundaries
 

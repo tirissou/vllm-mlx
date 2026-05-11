@@ -1569,3 +1569,134 @@ def test_multi_turn_conv_stored_after_turn2():
     )
     assert path_cross3[0] is sys_node
     cache.release(path_cross3)
+
+
+# ── _compute_turn_boundaries tests (tokenizer-only, no model) ──────────────
+
+class _MockTok:
+    """Char-level tokenizer with a minimal chat template."""
+    unk_token_id = None
+
+    def encode(self, text):
+        return list(text.encode("utf-8"))
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        parts = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            parts.append(f"<{role}>{content}</{role}>")
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        return "".join(parts)
+
+
+def _make_engine_with_mock_tok():
+    """Return a BatchedEngine stub with the mock tokenizer wired in."""
+    from vllm_mlx.engine.batched import BatchedEngine
+    eng = object.__new__(BatchedEngine)
+    eng._is_mllm = False
+    eng._tokenizer = _MockTok()
+    eng._processor = None
+    eng._model_name = "mock"
+    return eng
+
+
+def test_compute_turn_boundaries_single_turn():
+    """First turn (no completed assistant turn): returns [B_sys]."""
+    eng = _make_engine_with_mock_tok()
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "HELLO"},
+    ]
+    boundaries = eng._compute_turn_boundaries(messages)
+    assert len(boundaries) == 1, f"Expected 1 boundary, got {boundaries}"
+    # B_sys should be the byte-length of "<system>SYS</system>"
+    expected_sys_text = "<system>SYS</system>"
+    assert boundaries[0] == len(expected_sys_text.encode("utf-8")), (
+        f"B_sys={boundaries[0]}, expected {len(expected_sys_text.encode('utf-8'))}"
+    )
+
+
+def test_compute_turn_boundaries_two_turns():
+    """Two completed turns returns [B_sys, B_1, B_2]."""
+    eng = _make_engine_with_mock_tok()
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "U2"},
+        {"role": "assistant", "content": "A2"},
+        {"role": "user", "content": "U3"},
+    ]
+    boundaries = eng._compute_turn_boundaries(messages)
+    assert len(boundaries) == 3, f"Expected 3 boundaries, got {boundaries}"
+    assert boundaries[0] < boundaries[1] < boundaries[2], (
+        f"Boundaries not strictly increasing: {boundaries}"
+    )
+
+
+def test_compute_turn_boundaries_no_system():
+    """No system message → returns []."""
+    eng = _make_engine_with_mock_tok()
+    messages = [{"role": "user", "content": "HI"}]
+    assert eng._compute_turn_boundaries(messages) == []
+
+
+def test_compute_turn_boundaries_exact_position():
+    """B_sys is the exact LCP of closed [sys] template against full_tokens."""
+    eng = _make_engine_with_mock_tok()
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "U2"},
+    ]
+    boundaries = eng._compute_turn_boundaries(messages)
+    # Reconstruct what B_1 should be:
+    # full = <system>SYS</system><user>U1</user><assistant>A1</assistant><assistant>
+    # closed [sys,u1,a1] = <system>SYS</system><user>U1</user><assistant>A1</assistant>
+    tok = _MockTok()
+    closed_text = "<system>SYS</system><user>U1</user><assistant>A1</assistant>"
+    expected_b1 = len(closed_text.encode("utf-8"))
+    assert boundaries[1] == expected_b1, (
+        f"B_1={boundaries[1]}, expected {expected_b1}"
+    )
+
+
+def test_compute_turn_boundaries_strictly_increasing():
+    """Every boundary in the returned list is strictly greater than the previous."""
+    eng = _make_engine_with_mock_tok()
+    messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "U2"},
+        {"role": "assistant", "content": "A2"},
+        {"role": "user", "content": "U3"},
+        {"role": "assistant", "content": "A3"},
+        {"role": "user", "content": "U4"},
+    ]
+    boundaries = eng._compute_turn_boundaries(messages)
+    assert len(boundaries) == 4  # B_sys + 3 completed turns
+    for i in range(len(boundaries) - 1):
+        assert boundaries[i] < boundaries[i + 1], (
+            f"boundaries[{i}]={boundaries[i]} >= boundaries[{i+1}]={boundaries[i+1]}"
+        )
+
+
+def test_compute_turn_boundaries_last_boundary_less_than_full():
+    """The last boundary must be < len(full_tokens) (user segment exists after it)."""
+    eng = _make_engine_with_mock_tok()
+    messages = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U"},
+        {"role": "assistant", "content": "A"},
+        {"role": "user", "content": "Q"},
+    ]
+    boundaries = eng._compute_turn_boundaries(messages)
+    tok = _MockTok()
+    full_tokens = tok.encode(tok.apply_chat_template(messages, add_generation_prompt=True))
+    assert boundaries[-1] < len(full_tokens), (
+        f"Last boundary {boundaries[-1]} >= full_tokens length {len(full_tokens)}"
+    )
