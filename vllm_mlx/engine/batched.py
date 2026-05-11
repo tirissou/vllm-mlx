@@ -975,17 +975,13 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> list[int]:
-        """Compute exact token boundaries for cache segmentation using closed-template LCP.
+        """Compute exact token boundaries for cache segmentation by parsing template output.
 
         Returns [B_sys, B_1, ..., B_{N-1}] where B_k is the token position just after
-        the k-th completed assistant turn (via LCP of closed-template prefix against
-        full_tokens). Returns [] if no system message.
-
-        Note: `tools` is intentionally absent — tool schemas are embedded in the
-        system prompt in this codebase.
+        the k-th completed assistant turn. Finds boundaries by tokenizing progressively
+        larger message prefixes from the full template output. Returns [] if no system message.
         """
         if not messages or messages[0].get("role") != "system":
-            logger.info(f"[DEBUG] _compute_turn_boundaries: no system message (first role={messages[0].get('role') if messages else 'NO_MESSAGES'})")
             return []
 
         tokenizer = self.tokenizer
@@ -993,104 +989,48 @@ class BatchedEngine(BaseEngine):
             tokenizer = tokenizer.tokenizer
 
         if not hasattr(tokenizer, "apply_chat_template"):
-            logger.info(f"[DEBUG] _compute_turn_boundaries: tokenizer has no apply_chat_template")
             return []
 
         try:
+            # Apply template once to full messages (without generation prompt)
+            boundary_kwargs = chat_template_kwargs or {}
+            boundary_kwargs_with_no_gen = {**boundary_kwargs, "add_generation_prompt": False}
+
             full_prompt = self._apply_chat_template(
-                messages, chat_template_kwargs=chat_template_kwargs
+                messages, chat_template_kwargs=boundary_kwargs_with_no_gen
             )
-            logger.info(f"[DEBUG] _compute_turn_boundaries: full_prompt length={len(full_prompt)}, preview={full_prompt[:100]}")
             full_tokens = tokenizer.encode(full_prompt)
-            logger.info(f"[DEBUG] _compute_turn_boundaries: full_tokens length={len(full_tokens)}")
             if not full_tokens:
-                logger.info(f"[DEBUG] _compute_turn_boundaries: tokenizer.encode returned empty")
                 return []
-
-            def _lcp_closed(prefix_messages: list[dict]) -> int:
-                kwargs: dict[str, Any] = {
-                    "tokenize": False,
-                    "add_generation_prompt": False,
-                }
-                if chat_template_kwargs:
-                    for k, v in chat_template_kwargs.items():
-                        if k != "add_generation_prompt":
-                            kwargs[k] = v
-
-                messages_to_use = prefix_messages
-                try:
-                    prefix_text = tokenizer.apply_chat_template(messages_to_use, **kwargs)
-                except TypeError as e:
-                    try:
-                        prefix_text = tokenizer.apply_chat_template(
-                            messages_to_use,
-                            tokenize=False,
-                            add_generation_prompt=False,
-                        )
-                    except Exception as e2:
-                        # If "No user query found", add dummy user message
-                        if "No user query" in str(e2) and not any(m.get("role") == "user" for m in prefix_messages):
-                            messages_to_use = list(prefix_messages) + [{"role": "user", "content": ""}]
-                            try:
-                                prefix_text = tokenizer.apply_chat_template(
-                                    messages_to_use,
-                                    tokenize=False,
-                                    add_generation_prompt=False,
-                                )
-                                logger.info(f"[DEBUG] _lcp_closed: added dummy user msg for {[m.get('role') for m in prefix_messages]}")
-                            except Exception as e3:
-                                logger.info(f"[DEBUG] _lcp_closed: still failed after dummy user: {type(e3).__name__}: {e3}")
-                                return 0
-                        else:
-                            logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e2).__name__}: {e2}")
-                            return 0
-                except Exception as e:
-                    # If "No user query found", add dummy user message
-                    if "No user query" in str(e) and not any(m.get("role") == "user" for m in prefix_messages):
-                        messages_to_use = list(prefix_messages) + [{"role": "user", "content": ""}]
-                        try:
-                            prefix_text = tokenizer.apply_chat_template(messages_to_use, **kwargs)
-                            logger.info(f"[DEBUG] _lcp_closed: added dummy user msg for {[m.get('role') for m in prefix_messages]}")
-                        except Exception as e2:
-                            logger.info(f"[DEBUG] _lcp_closed: still failed after dummy user: {type(e2).__name__}: {e2}")
-                            return 0
-                    else:
-                        logger.info(f"[DEBUG] _lcp_closed: exception for {[m.get('role') for m in prefix_messages]}: {type(e).__name__}: {e}")
-                        return 0
-                prefix_tokens = tokenizer.encode(prefix_text)
-                lcp = 0
-                for j in range(min(len(full_tokens), len(prefix_tokens))):
-                    if full_tokens[j] != prefix_tokens[j]:
-                        break
-                    lcp = j + 1
-                logger.debug(f"[DEBUG] _lcp_closed({[m.get('role') for m in prefix_messages]}): prefix_len={len(prefix_text)}, prefix_tokens={len(prefix_tokens)}, lcp={lcp}")
-                return lcp
 
             boundaries: list[int] = []
 
-            B_sys = _lcp_closed([messages[0]])
-            logger.info(f"[DEBUG] _compute_turn_boundaries: B_sys={B_sys}, len(full_tokens)={len(full_tokens)}")
-            if B_sys <= 0 or B_sys >= len(full_tokens):
-                logger.info(f"[DEBUG] _compute_turn_boundaries: B_sys out of range (B_sys={B_sys}, full_tokens={len(full_tokens)})")
-                return []
-            boundaries.append(B_sys)
+            # Build boundaries by tokenizing progressively larger message prefixes
+            # and finding their token counts in the full prompt
+            for i in range(1, len(messages) + 1):
+                prefix = messages[:i]
+                prefix_prompt = self._apply_chat_template(
+                    prefix, chat_template_kwargs=boundary_kwargs_with_no_gen
+                )
+                prefix_tokens = tokenizer.encode(prefix_prompt)
 
-            k = 1
-            while 2 * k + 1 <= len(messages):
-                prefix = messages[: 2 * k + 1]
-                if prefix[-1].get("role") != "assistant":
-                    break
-                B_k = _lcp_closed(prefix)
-                if B_k <= boundaries[-1] or B_k >= len(full_tokens):
-                    break
-                boundaries.append(B_k)
-                k += 1
+                # Find where this prefix ends in full_tokens by checking if
+                # the prefix tokens match the beginning of full_tokens
+                if len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]:
+                    boundary = len(prefix_tokens)
+                    # Only add as a boundary if it's a system message (first) or
+                    # after a completed turn (message[i-1] is assistant)
+                    if i == 1 or (i > 0 and messages[i - 1].get("role") == "assistant"):
+                        # Don't add the final user message as a boundary
+                        if i < len(messages):
+                            if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
+                                boundaries.append(boundary)
 
+            logger.info(f"[DEBUG] _compute_turn_boundaries: computed {boundaries}")
             return boundaries
+
         except Exception as e:
             logger.info(f"[DEBUG] _compute_turn_boundaries: exception: {type(e).__name__}: {e}")
-            import traceback
-            logger.debug(f"[DEBUG] traceback: {traceback.format_exc()}")
             return []
 
     async def stream_chat(
