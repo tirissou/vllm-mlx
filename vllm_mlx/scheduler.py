@@ -418,6 +418,10 @@ def _install_chunked_prefill(
             if inputs.shape[1] <= prompt_checkpoint:
                 # Finalize
                 if partial.get("is_cached"):
+                    logger.info(
+                        f"[chunked_prefill][finalize-cached-eval] "
+                        f"inputs.shape={inputs.shape} prompt_checkpoint={prompt_checkpoint}"
+                    )
                     mx.eval([c.state for c in prompt_cache])
                     inputs = partial["last_inputs"]
 
@@ -441,6 +445,10 @@ def _install_chunked_prefill(
                 # the checkpoint callback, replay the remaining checkpoint tail
                 # except for the final token, which _step() consumes.
                 if prompt_checkpoint > 1:
+                    logger.info(
+                        f"[chunked_prefill][replay-eval] replaying prompt_checkpoint-1={prompt_checkpoint - 1} tokens "
+                        f"inputs.shape={inputs.shape} is_cached={partial.get('is_cached')}"
+                    )
                     self.model(
                         mx.contiguous(inputs[:, : prompt_checkpoint - 1]),
                         cache=prompt_cache,
@@ -595,10 +603,22 @@ def _install_chunked_prefill(
                     n_to_process = min(
                         _first_chunk, padded.shape[1] - prompt_checkpoint
                     )
+                    logger.info(
+                        f"[chunked_prefill][init] is_cached={is_cached} "
+                        f"prompt_checkpoints={list(prompt_checkpoints)} "
+                        f"prompt_checkpoint={prompt_checkpoint} "
+                        f"padded.shape={padded.shape} "
+                        f"_first_chunk={_first_chunk} n_to_process={n_to_process} "
+                        f"_needs_boundary_split={_needs_boundary_split}"
+                    )
                     if n_to_process > 0:
                         self.model(
                             mx.contiguous(padded[:, :n_to_process]),
                             cache=prompt_cache,
+                        )
+                        logger.info(
+                            f"[chunked_prefill][init-eval] n_to_process={n_to_process} "
+                            f"padded.shape={padded.shape}"
                         )
                         mx.eval([c.state for c in prompt_cache])
                         padded = padded[:, n_to_process:]
