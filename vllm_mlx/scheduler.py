@@ -599,7 +599,10 @@ def _install_chunked_prefill(
                         _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
                         _adjusted_pb = _pb - _cached
                         if 0 < _adjusted_pb < padded.shape[1] - prompt_checkpoint + 1:
-                            _first_chunk = _adjusted_pb
+                            # Use remainder so budget-sized loop iterations land exactly on
+                            # the boundary (prevents bypassing budget for large boundaries).
+                            _rem = _adjusted_pb % budget
+                            _first_chunk = _rem if _rem > 0 else budget
                     n_to_process = min(
                         _first_chunk, padded.shape[1] - prompt_checkpoint
                     )
