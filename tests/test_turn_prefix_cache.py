@@ -13,6 +13,39 @@ def seg(token_ids, role="user"):
     return Segment(role=role, token_ids=token_ids)
 
 
+class _MockKVLayer:
+    """Mock KV cache layer for testing."""
+    def __init__(self, n_tokens):
+        self.n_tokens = n_tokens
+
+
+def _make_extracted_state(n_layers, n_tokens):
+    """Create mock extracted cache state (list of layer dicts)."""
+    return [
+        {
+            "state": (
+                mx.zeros((1, n_tokens, 128)),
+                mx.zeros((1, n_tokens, 128))
+            )
+        }
+        for _ in range(n_layers)
+    ]
+
+
+def _make_minimal_scheduler_new():
+    """Minimal scheduler for testing new mid-prefill callback."""
+    from unittest.mock import MagicMock
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
+    sched.memory_aware_cache = None
+    sched.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched.requests = {}
+    sched.uid_to_request_id = {}
+    return sched
+
+
 def test_context_hash_deterministic():
     assert _context_hash(0, [1, 2, 3]) == _context_hash(0, [1, 2, 3])
 
@@ -1909,3 +1942,117 @@ def test_messages_to_segments_new_sys_stable():
     assert segs1[1].token_ids == user_hi
     assert segs2[1].token_ids == user_yo
     assert segs1[1].token_ids != segs2[1].token_ids
+
+
+def test_mid_prefill_saves_boundary_state():
+    """Test that _make_mid_prefill_save_callback saves state at boundaries."""
+    from unittest.mock import MagicMock, patch
+
+    sched = _make_minimal_scheduler_new()
+    callback = sched._make_mid_prefill_save_callback(save_interval=512)
+
+    # Create a simple request object (not MagicMock to avoid mock attribute issues)
+    class SimpleRequest:
+        pass
+
+    req = SimpleRequest()
+    req.request_id = "test-1"
+    req.prompt_token_ids = list(range(100))
+    req.cached_tokens = 0
+    req._turn_boundaries = [50]  # boundary at 50 tokens
+    req.prefix_boundary = 0
+    req.sys_end_boundary = 0
+    req._mid_prefill_last_save = 0
+
+    sched.requests["test-1"] = req
+    sched.uid_to_request_id[123] = "test-1"
+
+    # Mock _extract_cache_states
+    mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
+    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted):
+        # Call callback at boundary: total_processed = 0 (cached) + 50 (processed) = 50
+        prompt_cache = MagicMock()
+        callback(123, 50, prompt_cache)
+
+    # Verify _boundary_states was initialized and boundary saved
+    assert hasattr(req, "_boundary_states")
+    assert req._boundary_states is not None
+    assert 50 in req._boundary_states
+    assert req._boundary_states[50] == mock_extracted
+
+
+def test_mid_prefill_does_not_save_away_from_boundary():
+    """Test that callback does not save away from boundaries."""
+    from unittest.mock import MagicMock, patch
+
+    sched = _make_minimal_scheduler_new()
+    callback = sched._make_mid_prefill_save_callback(save_interval=512)
+
+    class SimpleRequest:
+        pass
+
+    req = SimpleRequest()
+    req.request_id = "test-2"
+    req.prompt_token_ids = list(range(100))
+    req.cached_tokens = 0
+    req._turn_boundaries = [50]  # boundary at 50, not at 30
+    req.prefix_boundary = 0
+    req.sys_end_boundary = 0
+    req._mid_prefill_last_save = 0
+
+    sched.requests["test-2"] = req
+    sched.uid_to_request_id[124] = "test-2"
+
+    mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
+    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted):
+        # Call at non-boundary position
+        prompt_cache = MagicMock()
+        callback(124, 30, prompt_cache)
+
+    # Should NOT save to _boundary_states
+    has_boundary_states = hasattr(req, "_boundary_states") and req._boundary_states
+    assert not has_boundary_states or 30 not in (req._boundary_states or {})
+
+
+def test_mid_prefill_saves_multiple_boundaries():
+    """Test that callback saves state at multiple boundaries."""
+    from unittest.mock import MagicMock, patch
+
+    sched = _make_minimal_scheduler_new()
+    callback = sched._make_mid_prefill_save_callback(save_interval=512)
+
+    class SimpleRequest:
+        pass
+
+    req = SimpleRequest()
+    req.request_id = "test-3"
+    req.prompt_token_ids = list(range(200))
+    req.cached_tokens = 0
+    req._turn_boundaries = [50, 100, 150]  # three boundaries
+    req.prefix_boundary = 0
+    req.sys_end_boundary = 0
+    req._mid_prefill_last_save = 0
+
+    sched.requests["test-3"] = req
+    sched.uid_to_request_id[125] = "test-3"
+
+    # Save at first boundary
+    mock_extracted_50 = _make_extracted_state(n_layers=2, n_tokens=50)
+    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_50):
+        callback(125, 50, MagicMock())
+
+    # Save at second boundary
+    mock_extracted_100 = _make_extracted_state(n_layers=2, n_tokens=100)
+    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_100):
+        callback(125, 100, MagicMock())
+
+    # Save at third boundary
+    mock_extracted_150 = _make_extracted_state(n_layers=2, n_tokens=150)
+    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_150):
+        callback(125, 150, MagicMock())
+
+    # Verify all boundaries were saved
+    assert hasattr(req, "_boundary_states")
+    assert 50 in req._boundary_states
+    assert 100 in req._boundary_states
+    assert 150 in req._boundary_states

@@ -1552,18 +1552,21 @@ class Scheduler:
             sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
             _tb = getattr(request, "turn_boundaries", None)
             turn_boundaries = _tb if isinstance(_tb, list) else []
+            _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
 
             # Boundaries where we always save regardless of throttle:
             # - sys_end_boundary: end of system prompt (for turn_cache sys node)
             # - turn_boundaries[i]: end of each intermediate turn (for per-turn trie nodes)
             # - prefix_boundary: end of conversation history before last user (for turn_cache conv node)
+            # - _turn_boundaries[i]: turn boundaries from turn_cache redesign
             at_sys_end = sys_end_boundary > 0 and total_cached == sys_end_boundary
             at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
             at_turn_boundary_idx = next(
                 (i for i, b in enumerate(turn_boundaries) if b > 0 and total_cached == b),
                 -1,
             )
-            at_any_boundary = at_sys_end or at_prefix_boundary or at_turn_boundary_idx >= 0
+            at_turn_boundary_new = total_cached in _turn_boundaries
+            at_any_boundary = at_sys_end or at_prefix_boundary or at_turn_boundary_idx >= 0 or at_turn_boundary_new
 
             # Throttle: only save every save_interval tokens,
             # unless we're at a cache boundary.
@@ -1599,35 +1602,17 @@ class Scheduler:
                                 f"store rejected for {total_cached} tokens"
                             )
 
-            # turn_cache: capture KV state at segment boundaries
-            if self.turn_cache is not None and at_any_boundary:
-                extracted = self._extract_cache_states(prompt_cache)
-                if extracted:
-                    if at_sys_end:
-                        # State at end of system prompt → stored on sys trie node
-                        request._sys_prompt_state = extracted
-                        request._mid_prefill_last_save = total_cached
+            # turn_cache branch: store state at each boundary in _boundary_states
+            if self.turn_cache is not None:
+                _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+                if total_cached in _turn_boundaries:
+                    extracted = self._extract_cache_states(prompt_cache)
+                    if extracted:
+                        if not hasattr(request, "_boundary_states") or request._boundary_states is None:
+                            request._boundary_states = {}
+                        request._boundary_states[total_cached] = extracted
                         logger.info(
-                            f"[turn_cache] sys_end_state captured at boundary={sys_end_boundary} "
-                            f"layers={len(extracted)} for {request_id[:12]}"
-                        )
-                    if at_turn_boundary_idx >= 0 and not at_sys_end:
-                        # State at end of an intermediate turn → stored on per-turn trie node
-                        if not hasattr(request, "_turn_boundary_states"):
-                            request._turn_boundary_states = {}
-                        request._turn_boundary_states[at_turn_boundary_idx] = extracted
-                        request._mid_prefill_last_save = total_cached
-                        logger.info(
-                            f"[turn_cache] turn_boundary_state[{at_turn_boundary_idx}] captured at "
-                            f"boundary={turn_boundaries[at_turn_boundary_idx]} "
-                            f"layers={len(extracted)} for {request_id[:12]}"
-                        )
-                    if at_prefix_boundary and not at_sys_end and at_turn_boundary_idx < 0:
-                        # State at end of conversation history → stored on conv trie node
-                        request._conv_end_state = extracted
-                        request._mid_prefill_last_save = total_cached
-                        logger.info(
-                            f"[turn_cache] conv_end_state captured at boundary={prefix_boundary} "
+                            f"[turn_cache] boundary_state captured at {total_cached} "
                             f"layers={len(extracted)} for {request_id[:12]}"
                         )
 
