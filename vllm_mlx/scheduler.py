@@ -2078,6 +2078,7 @@ class Scheduler:
 
         elif self.turn_cache is not None:
             segments = self._messages_to_segments(request)
+            logger.info(f"[turn_cache] _messages_to_segments for {request.request_id[:12]}: {len(segments) if segments else 0} segments from _turn_boundaries={getattr(request, '_turn_boundaries', [])}")
             if segments:
                 path, has_recurrent = self.turn_cache.match(segments)
                 if path:
@@ -2592,18 +2593,19 @@ class Scheduler:
                             )
 
                 elif self.turn_cache is not None:
-                    if (
-                        hasattr(request, "_extracted_cache")
-                        and request._extracted_cache is not None
-                    ):
+                    has_extracted = hasattr(request, "_extracted_cache") and request._extracted_cache is not None
+                    logger.info(f"[turn_cache] cleanup for {request_id[:12]}: has_extracted_cache={has_extracted}, output_tokens={len(request.output_token_ids) if request.output_token_ids else 0}")
+                    if has_extracted:
                         try:
                             segments = self._messages_to_segments(request)
+                            logger.info(f"[turn_cache] store phase: segments={len(segments)}, _turn_boundaries={getattr(request, '_turn_boundaries', [])}")
                             path = getattr(request, "_turn_cache_path", [])
                             matched_depth = len(path)
                             parent = path[-1] if path else self.turn_cache.root
                             new_segments = segments[matched_depth:]
                             _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
                             _boundary_states = getattr(request, "_boundary_states", None) or {}
+                            logger.info(f"[turn_cache] store: new_segments={len(new_segments)}, last_boundary would be {_turn_boundaries[-1] if _turn_boundaries else 0}")
                             parent_before_user = parent
 
                             for i, segment in enumerate(new_segments):
@@ -2626,6 +2628,13 @@ class Scheduler:
 
                             # Store completed exchange as a response node under parent_before_user.
                             last_boundary = _turn_boundaries[-1] if _turn_boundaries else 0
+                            store_cond = {
+                                "has_output": bool(request.output_token_ids),
+                                "last_boundary_gt_0": last_boundary > 0,
+                                "has_prompt": bool(request.prompt_token_ids),
+                                "has_segments": bool(new_segments),
+                            }
+                            logger.info(f"[turn_cache] store condition: {store_cond}")
                             if (
                                 request.output_token_ids
                                 and last_boundary > 0

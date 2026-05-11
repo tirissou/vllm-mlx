@@ -955,6 +955,7 @@ class BatchedEngine(BaseEngine):
             messages,
             chat_template_kwargs=chat_template_kwargs,
         )
+        logger.info(f"[turn_cache] chat() computed turn_boundaries={turn_boundaries}")
         kwargs["turn_boundaries"] = turn_boundaries
 
         return await self.generate(
@@ -1094,6 +1095,7 @@ class BatchedEngine(BaseEngine):
             messages,
             chat_template_kwargs=chat_template_kwargs,
         )
+        logger.info(f"[turn_cache] stream_chat() computed turn_boundaries={turn_boundaries}")
         kwargs["turn_boundaries"] = turn_boundaries
 
         async for output in self.stream_generate(
