@@ -985,6 +985,7 @@ class BatchedEngine(BaseEngine):
         system prompt in this codebase.
         """
         if not messages or messages[0].get("role") != "system":
+            logger.info(f"[DEBUG] _compute_turn_boundaries: no system message (first role={messages[0].get('role') if messages else 'NO_MESSAGES'})")
             return []
 
         tokenizer = self.tokenizer
@@ -992,14 +993,18 @@ class BatchedEngine(BaseEngine):
             tokenizer = tokenizer.tokenizer
 
         if not hasattr(tokenizer, "apply_chat_template"):
+            logger.info(f"[DEBUG] _compute_turn_boundaries: tokenizer has no apply_chat_template")
             return []
 
         try:
             full_prompt = self._apply_chat_template(
                 messages, chat_template_kwargs=chat_template_kwargs
             )
+            logger.debug(f"[DEBUG] _compute_turn_boundaries: full_prompt length={len(full_prompt)}")
             full_tokens = tokenizer.encode(full_prompt)
+            logger.debug(f"[DEBUG] _compute_turn_boundaries: full_tokens length={len(full_tokens)}")
             if not full_tokens:
+                logger.info(f"[DEBUG] _compute_turn_boundaries: tokenizer.encode returned empty")
                 return []
 
             def _lcp_closed(prefix_messages: list[dict]) -> int:
@@ -1035,7 +1040,9 @@ class BatchedEngine(BaseEngine):
             boundaries: list[int] = []
 
             B_sys = _lcp_closed([messages[0]])
+            logger.debug(f"[DEBUG] _compute_turn_boundaries: B_sys={B_sys}, len(full_tokens)={len(full_tokens)}")
             if B_sys <= 0 or B_sys >= len(full_tokens):
+                logger.info(f"[DEBUG] _compute_turn_boundaries: B_sys out of range")
                 return []
             boundaries.append(B_sys)
 
@@ -1051,7 +1058,10 @@ class BatchedEngine(BaseEngine):
                 k += 1
 
             return boundaries
-        except Exception:
+        except Exception as e:
+            logger.info(f"[DEBUG] _compute_turn_boundaries: exception: {type(e).__name__}: {e}")
+            import traceback
+            logger.debug(f"[DEBUG] traceback: {traceback.format_exc()}")
             return []
 
     async def stream_chat(
