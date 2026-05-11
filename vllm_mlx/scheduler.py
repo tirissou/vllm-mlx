@@ -388,6 +388,11 @@ def _install_chunked_prefill(
 
             if n_to_process > 0:
                 self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
+                logger.info(
+                    f"[chunked_prefill][loop-eval] n_to_process={n_to_process} "
+                    f"remaining={remaining} prompt_checkpoint={prompt_checkpoint} "
+                    f"is_cached={partial.get('is_cached')} inputs.shape={inputs.shape}"
+                )
                 mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
                 partial["inputs"] = inputs
@@ -1520,15 +1525,20 @@ class Scheduler:
 
             total_cached = (request.cached_tokens or 0) + processed_tokens
 
-            # Always save at prefix_boundary (message boundary for cache
-            # reuse with different final user messages).
             prefix_boundary = getattr(request, "prefix_boundary", 0)
+            sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
+
+            # Boundaries where we always save regardless of throttle:
+            # - sys_end_boundary: end of system prompt (for turn_cache sys node)
+            # - prefix_boundary: end of conversation history before last user (for turn_cache conv node)
+            at_sys_end = sys_end_boundary > 0 and total_cached == sys_end_boundary
             at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
+            at_any_boundary = at_sys_end or at_prefix_boundary
 
             # Throttle: only save every save_interval tokens,
-            # unless we're at the prefix boundary.
+            # unless we're at a cache boundary.
             last_save = getattr(request, "_mid_prefill_last_save", 0)
-            if not at_prefix_boundary and total_cached - last_save < save_interval:
+            if not at_any_boundary and total_cached - last_save < save_interval:
                 return
 
             # memory_aware_cache: save intermediate state for prefix cache reuse
@@ -1559,16 +1569,26 @@ class Scheduler:
                                 f"store rejected for {total_cached} tokens"
                             )
 
-            # turn_cache: capture system-segment state at prefix_boundary
-            if at_prefix_boundary and self.turn_cache is not None:
+            # turn_cache: capture KV state at segment boundaries
+            if self.turn_cache is not None and at_any_boundary:
                 extracted = self._extract_cache_states(prompt_cache)
                 if extracted:
-                    request._sys_prompt_state = extracted
-                    request._mid_prefill_last_save = total_cached
-                    logger.info(
-                        f"[turn_cache] sys_prompt_state captured at boundary={prefix_boundary} "
-                        f"layers={len(extracted)} for {request_id[:12]}"
-                    )
+                    if at_sys_end:
+                        # State at end of system prompt → stored on sys trie node
+                        request._sys_prompt_state = extracted
+                        request._mid_prefill_last_save = total_cached
+                        logger.info(
+                            f"[turn_cache] sys_end_state captured at boundary={sys_end_boundary} "
+                            f"layers={len(extracted)} for {request_id[:12]}"
+                        )
+                    if at_prefix_boundary and not at_sys_end:
+                        # State at end of conversation history → stored on conv trie node
+                        request._conv_end_state = extracted
+                        request._mid_prefill_last_save = total_cached
+                        logger.info(
+                            f"[turn_cache] conv_end_state captured at boundary={prefix_boundary} "
+                            f"layers={len(extracted)} for {request_id[:12]}"
+                        )
 
         return _mid_prefill_save
 
@@ -2538,8 +2558,12 @@ class Scheduler:
                             new_segments = segments[matched_depth:]
                             for i, segment in enumerate(new_segments):
                                 is_sys = segment.role == "system" and i == 0 and matched_depth == 0
+                                is_conv = segment.role == "conversation" and not is_sys
                                 if is_sys:
                                     state = getattr(request, "_sys_prompt_state", None)
+                                elif is_conv and i < len(new_segments) - 1:
+                                    # Conversation history segment: state captured at prefix_boundary
+                                    state = getattr(request, "_conv_end_state", None)
                                 elif i == len(new_segments) - 1:
                                     # Invariant: the last new segment is the user/assistant turn
                                     # and _extracted_cache covers prompt+output for this turn.
@@ -2601,13 +2625,13 @@ class Scheduler:
                         if not callable(keys_attr) and not callable(values_attr):
                             mx.eval(keys_attr, values_attr)
 
-            # Evaluate sys_prompt_state tensors (defensive: mid_prefill already evaluates
-            # chunked cache, but guard against any unevaluated lazy tensors)
-            sys_state = getattr(request, "_sys_prompt_state", None) if request is not None else None
-            if sys_state and isinstance(sys_state, list):
-                for layer_dict in sys_state:
-                    if isinstance(layer_dict, dict) and "state" in layer_dict:
-                        mx.eval(*layer_dict["state"])
+            # Evaluate boundary-captured tensors (defensive against lazy MLX GC)
+            for _state_attr in ("_sys_prompt_state", "_conv_end_state"):
+                _state = getattr(request, _state_attr, None) if request is not None else None
+                if _state and isinstance(_state, list):
+                    for layer_dict in _state:
+                        if isinstance(layer_dict, dict) and "state" in layer_dict:
+                            mx.eval(*layer_dict["state"])
 
             # Release all cache references on the request so Metal buffers
             # can be freed.  The prefix cache (if any) holds its own copy;
@@ -2617,6 +2641,7 @@ class Scheduler:
                 request.prompt_cache = None
                 request._extracted_cache = None
                 request._sys_prompt_state = None
+                request._conv_end_state = None
 
             # Remove from running
             if request_id in self.running:
@@ -3293,11 +3318,15 @@ class Scheduler:
     def _messages_to_segments(self, request: "Request") -> list:
         """Split a request's token sequence into per-message Segment objects.
 
-        Uses prefix_boundary (the exact token count before the last user message,
-        computed from the chat template) to split into a system-prompt segment and
-        a user segment.  This gives a stable, session-independent segment hash for
-        the system prompt so cross-session cache hits work correctly.
+        Produces up to three segments:
+          1. system: tokens[0:sys_end_boundary] — stable across all turns with the
+             same system prompt; this is the key that enables cross-session hits.
+          2. conversation: tokens[sys_end_boundary:prefix_boundary] — prior turn
+             history (only present in multi-turn conversations).
+          3. user: tokens[prefix_boundary:] — the current user message.
 
+        sys_end_boundary (end of system prompt) is stable across turns.
+        prefix_boundary (before last user message) shifts with each turn.
         Falls back to an empty list when no usable boundary is available.
         """
         from .turn_prefix_cache import Segment
@@ -3307,10 +3336,21 @@ class Scheduler:
             return []
 
         prefix_boundary = getattr(request, "prefix_boundary", 0)
-        if prefix_boundary > 0 and prefix_boundary < len(full_tokens):
-            return [
-                Segment(role="system", token_ids=full_tokens[:prefix_boundary]),
-                Segment(role="user", token_ids=full_tokens[prefix_boundary:]),
-            ]
+        sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
 
-        return []
+        if sys_end_boundary <= 0 or sys_end_boundary >= len(full_tokens):
+            return []
+
+        segments = [Segment(role="system", token_ids=full_tokens[:sys_end_boundary])]
+
+        if prefix_boundary > sys_end_boundary:
+            # Multi-turn: include conversation history as a separate segment
+            segments.append(Segment(
+                role="conversation",
+                token_ids=full_tokens[sys_end_boundary:prefix_boundary],
+            ))
+
+        if prefix_boundary < len(full_tokens):
+            segments.append(Segment(role="user", token_ids=full_tokens[prefix_boundary:]))
+
+        return segments if len(segments) > 1 else []

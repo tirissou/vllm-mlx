@@ -780,10 +780,12 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        sys_end_boundary = kwargs.pop("sys_end_boundary", 0)
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            sys_end_boundary=sys_end_boundary,
         )
 
         text = clean_output_text(output.output_text)
@@ -872,10 +874,12 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        sys_end_boundary = kwargs.pop("sys_end_boundary", 0)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            sys_end_boundary=sys_end_boundary,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -951,13 +955,15 @@ class BatchedEngine(BaseEngine):
         )
 
         # Compute prefix boundary for turn cache (same as stream_chat)
-        prefix_boundary = self._compute_prefix_boundary(
+        prefix_boundary, sys_end_boundary = self._compute_prefix_boundary(
             messages,
             tools,
             chat_template_kwargs=chat_template_kwargs,
         )
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+        if sys_end_boundary > 0:
+            kwargs["sys_end_boundary"] = sys_end_boundary
 
         return await self.generate(
             prompt=prompt,
@@ -975,23 +981,26 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> int:
-        """Compute token count for the shared prefix across message variations.
+    ) -> tuple[int, int]:
+        """Compute token boundaries for cache segmentation.
 
-        Uses a two-tokenization approach: tokenize the full prompt twice
-        (once as-is, once with the last user message replaced by a dummy)
-        and find the longest common prefix (LCP).  This gives the exact
-        boundary where different user suffixes diverge, avoiding template
-        discrepancies (e.g. Qwen3 <think> markers on last assistant).
+        Returns (prefix_boundary, sys_end_boundary):
+          - prefix_boundary: tokens before the last user message (dynamic per turn)
+          - sys_end_boundary: tokens before the first user message (stable across turns)
+
+        Uses LCP comparisons so that chat-template quirks (e.g. Qwen3 <think>
+        markers appended to the last assistant turn) don't shift the boundary.
         """
-        # Find index of last user message
+        # Find first and last user message indices
+        first_user_idx = None
         last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
+        for i, m in enumerate(messages):
+            if m.get("role") == "user":
+                if first_user_idx is None:
+                    first_user_idx = i
                 last_user_idx = i
-                break
         if last_user_idx is None or last_user_idx == 0:
-            return 0
+            return 0, 0
         try:
             template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -1002,35 +1011,43 @@ class BatchedEngine(BaseEngine):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-            # Build a dummy variant with different last user content
-            dummy_messages = list(messages)
-            dummy_messages[last_user_idx] = {
-                **messages[last_user_idx],
-                "content": "XXXXXXXXXX",
-            }
-            dummy_prompt = self._apply_chat_template(
-                dummy_messages,
-                template_tools,
-                chat_template_kwargs=chat_template_kwargs,
-            )
-
             tokenizer = self.tokenizer
             if hasattr(tokenizer, "tokenizer"):
                 tokenizer = tokenizer.tokenizer
 
             real_tokens = tokenizer.encode(real_prompt)
-            dummy_tokens = tokenizer.encode(dummy_prompt)
 
-            # Find LCP — the point where the two diverge is the boundary
-            lcp = 0
-            for j in range(min(len(real_tokens), len(dummy_tokens))):
-                if real_tokens[j] != dummy_tokens[j]:
-                    break
-                lcp = j + 1
+            def _lcp(dummy_idx: int) -> int:
+                dummy_messages = list(messages)
+                dummy_messages[dummy_idx] = {
+                    **messages[dummy_idx],
+                    "content": "XXXXXXXXXX",
+                }
+                dummy_prompt = self._apply_chat_template(
+                    dummy_messages,
+                    template_tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                dummy_tokens = tokenizer.encode(dummy_prompt)
+                lcp = 0
+                for j in range(min(len(real_tokens), len(dummy_tokens))):
+                    if real_tokens[j] != dummy_tokens[j]:
+                        break
+                    lcp = j + 1
+                return lcp
 
-            return lcp
+            # prefix_boundary: before the last user message
+            prefix_boundary = _lcp(last_user_idx)
+
+            # sys_end_boundary: before the first user message (stable across all turns)
+            if first_user_idx == last_user_idx:
+                sys_end_boundary = prefix_boundary  # single-user turn, same point
+            else:
+                sys_end_boundary = _lcp(first_user_idx)
+
+            return prefix_boundary, sys_end_boundary
         except Exception:
-            return 0
+            return 0, 0
 
     async def stream_chat(
         self,
@@ -1093,13 +1110,15 @@ class BatchedEngine(BaseEngine):
         )
 
         # Compute prefix boundary for cache
-        prefix_boundary = self._compute_prefix_boundary(
+        prefix_boundary, sys_end_boundary = self._compute_prefix_boundary(
             messages,
             tools,
             chat_template_kwargs=chat_template_kwargs,
         )
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+        if sys_end_boundary > 0:
+            kwargs["sys_end_boundary"] = sys_end_boundary
 
         async for output in self.stream_generate(
             prompt=prompt,

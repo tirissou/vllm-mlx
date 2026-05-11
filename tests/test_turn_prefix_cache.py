@@ -795,6 +795,7 @@ def test_messages_to_segments_uses_prefix_boundary():
         req = MagicMock()
         req.prompt_token_ids = sys_tokens + user_tokens
         req.prefix_boundary = boundary
+        req.sys_end_boundary = boundary
         return req
 
     # Both sessions have the same prefix_boundary (system prompt length)
@@ -837,6 +838,7 @@ def test_cross_session_hit_via_prefix_boundary():
         req = MagicMock()
         req.prompt_token_ids = sys_tokens + user_tokens
         req.prefix_boundary = len(sys_tokens)  # exact system-prompt boundary
+        req.sys_end_boundary = len(sys_tokens)
         return req
 
     # Session 1 store: insert sys segment + user-hi segment
@@ -954,6 +956,7 @@ def test_mid_prefill_stores_sys_prompt_state_at_boundary():
     req = MagicMock()
     req.prompt_token_ids = list(range(15))  # 10 sys + 5 user
     req.prefix_boundary = 10
+    req.sys_end_boundary = 10
     req.cached_tokens = 0
     sched.requests["req1"] = req
     sched.uid_to_request_id[1] = "req1"
@@ -980,6 +983,7 @@ def test_mid_prefill_does_not_store_state_away_from_boundary():
     req = MagicMock()
     req.prompt_token_ids = list(range(20))
     req.prefix_boundary = 10
+    req.sys_end_boundary = 10
     req.cached_tokens = 0
     req._mid_prefill_last_save = 0  # Avoid MagicMock returning a Mock for this
     req._sys_prompt_state = None    # Pre-set so we can detect if callback writes it
@@ -1003,6 +1007,7 @@ def test_mid_prefill_does_not_store_state_away_from_boundary_past_interval():
     req = MagicMock()
     req.prompt_token_ids = list(range(30))
     req.prefix_boundary = 20
+    req.sys_end_boundary = 20
     req.cached_tokens = 0
     req._mid_prefill_last_save = 0
     req._sys_prompt_state = None
@@ -1051,6 +1056,7 @@ def test_store_side_sets_recurrent_state_on_system_segment():
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + user_tokens
     req.prefix_boundary = 10
+    req.sys_end_boundary = 10
     req._sys_prompt_state = sys_state
     req._extracted_cache = [_MockKVLayer(15), _MockKVLayer(15)]  # live objects for user seg
     req._turn_cache_path = []
@@ -1112,6 +1118,7 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + user_tokens
     req.prefix_boundary = 10
+    req.sys_end_boundary = 10
     req.request_id = "test-fetch"
 
     segments = sched._messages_to_segments(req)
@@ -1249,6 +1256,7 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     req1 = MagicMock()
     req1.prompt_token_ids = sys_tokens + user_hi
     req1.prefix_boundary = len(sys_tokens)
+    req1.sys_end_boundary = len(sys_tokens)
     req1._sys_prompt_state = sys_state
     req1._turn_cache_path = []
 
@@ -1263,6 +1271,7 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     req2 = MagicMock()
     req2.prompt_token_ids = sys_tokens + user_yo
     req2.prefix_boundary = len(sys_tokens)
+    req2.sys_end_boundary = len(sys_tokens)
     req2.request_id = "session2"
 
     segs2 = sched._messages_to_segments(req2)
