@@ -373,6 +373,7 @@ class EngineCore:
             videos=videos,
             _turn_boundaries=turn_boundaries or [],
         )
+        logger.info(f"[DEBUG] add_request() created Request {request_id[:12]} with _turn_boundaries={request._turn_boundaries}")
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)

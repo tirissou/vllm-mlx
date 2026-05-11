@@ -2077,7 +2077,10 @@ class Scheduler:
                         request._ssd_candidate = ssd_candidate
 
         elif self.turn_cache is not None:
+            _turn_bds = getattr(request, "_turn_boundaries", None)
+            logger.info(f"[DEBUG] turn_cache check for {request.request_id[:12]}: _turn_boundaries={_turn_bds}")
             segments = self._messages_to_segments(request)
+            logger.info(f"[DEBUG] _messages_to_segments returned {len(segments) if segments else 0} segments")
             if segments:
                 path, has_recurrent = self.turn_cache.match(segments)
                 if path:
@@ -3417,14 +3420,17 @@ class Scheduler:
 
         full_tokens = list(request.prompt_token_ids or [])
         if not full_tokens:
+            logger.debug(f"[DEBUG] _messages_to_segments: no prompt tokens")
             return []
 
         _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
         if not _turn_boundaries:
+            logger.debug(f"[DEBUG] _messages_to_segments: no _turn_boundaries set")
             return []
 
         B_sys = _turn_boundaries[0]
         if B_sys <= 0 or B_sys >= len(full_tokens):
+            logger.debug(f"[DEBUG] _messages_to_segments: B_sys={B_sys} invalid (len={len(full_tokens)})")
             return []
 
         segments: list[Segment] = [
@@ -3440,4 +3446,6 @@ class Scheduler:
         if prev < len(full_tokens):
             segments.append(Segment(role="user", token_ids=full_tokens[prev:]))
 
-        return segments if len(segments) > 1 else []
+        result = segments if len(segments) > 1 else []
+        logger.debug(f"[DEBUG] _messages_to_segments: created {len(segments)} segments, returning {len(result)} (need >1)")
+        return result
