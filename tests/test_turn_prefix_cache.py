@@ -964,80 +964,6 @@ class _MockKVLayer:
         return (str(self._n),)
 
 
-def test_mid_prefill_stores_sys_prompt_state_at_boundary():
-    """_mid_prefill_save sets request._sys_prompt_state at prefix_boundary."""
-    from unittest.mock import MagicMock
-    sched = _make_minimal_scheduler_with_turn_cache()
-
-    req = MagicMock()
-    req.prompt_token_ids = list(range(15))  # 10 sys + 5 user
-    req.prefix_boundary = 10
-    req.sys_end_boundary = 10
-    req.cached_tokens = 0
-    sched.requests["req1"] = req
-    sched.uid_to_request_id[1] = "req1"
-
-    mock_cache = [_MockKVLayer(10), _MockKVLayer(10)]  # 2 layers, 10 tokens processed
-
-    cb = sched._make_mid_prefill_save_callback(save_interval=8192)
-    cb(uid=1, processed_tokens=10, prompt_cache=mock_cache)
-
-    assert hasattr(req, "_sys_prompt_state"), "_sys_prompt_state not set"
-    assert req._sys_prompt_state is not None
-    assert isinstance(req._sys_prompt_state, list)
-    assert len(req._sys_prompt_state) == 2
-    assert isinstance(req._sys_prompt_state[0], dict)
-    assert "state" in req._sys_prompt_state[0]
-    assert "class_name" in req._sys_prompt_state[0]
-
-
-def test_mid_prefill_does_not_store_state_away_from_boundary():
-    """_mid_prefill_save does NOT set _sys_prompt_state when not at prefix_boundary."""
-    from unittest.mock import MagicMock
-    sched = _make_minimal_scheduler_with_turn_cache()
-
-    req = MagicMock()
-    req.prompt_token_ids = list(range(20))
-    req.prefix_boundary = 10
-    req.sys_end_boundary = 10
-    req.cached_tokens = 0
-    req._mid_prefill_last_save = 0  # Avoid MagicMock returning a Mock for this
-    req._sys_prompt_state = None    # Pre-set so we can detect if callback writes it
-    sched.requests["req1"] = req
-    sched.uid_to_request_id[1] = "req1"
-
-    mock_cache = [_MockKVLayer(5)]  # Only 5 tokens processed, not at boundary
-
-    cb = sched._make_mid_prefill_save_callback(save_interval=8192)
-    cb(uid=1, processed_tokens=5, prompt_cache=mock_cache)
-
-    # _sys_prompt_state should remain None — callback returns early due to throttle
-    assert req._sys_prompt_state is None
-
-
-def test_mid_prefill_does_not_store_state_away_from_boundary_past_interval():
-    """_mid_prefill_save does NOT set _sys_prompt_state when past save_interval but not at boundary."""
-    from unittest.mock import MagicMock
-    sched = _make_minimal_scheduler_with_turn_cache()
-
-    req = MagicMock()
-    req.prompt_token_ids = list(range(30))
-    req.prefix_boundary = 20
-    req.sys_end_boundary = 20
-    req.cached_tokens = 0
-    req._mid_prefill_last_save = 0
-    req._sys_prompt_state = None
-    sched.requests["req1"] = req
-    sched.uid_to_request_id[1] = "req1"
-
-    # processed_tokens=15 exceeds save_interval=10, but is NOT at prefix_boundary=20
-    mock_cache = [_MockKVLayer(15)]
-    cb = sched._make_mid_prefill_save_callback(save_interval=10)
-    cb(uid=1, processed_tokens=15, prompt_cache=mock_cache)
-
-    assert req._sys_prompt_state is None, "_sys_prompt_state should not be set away from boundary"
-
-
 def _make_extracted_state(n_layers=2, n_tokens=10):
     """Build a list of dicts in _extract_cache_states format."""
     from mlx_lm.models.cache import KVCache
@@ -1050,64 +976,6 @@ def _make_extracted_state(n_layers=2, n_tokens=10):
         }
         for _ in range(n_layers)
     ]
-
-
-def test_store_side_sets_recurrent_state_on_system_segment():
-    """After generation, system segment node gets recurrent_state from _sys_prompt_state."""
-    from unittest.mock import MagicMock
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
-    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
-
-    sched = object.__new__(Scheduler)
-    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
-    sched.memory_aware_cache = None
-    sched.block_aware_cache = None
-    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
-    sched.turn_cache = cache
-
-    sys_tokens = list(range(10))
-    user_tokens = list(range(10, 15))
-    sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
-
-    req = MagicMock()
-    req.prompt_token_ids = sys_tokens + user_tokens
-    req.prefix_boundary = 10
-    req.sys_end_boundary = 10
-    req._sys_prompt_state = sys_state
-    req._extracted_cache = [_MockKVLayer(15), _MockKVLayer(15)]  # live objects for user seg
-    req._turn_cache_path = []
-
-    # Call _messages_to_segments and then simulate the store loop
-    segments = sched._messages_to_segments(req)
-    assert len(segments) == 2
-
-    parent = cache.root
-    new_segments = segments  # matched_depth=0, so all segments are new
-    for i, segment in enumerate(new_segments):
-        is_sys = segment.role == "system" and i == 0
-        if is_sys:
-            state = getattr(req, "_sys_prompt_state", None)
-        elif i == len(new_segments) - 1:
-            ec = req._extracted_cache
-            if isinstance(ec, list) and ec and isinstance(ec[0], dict):
-                state = ec
-            else:
-                state = sched._extract_cache_states(ec)
-        else:
-            state = None
-        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
-
-    # System node should have _sys_prompt_state
-    sys_node = list(cache.root.children.values())[0]
-    assert sys_node.recurrent_state is not None
-    assert isinstance(sys_node.recurrent_state, list)
-    assert isinstance(sys_node.recurrent_state[0], dict)
-
-    # User node should have extracted state from _extracted_cache
-    user_node = list(sys_node.children.values())[0]
-    assert user_node.recurrent_state is not None
-    assert isinstance(user_node.recurrent_state, list)
-    assert isinstance(user_node.recurrent_state[0], dict)
 
 
 def test_fetch_reconstructs_dict_state_into_prompt_cache():
@@ -1125,6 +993,7 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
 
     sys_tokens = list(range(10))
     user_tokens = list(range(10, 13))
+    B_sys = len(sys_tokens)
     sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
 
     sys_seg = Segment(role="system", token_ids=sys_tokens)
@@ -1133,8 +1002,7 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
     # Fetch: request with same system tokens but different user tokens
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + user_tokens
-    req.prefix_boundary = 10
-    req.sys_end_boundary = 10
+    req._turn_boundaries = [B_sys]
     req.request_id = "test-fetch"
 
     segments = sched._messages_to_segments(req)
@@ -1145,7 +1013,7 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
     assert ancestor is not None
     raw_state = ancestor.recurrent_state
 
-    # Apply the reconstruction logic we're about to add
+    # Apply the reconstruction logic
     if (
         raw_state is not None
         and isinstance(raw_state, list)
