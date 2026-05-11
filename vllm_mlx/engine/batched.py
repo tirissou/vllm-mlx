@@ -999,6 +999,7 @@ class BatchedEngine(BaseEngine):
                 messages, chat_template_kwargs=boundary_kwargs_with_no_gen
             )
             full_tokens = tokenizer.encode(full_prompt)
+            logger.info(f"[turn_cache] _compute_turn_boundaries: full_prompt len={len(full_prompt)}, full_tokens len={len(full_tokens)}")
             if not full_tokens:
                 return []
 
@@ -1013,9 +1014,12 @@ class BatchedEngine(BaseEngine):
                 )
                 prefix_tokens = tokenizer.encode(prefix_prompt)
 
+                matches = len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]
+                logger.info(f"[turn_cache] prefix i={i} ({messages[i-1].get('role')}): len={len(prefix_tokens)}, matches={matches}")
+
                 # Find where this prefix ends in full_tokens by checking if
                 # the prefix tokens match the beginning of full_tokens
-                if len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]:
+                if matches:
                     boundary = len(prefix_tokens)
                     # Only add as a boundary if it's a system message (first) or
                     # after a completed turn (message[i-1] is assistant)
@@ -1023,11 +1027,14 @@ class BatchedEngine(BaseEngine):
                         # Don't add the final user message as a boundary
                         if i < len(messages):
                             if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
+                                logger.info(f"[turn_cache] adding boundary {boundary} at i={i}")
                                 boundaries.append(boundary)
 
+            logger.info(f"[turn_cache] _compute_turn_boundaries final: {boundaries}")
             return boundaries
 
         except Exception as e:
+            logger.info(f"[turn_cache] _compute_turn_boundaries exception: {type(e).__name__}: {e}")
             return []
 
     async def stream_chat(
