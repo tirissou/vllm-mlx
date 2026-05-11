@@ -385,6 +385,20 @@ def _install_chunked_prefill(
                 if remaining > prompt_checkpoint
                 else 0
             )
+            # Boundary-aware: shrink chunk to land exactly on the next boundary
+            if n_to_process > 0 and len(partial.get("uids", [])) == 1:
+                _uid0 = partial["uids"][0]
+                _rid0 = (uid_to_request_id or {}).get(_uid0)
+                _req0 = (requests or {}).get(_rid0) if _rid0 else None
+                if _req0 is not None:
+                    _turn_bds = getattr(_req0, "_turn_boundaries", [])
+                    _cached0 = getattr(_req0, "cached_tokens", 0)
+                    _total_pos = _cached0 + partial["processed"]
+                    _next_b = next((b for b in sorted(_turn_bds) if b > _total_pos), None)
+                    if _next_b is not None:
+                        _dist = _next_b - _total_pos
+                        if _dist <= budget:
+                            n_to_process = min(_dist, remaining - prompt_checkpoint)
 
             if n_to_process > 0:
                 self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
@@ -511,14 +525,14 @@ def _install_chunked_prefill(
             if batch_prompts:
                 total_tokens = sum(len(p[1]) for p in batch_prompts)
 
-                # Check if any prompt has a prefix_boundary that
+                # Check if any prompt has turn boundaries that
                 # requires two-phase prefill for cache save at that boundary.
                 _needs_boundary_split = False
                 if requests is not None and uid_to_request_id is not None:
                     for _uid, _toks, *_ in batch_prompts:
                         _rid = uid_to_request_id.get(_uid)
                         _req = requests.get(_rid) if _rid else None
-                        if _req and getattr(_req, "prefix_boundary", 0) > 0:
+                        if _req and getattr(_req, "_turn_boundaries", []):
                             _needs_boundary_split = True
                             break
 
@@ -595,14 +609,13 @@ def _install_chunked_prefill(
                         _uid0 = uids[0]
                         _rid0 = uid_to_request_id.get(_uid0)
                         _req0 = requests.get(_rid0) if _rid0 else None
-                        _pb = getattr(_req0, "prefix_boundary", 0) if _req0 else 0
+                        _turn_bds = getattr(_req0, "_turn_boundaries", []) if _req0 else []
                         _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
-                        _adjusted_pb = _pb - _cached
-                        if 0 < _adjusted_pb < padded.shape[1] - prompt_checkpoint + 1:
-                            # Use remainder so budget-sized loop iterations land exactly on
-                            # the boundary (prevents bypassing budget for large boundaries).
-                            _rem = _adjusted_pb % budget
-                            _first_chunk = _rem if _rem > 0 else budget
+                        _bds_to_hit = sorted(b for b in _turn_bds if b > _cached)
+                        if _bds_to_hit:
+                            _dist = _bds_to_hit[0] - _cached
+                            if 0 < _dist < padded.shape[1] - prompt_checkpoint + 1:
+                                _first_chunk = min(_dist, budget)
                     n_to_process = min(
                         _first_chunk, padded.shape[1] - prompt_checkpoint
                     )

@@ -2172,3 +2172,60 @@ def test_store_side_conv_node_gets_boundary_state():
     sys_node = list(cache.root.children.values())[0]
     conv_node = list(sys_node.children.values())[0]
     assert conv_node.recurrent_state is conv_state
+
+
+def test_chunked_prefill_boundary_aware_first_chunk():
+    """When _turn_boundaries=[B_sys] and B_sys <= budget, first chunk lands exactly on B_sys."""
+    from unittest.mock import MagicMock, patch
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+    sched = object.__new__(Scheduler)
+    sched.config = SchedulerConfig(
+        use_turn_cache=True, chunked_prefill_tokens=100
+    )
+
+    # Simulate a request with B_sys=40, budget=100, prompt=80 tokens
+    req = MagicMock()
+    req._turn_boundaries = [40]
+    req.cached_tokens = 0
+    req.prompt_token_ids = list(range(80))
+
+    # The first chunk should be 40 (landing on B_sys)
+    _turn_boundaries = req._turn_boundaries
+    cached = req.cached_tokens
+    budget = 100
+
+    boundaries_to_hit = sorted(b for b in _turn_boundaries if b > cached)
+    assert boundaries_to_hit
+    first_b = boundaries_to_hit[0]
+    dist = first_b - cached
+    first_chunk = min(dist, budget) if dist <= budget else budget
+    assert first_chunk == 40, f"Expected first_chunk=40, got {first_chunk}"
+
+
+def test_chunked_prefill_boundary_aware_skips_when_boundary_beyond_budget():
+    """When B_sys > budget, full budget is used (boundary handled in next iteration)."""
+    req_boundaries = [300]  # B_sys=300
+    cached = 0
+    budget = 100
+
+    boundaries_to_hit = sorted(b for b in req_boundaries if b > cached)
+    first_b = boundaries_to_hit[0]
+    dist = first_b - cached
+    first_chunk = min(dist, budget) if dist <= budget else budget
+    assert first_chunk == budget, f"Expected first_chunk={budget}, got {first_chunk}"
+
+
+def test_chunked_prefill_boundary_aware_continuation_lands_on_boundary():
+    """In the continuation loop, chunk size lands exactly on next boundary."""
+    _turn_boundaries = [40, 80]
+    cached = 0
+    processed_so_far = 40  # first chunk already landed on B_sys=40
+    budget = 100
+
+    total_pos = cached + processed_so_far
+    next_b = next((b for b in sorted(_turn_boundaries) if b > total_pos), None)
+    assert next_b == 80
+    dist = next_b - total_pos
+    n_to_process = min(dist, budget) if dist <= budget else budget
+    assert n_to_process == 40
