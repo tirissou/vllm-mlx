@@ -1700,3 +1700,45 @@ def test_compute_turn_boundaries_last_boundary_less_than_full():
     assert boundaries[-1] < len(full_tokens), (
         f"Last boundary {boundaries[-1]} >= full_tokens length {len(full_tokens)}"
     )
+
+
+# ── Request dataclass field tests ──────────────────────────────────────────
+
+def test_request_has_turn_boundaries_field():
+    """Request must have _turn_boundaries field (new)."""
+    from vllm_mlx.request import Request, SamplingParams
+    req = Request(
+        request_id="test",
+        prompt="hi",
+        sampling_params=SamplingParams(),
+    )
+    assert hasattr(req, "_turn_boundaries"), "Request missing _turn_boundaries field"
+
+
+def test_request_turn_boundaries_field_set():
+    """Request._turn_boundaries defaults to empty list and can be set."""
+    from vllm_mlx.request import Request, SamplingParams
+    req = Request(
+        request_id="test",
+        prompt="hi",
+        sampling_params=SamplingParams(),
+    )
+    assert isinstance(req._turn_boundaries, list), "_turn_boundaries should be a list"
+    assert len(req._turn_boundaries) == 0, "_turn_boundaries should default to empty"
+    # Should also have _boundary_states field
+    assert hasattr(req, "_boundary_states"), "Request missing _boundary_states field"
+    assert isinstance(req._boundary_states, dict), "_boundary_states should be a dict"
+    assert len(req._boundary_states) == 0, "_boundary_states should default to empty"
+
+
+def test_request_no_old_boundary_fields():
+    """Request must NOT have the old boundary fields (prefix_boundary, sys_end_boundary, turn_boundaries)."""
+    from vllm_mlx.request import Request, SamplingParams
+    req = Request(
+        request_id="test",
+        prompt="hi",
+        sampling_params=SamplingParams(),
+    )
+    assert not hasattr(req, "prefix_boundary"), "Request should not have prefix_boundary field"
+    assert not hasattr(req, "sys_end_boundary"), "Request should not have sys_end_boundary field"
+    assert not hasattr(req, "turn_boundaries"), "Request should not have turn_boundaries field"
