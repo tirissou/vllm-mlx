@@ -1005,36 +1005,83 @@ class BatchedEngine(BaseEngine):
 
             boundaries: list[int] = []
 
-            # Build boundaries by tokenizing progressively larger message prefixes
-            # and finding their token counts in the full prompt
+            # Find message boundaries by tokenizing prefixes including dummy user messages when needed
             for i in range(1, len(messages) + 1):
-                prefix = messages[:i]
-                prefix_prompt = self._apply_chat_template(
-                    prefix, chat_template_kwargs=boundary_kwargs_with_no_gen
-                )
+                prefix = list(messages[:i])
+
+                # If prefix doesn't have a user message, add dummy one so template accepts it
+                dummy_added = False
+                if not any(m.get("role") == "user" for m in prefix):
+                    prefix.append({"role": "user", "content": ""})
+                    dummy_added = True
+
+                try:
+                    prefix_prompt = self._apply_chat_template(
+                        prefix, chat_template_kwargs=boundary_kwargs_with_no_gen
+                    )
+                except Exception as e:
+                    logger.info(f"[turn_cache] prefix i={i}: template failed: {e}")
+                    continue
+
                 prefix_tokens = tokenizer.encode(prefix_prompt)
 
+                # If we added a dummy user message, try to remove it from the encoded tokens
+                # by comparing with a version that has the dummy message explicitly
+                if dummy_added and i == 1:
+                    # For system-only prefix, find where system message ends by looking for role markers
+                    # Try to find the boundary by looking for the pattern of opening/closing tags
+                    # This is a heuristic but should work for most templates
+
+                    # Simpler approach: tokenize just the original prefix without the dummy
+                    # and use the tokenizer's token count
+                    sys_msg = messages[0]
+                    sys_content = sys_msg.get("content", "")
+
+                    # Estimate where system message ends by finding closing tag position
+                    # Look for common template patterns like </system>, </s>, etc
+                    import re
+                    close_patterns = ['</system>', '</s>', '<user>']
+                    boundary_pos = len(full_prompt)
+                    for pattern in close_patterns:
+                        pos = full_prompt.find(pattern)
+                        if pos >= 0:
+                            boundary_pos = min(boundary_pos, pos + len(pattern) if pattern != '<user>' else pos)
+
+                    # Tokenize up to the boundary
+                    boundary_tokens = tokenizer.encode(full_prompt[:boundary_pos])
+                    logger.info(f"[turn_cache] system boundary: approx tokens at {boundary_pos}/{len(full_prompt)}, tokenized={len(boundary_tokens)}")
+                    if boundary_tokens and boundary_tokens[0] == full_tokens[0]:
+                        # Find longest prefix that matches
+                        lcp = 0
+                        for j in range(min(len(boundary_tokens), len(full_tokens))):
+                            if boundary_tokens[j] == full_tokens[j]:
+                                lcp = j + 1
+                            else:
+                                break
+                        logger.info(f"[turn_cache] system LCP={lcp}")
+                        if lcp > 0:
+                            boundaries.append(lcp)
+                    continue
+
+                # For prefixes with user messages, check if they match the full token prefix
                 matches = len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]
                 logger.info(f"[turn_cache] prefix i={i} ({messages[i-1].get('role')}): len={len(prefix_tokens)}, matches={matches}")
 
-                # Find where this prefix ends in full_tokens by checking if
-                # the prefix tokens match the beginning of full_tokens
                 if matches:
                     boundary = len(prefix_tokens)
-                    # Only add as a boundary if it's a system message (first) or
-                    # after a completed turn (message[i-1] is assistant)
-                    if i == 1 or (i > 0 and messages[i - 1].get("role") == "assistant"):
-                        # Don't add the final user message as a boundary
-                        if i < len(messages):
-                            if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
-                                logger.info(f"[turn_cache] adding boundary {boundary} at i={i}")
-                                boundaries.append(boundary)
+                    # Only add as a boundary if it's after a completed turn (message[i-1] is assistant)
+                    if i > 1 and messages[i - 1].get("role") == "assistant":
+                        if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
+                            logger.info(f"[turn_cache] adding boundary {boundary} at i={i}")
+                            boundaries.append(boundary)
 
             logger.info(f"[turn_cache] _compute_turn_boundaries final: {boundaries}")
             return boundaries
 
         except Exception as e:
             logger.info(f"[turn_cache] _compute_turn_boundaries exception: {type(e).__name__}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return []
 
     async def stream_chat(
