@@ -368,6 +368,7 @@ class TurnPrefixCache:
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
             self._evict_if_needed_unlocked()
+            __import__('pdb').set_trace()
             return node
 
     def match(self, segments: list[Segment]) -> tuple[list[TurnNode], bool]:
