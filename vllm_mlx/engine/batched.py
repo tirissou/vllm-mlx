@@ -1077,7 +1077,9 @@ class BatchedEngine(BaseEngine):
                             else:
                                 break
                         logger.info(f"[turn_cache] system LCP={lcp}")
-                        if lcp > 0:
+                        # Only add system boundary if it doesn't span the entire prompt
+                        # (which indicates detection failure in multi-turn conversations)
+                        if lcp > 0 and lcp < len(full_tokens):
                             boundaries.append(lcp)
                     continue
 
