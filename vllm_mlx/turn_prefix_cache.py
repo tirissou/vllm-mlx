@@ -224,7 +224,9 @@ class TurnPrefixCache:
             for segment in segments:
                 h = _context_hash(node.context_hash, segment.token_ids)
                 if h not in node.children:
+                    logger.info(f"Could not match {segment.role=}")
                     break
+                logger.info(f"Matched {segment.role=}")
                 node = node.children[h]
                 node.last_used = now
                 node.ref_count += 1
