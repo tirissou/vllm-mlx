@@ -2630,6 +2630,12 @@ class Scheduler:
 
                             # Store completed exchange as a response node under parent_before_user.
                             last_boundary = _turn_boundaries[-1] if _turn_boundaries else 0
+
+                            # When no boundaries exist (first turn, no assistant yet), use full prompt as boundary
+                            # to enable caching for future turns
+                            if not _turn_boundaries and request.prompt_token_ids:
+                                last_boundary = len(request.prompt_token_ids)
+
                             store_cond = {
                                 "has_output": bool(request.output_token_ids),
                                 "last_boundary_gt_0": last_boundary > 0,
