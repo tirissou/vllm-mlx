@@ -1087,7 +1087,7 @@ class BatchedEngine(BaseEngine):
 
                 if matches:
                     boundary = len(prefix_tokens)
-                    # Only add as a boundary if it's after a completed turn (message[i-1] is assistant)
+                    # Add each turn as a boundary
                     if i > 1 and messages[i - 1].get("role") == "assistant":
                         if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
                             logger.info(f"[turn_cache] adding boundary {boundary} at i={i}")
