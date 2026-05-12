@@ -667,8 +667,13 @@ class TurnPrefixCache:
 
         return True
 
-    def visualize(self, max_depth: int = 10) -> str:
-        """Return a tree representation of the trie structure."""
+    def visualize(self, max_depth: int = 10, tokenizer=None) -> str:
+        """Return a tree representation of the trie structure.
+
+        Args:
+            max_depth: Maximum depth to traverse
+            tokenizer: Optional tokenizer to decode tokens (must have decode() method)
+        """
         lines = []
 
         def node_label(node: TurnNode, is_root: bool = False) -> str:
@@ -680,11 +685,36 @@ class TurnPrefixCache:
             has_state = "S" if node.recurrent_state else " "
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
-            # Show last 5 tokens
             if node.token_ids:
-                last_tokens = node.token_ids[-5:] if len(node.token_ids) >= 5 else node.token_ids
-                tokens_str = ",".join(str(t) for t in last_tokens)
-                label += f" ...{tokens_str}"
+                last_tokens = node.token_ids[-10:] if len(node.token_ids) >= 10 else node.token_ids
+
+                # Try to decode tokens to text
+                if tokenizer:
+                    try:
+                        # Handle both direct tokenizer with decode() and wrapped tokenizer
+                        tok = tokenizer
+                        if hasattr(tokenizer, "tokenizer"):
+                            tok = tokenizer.tokenizer
+
+                        if hasattr(tok, "decode"):
+                            text = tok.decode(last_tokens)
+                            # Escape newlines and limit length for display
+                            text = text.replace("\n", "\\n").replace("\r", "\\r")
+                            if len(text) > 50:
+                                text = text[:47] + "..."
+                            label += f" | {text}"
+                        else:
+                            # Fallback to token IDs if decode not available
+                            tokens_str = ",".join(str(t) for t in last_tokens)
+                            label += f" ...{tokens_str}"
+                    except Exception:
+                        # If decode fails, show token IDs
+                        tokens_str = ",".join(str(t) for t in last_tokens)
+                        label += f" ...{tokens_str}"
+                else:
+                    # No tokenizer, show token IDs
+                    tokens_str = ",".join(str(t) for t in last_tokens)
+                    label += f" ...{tokens_str}"
 
             return label
 

@@ -2114,7 +2114,7 @@ class Scheduler:
                         request.cached_tokens = 0
                         request.remaining_tokens = request.prompt_token_ids
                     logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request.request_id}")
-                    logger.debug(f"[turn_cache] cache structure on HIT:\n{self.turn_cache.visualize()}")
+                    logger.debug(f"[turn_cache] cache structure on HIT:\n{self.turn_cache.visualize(tokenizer=self.tokenizer)}")
                 else:
                     request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
@@ -2685,8 +2685,8 @@ class Scheduler:
                             if path:
                                 self.turn_cache.release(path)
 
-                            # Debug: visualize cache structure
-                            logger.debug(f"[turn_cache] cache structure after store:\n{self.turn_cache.visualize()}")
+                            # Debug: visualize cache structure with decoded tokens
+                            logger.debug(f"[turn_cache] cache structure after store:\n{self.turn_cache.visualize(tokenizer=self._actual_tokenizer)}")
                         except Exception as e:
                             logger.debug(f"[turn_cache] store failed for {request_id}: {e}")
 
