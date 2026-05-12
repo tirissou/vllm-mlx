@@ -2615,6 +2615,21 @@ class Scheduler:
                                 is_sys = segment.role == "system" and abs_idx == 0
                                 is_last = i == len(new_segments) - 1
 
+                                # Skip inserting thinking block prefix (added by template for generation)
+                                # The thinking block prefix is just \n<|im_start|>assistant\n<think>\n (6 tokens)
+                                # It will be included in response_tokens, so we don't insert it separately
+                                if is_last and len(segment.token_ids) <= 10:
+                                    try:
+                                        seg_text = self._tokenizer.decode(segment.token_ids)
+                                        if "<think>" in seg_text and "<|im_start|>" in seg_text:
+                                            logger.info(
+                                                f"[turn_cache] skipping thinking block prefix: "
+                                                f"{len(segment.token_ids)} tokens"
+                                            )
+                                            continue
+                                    except Exception:
+                                        pass  # If decoding fails, proceed with normal insert
+
                                 if is_last:
                                     state = None
                                 elif abs_idx < len(_turn_boundaries):
@@ -2665,6 +2680,8 @@ class Scheduler:
                                     resp_state = ec
                                 else:
                                     resp_state = self._extract_cache_states(ec) or None
+
+
                                 self.turn_cache.insert(
                                     parent_before_user,
                                     _Seg(role="conversation", token_ids=response_tokens),
