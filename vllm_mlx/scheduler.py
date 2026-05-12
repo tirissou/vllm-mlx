@@ -92,8 +92,8 @@ class SchedulerConfig:
     # TurnPrefixCache settings
     use_turn_cache: bool = False
     turn_cache_stride: int = 512
-    turn_cache_ssd_gb: float = 0.0
-    turn_cache_memory_gb: float = 8.0
+    turn_cache_ssd_gb: float = 50.0
+    turn_cache_memory_gb: float = 20.0
 
     # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
     # When enabled, large prompts are split into chunks so that active
