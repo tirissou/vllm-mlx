@@ -1046,41 +1046,60 @@ class BatchedEngine(BaseEngine):
                 # If we added a dummy user message, try to remove it from the encoded tokens
                 # by comparing with a version that has the dummy message explicitly
                 if dummy_added and i == 1:
-                    # For system-only prefix, find where system message ends by looking for role markers
-                    # Try to find the boundary by looking for the pattern of opening/closing tags
-                    # This is a heuristic but should work for most templates
+                    # Detect system boundary by template structure comparison
+                    # Find where second user message starts in [system, user, user] template
 
-                    # Simpler approach: tokenize just the original prefix without the dummy
-                    # and use the tokenizer's token count
-                    sys_msg = messages[0]
-                    sys_content = sys_msg.get("content", "")
+                    try:
+                        # Single dummy: system + 1st user
+                        one_dummy = self._apply_chat_template(
+                            [messages[0], {"role": "user", "content": ""}],
+                            tools=tools, num_images=num_images, num_audios=num_audios,
+                            chat_template_kwargs=boundary_kwargs_with_no_gen,
+                            enable_thinking=enable_thinking,
+                        )
 
-                    # Estimate where system message ends by finding closing tag position
-                    # Look for common template patterns like </system>, </s>, etc
-                    import re
-                    close_patterns = ['</system>', '</s>', '<user>']
-                    boundary_pos = len(full_prompt)
-                    for pattern in close_patterns:
-                        pos = full_prompt.find(pattern)
-                        if pos >= 0:
-                            boundary_pos = min(boundary_pos, pos + len(pattern) if pattern != '<user>' else pos)
+                        # Double dummy: system + 1st user + 2nd user
+                        two_dummies = self._apply_chat_template(
+                            [messages[0], {"role": "user", "content": ""}, {"role": "user", "content": ""}],
+                            tools=tools, num_images=num_images, num_audios=num_audios,
+                            chat_template_kwargs=boundary_kwargs_with_no_gen,
+                            enable_thinking=enable_thinking,
+                        )
 
-                    # Tokenize up to the boundary
-                    boundary_tokens = tokenizer.encode(full_prompt[:boundary_pos])
-                    logger.info(f"[turn_cache] system boundary: approx tokens at {boundary_pos}/{len(full_prompt)}, tokenized={len(boundary_tokens)}")
-                    if boundary_tokens and boundary_tokens[0] == full_tokens[0]:
-                        # Find longest prefix that matches
-                        lcp = 0
-                        for j in range(min(len(boundary_tokens), len(full_tokens))):
-                            if boundary_tokens[j] == full_tokens[j]:
-                                lcp = j + 1
-                            else:
-                                break
-                        logger.info(f"[turn_cache] system LCP={lcp}")
-                        # Only add system boundary if it doesn't span the entire prompt
-                        # (which indicates detection failure in multi-turn conversations)
-                        if lcp > 0 and lcp < len(full_tokens):
-                            boundaries.append(lcp)
+                        # Find where second user message starts by finding the repeating pattern
+                        # two_dummies = one_dummy + (second_user_part)
+                        # The second user part is identical to the first user part in structure
+                        # So find where the pattern repeats in two_dummies
+
+                        # Look for the end of one_dummy by finding first difference
+                        # Then backtrack to find where the user marker starts
+                        import re
+                        # Find all "<user>" markers in two_dummies
+                        user_markers = [(m.start(), m.end()) for m in re.finditer(r'<user>', two_dummies)]
+                        if len(user_markers) >= 2:
+                            # System boundary is where the first <user> marker starts
+                            boundary_pos = user_markers[0][0]
+                        else:
+                            # Fallback: use the length of one_dummy
+                            boundary_pos = len(one_dummy)
+
+                        # Tokenize just the system part
+                        system_tokens = tokenizer.encode(full_prompt[:boundary_pos])
+                        logger.info(f"[turn_cache] system boundary: {len(system_tokens)} tokens")
+
+                        if system_tokens and system_tokens[0] == full_tokens[0]:
+                            # Find longest prefix match
+                            lcp = 0
+                            for j in range(min(len(system_tokens), len(full_tokens))):
+                                if system_tokens[j] == full_tokens[j]:
+                                    lcp = j + 1
+                                else:
+                                    break
+                            if 0 < lcp < len(full_tokens):
+                                boundaries.append(lcp)
+                    except Exception as e:
+                        logger.debug(f"[turn_cache] system boundary detection failed: {e}")
+
                     continue
 
                 # For prefixes with user messages, check if they match the full token prefix

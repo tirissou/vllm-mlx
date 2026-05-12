@@ -1389,6 +1389,16 @@ def _make_engine_with_mock_tok():
     eng._tokenizer = _MockTok()
     eng._processor = None
     eng._model_name = "mock"
+
+    # Add _apply_chat_template method for boundary detection
+    def _apply_chat_template(messages, tools=None, num_images=0, num_audios=0,
+                           chat_template_kwargs=None, enable_thinking=None):
+        return eng._tokenizer.apply_chat_template(
+            messages,
+            **((chat_template_kwargs or {}) if isinstance(chat_template_kwargs, dict) else {})
+        )
+    eng._apply_chat_template = _apply_chat_template
+
     return eng
 
 
