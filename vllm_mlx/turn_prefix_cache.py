@@ -404,14 +404,8 @@ class TurnPrefixCache:
         """
         # First pass: look for deepest permanent checkpoint with recurrent state
         for node in reversed(path):
-            if (node.is_permanent_checkpoint and
-                node.recurrent_state is not None and
+            if (node.recurrent_state is not None and
                 not isinstance(node.recurrent_state, SSDRef)):
-                return node
-
-        # Fallback: if no permanent checkpoint found, return deepest node with recurrent state
-        for node in reversed(path):
-            if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
                 return node
 
         return None
