@@ -20,7 +20,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_CACHE_FORMAT_VERSION = 1
+_CACHE_FORMAT_VERSION = 2
 
 
 @dataclass
@@ -42,6 +42,7 @@ class TurnNode:
     kv_arrays: list[mx.array] | SSDRef | None   # None only for root sentinel
     kv_scales: list[float] | None
     recurrent_state: Any | SSDRef | None         # list of per-layer states, or SSDRef
+    recurrent_scales: list[list[float]] | None   # per-layer, per-tensor per-channel scales (int8 only)
     tokens_since_checkpoint: int                 # from nearest permanent checkpoint ancestor at creation
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
@@ -60,9 +61,10 @@ class TurnNode:
 
 @dataclass
 class TurnPrefixCacheConfig:
-    checkpoint_stride: int = 512      # tokens between permanent checkpoints; 0 = every node
+    checkpoint_stride: int = 4000 # tokens between permanent checkpoints; 0 = every node
     max_memory_gb: float = 8.0
-    kv_dtype: str = "int8"            # "bf16" or "int8"
+    kv_dtype: str = "int8"                      # "bf16" or "int8"
+    recurrent_dtype: str = "int8"                # "none", "fp16", "bf16", or "int8" (per-channel)
     persist_dir: str | None = None    # None = disabled
     ssd_max_gb: float = 0.0           # 0 = disabled
     ssd_dir: str | None = None        # SSD spill directory (defaults to persist_dir/ssd)
@@ -140,6 +142,148 @@ def _dequantize_kv(
     ]
 
 
+def _quantize_recurrent(
+    recurrent_state: Any,
+    dtype: str,
+) -> tuple[Any, list[list[float]] | None]:
+    """Quantize/cast recurrent state to the configured dtype.
+
+    For int8, uses per-channel (last-axis) scales for better precision on small tensors.
+    Returns (quantized_state, scales) where scales is None for non-int8 dtypes.
+    """
+    if recurrent_state is None:
+        return None, None
+
+    if dtype == "none":
+        return recurrent_state, None
+
+    target = mx.float16 if dtype == "fp16" else mx.bfloat16
+    if dtype in ("fp16", "bf16"):
+        if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
+            return [
+                {
+                    **ld,
+                    "state": tuple(arr.astype(target) for arr in ld.get("state", ())),
+                }
+                for ld in recurrent_state
+            ], None
+        else:
+            items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
+            return [
+                [
+                    arr.astype(target) if hasattr(arr, "astype") else arr
+                    for arr in (item if isinstance(item, (list, tuple)) else [item])
+                ]
+                for item in items
+            ], None
+
+    # int8 with per-channel (last-axis) scales
+    if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
+        all_scales: list[list[float]] = []
+        quantized = []
+        for ld in recurrent_state:
+            layer_scales: list[float] = []
+            quantized_states = []
+            for arr in ld.get("state", ()):
+                f32 = arr.astype(mx.float32)
+                scales = mx.max(mx.abs(f32), axis=tuple(range(f32.ndim - 1)), keepdims=True)
+                scale = mx.where(scales > 0, scales / 127.0, 1.0)
+                q = mx.clip(mx.round(f32 / scale), -127, 127).astype(mx.int8)
+                quantized_states.append(q)
+                layer_scales.append(mx.squeeze(scale).tolist())
+            all_scales.append(layer_scales)
+            quantized.append({**ld, "state": tuple(quantized_states)})
+        return quantized, all_scales
+    else:
+        all_scales = []
+        items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
+        quantized = []
+        for item in items:
+            layer_scales = []
+            sub = item if isinstance(item, (list, tuple)) else [item]
+            quantized_sub = []
+            for arr in sub:
+                if hasattr(arr, "astype"):
+                    f32 = arr.astype(mx.float32)
+                    scales = mx.max(mx.abs(f32), axis=tuple(range(f32.ndim - 1)), keepdims=True)
+                    scale = mx.where(scales > 0, scales / 127.0, 1.0)
+                    q = mx.clip(mx.round(f32 / scale), -127, 127).astype(mx.int8)
+                    quantized_sub.append(q)
+                    layer_scales.append(mx.squeeze(scale).tolist())
+                else:
+                    quantized_sub.append(arr)
+            all_scales.append(layer_scales)
+            quantized.append(quantized_sub if len(quantized_sub) > 1 else quantized_sub[0])
+        return (quantized if len(quantized) > 1 else (quantized[0] if quantized else None)), all_scales
+
+
+def _dequantize_recurrent(
+    recurrent_state: Any,
+    scales: list[list[float]] | None,
+    original_dtype: str = "bf16",
+) -> Any:
+    """Dequantize recurrent state back to bf16/fp16.
+
+    If scales is None, just cast to target dtype (for fp16/bf16 storage).
+    """
+    if recurrent_state is None:
+        return None
+
+    target = mx.float16 if original_dtype == "fp16" else mx.bfloat16
+
+    if scales is None:
+        # Simple cast (fp16/bf16 storage or no quantization)
+        if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
+            return [
+                {
+                    **ld,
+                    "state": tuple(arr.astype(target) for arr in ld.get("state", ())),
+                }
+                for ld in recurrent_state
+            ]
+        else:
+            items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
+            return [
+                [
+                    arr.astype(target) if hasattr(arr, "astype") else arr
+                    for arr in (item if isinstance(item, (list, tuple)) else [item])
+                ]
+                for item in items
+            ]
+
+    # int8 dequantize with per-channel scales
+    if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
+        dequantized = []
+        for ld, layer_scales in zip(recurrent_state, scales):
+            dq_states = []
+            for arr, scale_list in zip(ld.get("state", ()), layer_scales):
+                scale = mx.array(scale_list, dtype=mx.float32)
+                # Restore the kept dimensions for broadcasting
+                arr_f32 = arr.astype(mx.float32)
+                broadcast_shape = [1] * (arr_f32.ndim - 1) + [-1]
+                scale = mx.reshape(scale, broadcast_shape)
+                dq_states.append((arr_f32 * scale).astype(target))
+            dequantized.append({**ld, "state": tuple(dq_states)})
+        return dequantized
+    else:
+        items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
+        dequantized = []
+        for item, layer_scales in zip(items, scales):
+            sub = item if isinstance(item, (list, tuple)) else [item]
+            dq_sub = []
+            for arr, scale_list in zip(sub, layer_scales):
+                if hasattr(arr, "astype"):
+                    scale = mx.array(scale_list, dtype=mx.float32)
+                    arr_f32 = arr.astype(mx.float32)
+                    broadcast_shape = [1] * (arr_f32.ndim - 1) + [-1]
+                    scale = mx.reshape(scale, broadcast_shape)
+                    dq_sub.append((arr_f32 * scale).astype(target))
+                else:
+                    dq_sub.append(arr)
+            dequantized.append(dq_sub if len(dq_sub) > 1 else dq_sub[0])
+        return dequantized if len(dequantized) > 1 else (dequantized[0] if dequantized else None)
+
+
 class TurnPrefixCache:
     def __init__(self, config: TurnPrefixCacheConfig) -> None:
         self.config = config
@@ -149,6 +293,7 @@ class TurnPrefixCache:
             kv_arrays=None,
             kv_scales=None,
             recurrent_state=None,
+            recurrent_scales=None,
             tokens_since_checkpoint=0,
             parent=None,
             is_permanent_checkpoint=True,  # root acts as checkpoint anchor
@@ -166,8 +311,8 @@ class TurnPrefixCache:
         recurrent_state: Any | None,
         is_system_prompt: bool = False,
     ) -> TurnNode:
-        h = _context_hash(parent.context_hash, segment.token_ids)
         with self._lock:
+            h = _context_hash(parent.context_hash, segment.token_ids)
             if h in parent.children:
                 node = parent.children[h]
                 node.last_used = time.time()
@@ -189,12 +334,21 @@ class TurnPrefixCache:
             if self.config.kv_dtype == "int8" and kv_arrays:
                 stored_kv, stored_scales = _quantize_kv(kv_arrays)
 
+            # Quantize/cast recurrent state if configured
+            stored_recurrent = recurrent_state
+            stored_recurrent_scales = None
+            if self.config.recurrent_dtype != "none" and recurrent_state is not None:
+                stored_recurrent, stored_recurrent_scales = _quantize_recurrent(
+                    recurrent_state, self.config.recurrent_dtype
+                )
+
             node = TurnNode(
                 token_ids=segment.token_ids,
                 context_hash=h,
                 kv_arrays=stored_kv,
                 kv_scales=stored_scales,
-                recurrent_state=recurrent_state,
+                recurrent_state=stored_recurrent,
+                recurrent_scales=stored_recurrent_scales,
                 tokens_since_checkpoint=tokens_since if not is_permanent else 0,
                 parent=parent,
                 is_permanent_checkpoint=is_permanent,
@@ -209,6 +363,7 @@ class TurnPrefixCache:
                 and parent is not self.root
             ):
                 parent.recurrent_state = None
+                parent.recurrent_scales = None
 
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
@@ -277,6 +432,7 @@ class TurnPrefixCache:
             current.kv_arrays = None
             current.kv_scales = None
             current.recurrent_state = None
+            current.recurrent_scales = None
 
             parent = current.parent
             if parent is not None and current.context_hash in parent.children:
@@ -366,14 +522,24 @@ class TurnPrefixCache:
                     rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
                     tensors: dict[str, np.ndarray] = {}
                     state = node.recurrent_state
+                    has_scales = node.recurrent_scales is not None
 
                     if isinstance(state, list) and state and isinstance(state[0], dict):
                         # Dict format (_extract_cache_states output)
                         for li, layer_dict in enumerate(state):
                             for j, arr in enumerate(layer_dict.get("state", ())):
-                                if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                                # int8 arrays: store as int32 numpy + scales
+                                if arr.dtype == mx.int8 and has_scales and li < len(node.recurrent_scales):
+                                    tensors[f"ext_{li}_state_{j}"] = np.array(arr, dtype=np.int32)
+                                    if j < len(node.recurrent_scales[li]):
+                                        tensors[f"ext_{li}_scale_{j}"] = np.array(
+                                            node.recurrent_scales[li][j], dtype=np.float32
+                                        )
+                                elif hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
                                     arr = arr.astype(mx.float32)
-                                tensors[f"ext_{li}_state_{j}"] = np.array(arr)
+                                    tensors[f"ext_{li}_state_{j}"] = np.array(arr)
+                                else:
+                                    tensors[f"ext_{li}_state_{j}"] = np.array(arr)
                             meta = layer_dict.get("meta_state", ())
                             if isinstance(meta, (list, tuple)):
                                 for j, s in enumerate(meta):
@@ -390,9 +556,17 @@ class TurnPrefixCache:
                         for k, item in enumerate(items):
                             sub = item if isinstance(item, (list, tuple)) else [item]
                             for m, arr in enumerate(sub):
-                                if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                                if hasattr(arr, 'dtype') and arr.dtype == mx.int8 and has_scales and k < len(node.recurrent_scales):
+                                    tensors[f"r_{k}_{m}"] = np.array(arr, dtype=np.int32)
+                                    if m < len(node.recurrent_scales[k]):
+                                        tensors[f"r_{k}_scale_{m}"] = np.array(
+                                            node.recurrent_scales[k][m], dtype=np.float32
+                                        )
+                                elif hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
                                     arr = arr.astype(mx.float32)
-                                tensors[f"r_{k}_{m}"] = np.array(arr)
+                                    tensors[f"r_{k}_{m}"] = np.array(arr)
+                                else:
+                                    tensors[f"r_{k}_{m}"] = np.array(arr)
 
                     if tensors:
                         tmp = rec_path + ".tmp"
@@ -470,6 +644,9 @@ class TurnPrefixCache:
                 try:
                     tensors = st_load(rec_path)
 
+                    # Collect scales alongside state tensors
+                    recurrent_scales: list[list[float]] | None = None
+
                     if any(k.startswith("ext_") for k in tensors):
                         # Dict format
                         import importlib
@@ -481,12 +658,21 @@ class TurnPrefixCache:
                             if k.startswith("ext_")
                         })
                         state_list = []
+                        scales_list: list[list[float]] = []
                         for li in layer_indices:
                             state_parts = []
+                            layer_scales: list[float] = []
                             j = 0
                             while f"ext_{li}_state_{j}" in tensors:
                                 state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
+                                # Check for per-tensor scale (int8 quantization)
+                                if f"ext_{li}_scale_{j}" in tensors:
+                                    layer_scales.append(
+                                        float(tensors[f"ext_{li}_scale_{j}"])
+                                    )
                                 j += 1
+                            if layer_scales:
+                                scales_list.append(layer_scales)
                             meta_parts = []
                             j = 0
                             while f"ext_{li}_meta_{j}" in tensors:
@@ -503,6 +689,7 @@ class TurnPrefixCache:
                                 "class_name": cn,
                                 "class_ref": getattr(cache_mod, cn, None),
                             })
+                        recurrent_scales = scales_list if scales_list else None
                         recurrent_state = state_list or None
 
                     else:
@@ -514,16 +701,25 @@ class TurnPrefixCache:
                                 max_k = max(max_k, k)
                         if max_k >= 0:
                             state_list = []
+                            scales_list: list[list[float]] = []
                             for k in range(max_k + 1):
                                 layer_list = []
+                                layer_scales: list[float] = []
                                 m = 0
                                 while f"r_{k}_{m}" in tensors:
                                     layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
+                                    if f"r_{k}_scale_{m}" in tensors:
+                                        layer_scales.append(
+                                            float(tensors[f"r_{k}_scale_{m}"])
+                                        )
                                     m += 1
+                                if layer_scales:
+                                    scales_list.append(layer_scales)
                                 if layer_list:
                                     state_list.append(
                                         layer_list if len(layer_list) > 1 else layer_list[0]
                                     )
+                            recurrent_scales = scales_list if scales_list else None
                             recurrent_state = (
                                 state_list if len(state_list) > 1
                                 else (state_list[0] if state_list else None)
@@ -537,6 +733,7 @@ class TurnPrefixCache:
                 kv_arrays=kv_arrays or None,
                 kv_scales=kv_scales or None,
                 recurrent_state=recurrent_state,
+                recurrent_scales=recurrent_scales,
                 tokens_since_checkpoint=tokens_since,
                 is_permanent_checkpoint=bool(is_perm),
                 last_used=last_used,
@@ -593,21 +790,59 @@ class TurnPrefixCache:
             and not isinstance(node.recurrent_state, SSDRef)
         ):
             path = self._ssd_path(node, "rec")
-            tensors = {}
+            tensors: dict[str, np.ndarray] = {}
             state = node.recurrent_state
-            items = state if isinstance(state, (list, tuple)) else [state]
-            for k, item in enumerate(items):
-                sub = item if isinstance(item, (list, tuple)) else [item]
-                for m, arr in enumerate(sub):
-                    # Convert to float32 if bfloat16 to avoid numpy conversion issues
-                    if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
-                        arr = arr.astype(mx.float32)
-                    tensors[f"r_{k}_{m}"] = np.array(arr)
-            tmp = path + ".tmp"
-            st_save(tensors, tmp)
-            os.replace(tmp, path)
-            size = os.path.getsize(path)
-            node.recurrent_state = SSDRef(file_path=path, size_bytes=size)
+            has_scales = node.recurrent_scales is not None
+
+            if isinstance(state, list) and state and isinstance(state[0], dict):
+                # Dict format (_extract_cache_states output)
+                for li, layer_dict in enumerate(state):
+                    for j, arr in enumerate(layer_dict.get("state", ())):
+                        # int8 arrays: store as int32 numpy + scales
+                        if arr.dtype == mx.int8 and has_scales and li < len(node.recurrent_scales):
+                            tensors[f"ext_{li}_state_{j}"] = np.array(arr, dtype=np.int32)
+                            if j < len(node.recurrent_scales[li]):
+                                tensors[f"ext_{li}_scale_{j}"] = np.array(
+                                    node.recurrent_scales[li][j], dtype=np.float32
+                                )
+                        elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
+                            tensors[f"ext_{li}_state_{j}"] = np.array(arr.astype(mx.float32))
+                        else:
+                            tensors[f"ext_{li}_state_{j}"] = np.array(arr)
+                    meta = layer_dict.get("meta_state", ())
+                    if isinstance(meta, (list, tuple)):
+                        for j, s in enumerate(meta):
+                            tensors[f"ext_{li}_meta_{j}"] = np.frombuffer(
+                                str(s).encode(), dtype=np.uint8
+                            )
+                    cn = layer_dict.get("class_name", "")
+                    tensors[f"ext_{li}_class"] = np.frombuffer(
+                        cn.encode(), dtype=np.uint8
+                    )
+            else:
+                # Legacy SSM raw-tensor format
+                items = state if isinstance(state, (list, tuple)) else [state]
+                for k, item in enumerate(items):
+                    sub = item if isinstance(item, (list, tuple)) else [item]
+                    for m, arr in enumerate(sub):
+                        if hasattr(arr, "dtype") and arr.dtype == mx.int8 and has_scales and k < len(node.recurrent_scales):
+                            tensors[f"r_{k}_{m}"] = np.array(arr, dtype=np.int32)
+                            if m < len(node.recurrent_scales[k]):
+                                tensors[f"r_{k}_scale_{m}"] = np.array(
+                                    node.recurrent_scales[k][m], dtype=np.float32
+                                )
+                        elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
+                            tensors[f"r_{k}_{m}"] = np.array(arr.astype(mx.float32))
+                        else:
+                            tensors[f"r_{k}_{m}"] = np.array(arr)
+
+            if tensors:
+                tmp = path + ".tmp"
+                st_save(tensors, tmp)
+                os.replace(tmp, path)
+                size = os.path.getsize(path)
+                node.recurrent_state = SSDRef(file_path=path, size_bytes=size)
+                node.recurrent_scales = None
 
     def _promote_from_ssd(self, node: TurnNode) -> bool:
         """Load node's KV from SSD back into RAM. Returns False on error."""
@@ -639,35 +874,108 @@ class TurnPrefixCache:
             if os.path.exists(path):
                 try:
                     tensors = st_load(path)
-                    # Reconstruct nested structure from flat dict keys r_{k}_{m}
-                    state_list = []
-                    k = 0
-                    max_k = -1
-                    for key in tensors.keys():
-                        if key.startswith("r_"):
-                            parts = key.split("_")
-                            if len(parts) >= 3:
-                                try:
-                                    k_idx = int(parts[1])
-                                    max_k = max(max_k, k_idx)
-                                except ValueError:
-                                    pass
 
-                    for k in range(max_k + 1):
-                        layer_list = []
-                        m = 0
-                        while f"r_{k}_{m}" in tensors:
-                            layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
-                            m += 1
-                        if layer_list:
-                            state_list.append(layer_list if len(layer_list) > 1 else layer_list[0])
+                    if any(k.startswith("ext_") for k in tensors):
+                        # Dict format
+                        layer_indices = sorted({
+                            int(k.split("_")[1])
+                            for k in tensors
+                            if k.startswith("ext_")
+                        })
+                        state_list = []
+                        scales_list: list[list[float]] = []
+                        for li in layer_indices:
+                            state_parts = []
+                            layer_scales: list[float] = []
+                            j = 0
+                            while f"ext_{li}_state_{j}" in tensors:
+                                state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
+                                if f"ext_{li}_scale_{j}" in tensors:
+                                    layer_scales.append(
+                                        float(tensors[f"ext_{li}_scale_{j}"])
+                                    )
+                                j += 1
+                            if layer_scales:
+                                scales_list.append(layer_scales)
+                            meta_parts = []
+                            j = 0
+                            while f"ext_{li}_meta_{j}" in tensors:
+                                meta_parts.append(
+                                    bytes(tensors[f"ext_{li}_meta_{j}"]).decode()
+                                )
+                                j += 1
+                            state_list.append({
+                                "state": tuple(state_parts),
+                                "meta_state": tuple(meta_parts) if meta_parts else "",
+                                "class_name": "",
+                                "class_ref": None,
+                            })
+                        node.recurrent_state = state_list or None
+                        node.recurrent_scales = scales_list if scales_list else None
+                    else:
+                        # Legacy SSM format
+                        max_k = -1
+                        for key in tensors.keys():
+                            if key.startswith("r_"):
+                                parts = key.split("_")
+                                if len(parts) >= 3:
+                                    try:
+                                        k_idx = int(parts[1])
+                                        max_k = max(max_k, k_idx)
+                                    except ValueError:
+                                        pass
 
-                    node.recurrent_state = state_list if len(state_list) > 1 else (state_list[0] if state_list else None)
+                        state_list = []
+                        scales_list: list[list[float]] = []
+                        for k in range(max_k + 1):
+                            layer_list = []
+                            layer_scales: list[float] = []
+                            m = 0
+                            while f"r_{k}_{m}" in tensors:
+                                layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
+                                if f"r_{k}_scale_{m}" in tensors:
+                                    layer_scales.append(
+                                        float(tensors[f"r_{k}_scale_{m}"])
+                                    )
+                                m += 1
+                            if layer_scales:
+                                scales_list.append(layer_scales)
+                            if layer_list:
+                                state_list.append(layer_list if len(layer_list) > 1 else layer_list[0])
+
+                        node.recurrent_state = state_list if len(state_list) > 1 else (state_list[0] if state_list else None)
+                        node.recurrent_scales = scales_list if scales_list else None
                 except Exception as e:
                     logger.warning(f"[turn_cache] SSD recurrent promote failed: {e}")
                     node.recurrent_state = None
 
         return True
+
+    def get_dequantized_recurrent(self, node: TurnNode) -> Any | None:
+        """Return the recurrent state dequantized to bf16/fp16.
+
+        Handles both dict format (_extract_cache_states) and legacy SSM format.
+        If the state has scales (int8 quantization), dequantizes on demand.
+        If the state is an SSDRef, promotes it first.
+        """
+        state = node.recurrent_state
+        scales = node.recurrent_scales
+
+        # Promote from SSD if needed
+        if isinstance(state, SSDRef):
+            if not self._promote_from_ssd(node):
+                return None
+            state = node.recurrent_state
+            scales = node.recurrent_scales
+
+        if state is None:
+            return None
+
+        # Dequantize if scales are present (int8 storage)
+        if scales is not None:
+            state = _dequantize_recurrent(state, scales, self.config.recurrent_dtype)
+
+        return state
 
     def visualize(self, max_depth: int = 10, tokenizer=None) -> str:
         """Return a tree representation of the trie structure.
@@ -702,7 +1010,7 @@ class TurnPrefixCache:
                             text = tok.decode(last_tokens)
                             # Escape newlines and limit length for display
                             text = text.replace("\n", "\\n").replace("\r", "\\r")
-                            if len(text) > 50:
+                            if len(text) > 80:
                                 text = text[:47] + "..."
                             label += f" | {text}"
                         else:

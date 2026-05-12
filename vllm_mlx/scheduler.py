@@ -1229,7 +1229,7 @@ class Scheduler:
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self._ssd_tier: Optional[SSDCacheTier] = None
-        self.turn_cache: Optional[Any] = None
+        self.turn_cache: Optional[TurnPrefixCache] = None
 
         if self.config.enable_prefix_cache:
             if self.config.use_paged_cache:
