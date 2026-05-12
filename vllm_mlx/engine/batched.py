@@ -982,11 +982,14 @@ class BatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         enable_thinking: bool | None = None,
     ) -> list[int]:
-        """Compute exact token boundaries for cache segmentation by parsing template output.
+        """Compute token boundaries by scanning for <|im_end|> in the full prompt.
 
-        Returns [B_sys, B_1, ..., B_{N-1}] where B_k is the token position just after
-        the k-th completed assistant turn. Finds boundaries by tokenizing progressively
-        larger message prefixes from the full template output. Returns [] if no system message.
+        Returns one boundary per message: the token position immediately after
+        each <|im_end|>\\n pair in the tokenized prompt (without generation prompt).
+        Each segment therefore covers exactly one complete message block, from
+        <|im_start|> through <|im_end|>\\n inclusive.
+
+        Returns [] if no system message or tokenizer lacks apply_chat_template.
         """
         if not messages or messages[0].get("role") != "system":
             return []
@@ -999,128 +1002,94 @@ class BatchedEngine(BaseEngine):
             return []
 
         try:
-            # Apply template once to full messages (without generation prompt)
-            boundary_kwargs = chat_template_kwargs or {}
-            boundary_kwargs_with_no_gen = {**boundary_kwargs, "add_generation_prompt": False}
-
+            boundary_kwargs = {**(chat_template_kwargs or {}), "add_generation_prompt": False}
             full_prompt = self._apply_chat_template(
                 messages,
                 tools=tools,
                 num_images=num_images,
                 num_audios=num_audios,
-                chat_template_kwargs=boundary_kwargs_with_no_gen,
+                chat_template_kwargs=boundary_kwargs,
                 enable_thinking=enable_thinking,
             )
             full_tokens = tokenizer.encode(full_prompt)
-            logger.info(f"[turn_cache] _compute_turn_boundaries: full_prompt len={len(full_prompt)}, full_tokens len={len(full_tokens)}")
             if not full_tokens:
                 return []
 
-            boundaries: list[int] = []
+            im_end_id = None
+            if hasattr(tokenizer, "convert_tokens_to_ids"):
+                im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
-            # Find message boundaries by tokenizing prefixes including dummy user messages when needed
-            for i in range(1, len(messages) + 1):
-                prefix = list(messages[:i])
+            # Try im_end scan for Qwen3-like tokenizers
+            if im_end_id is not None and im_end_id != getattr(tokenizer, "unk_token_id", None):
+                nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
+                nl_id = nl_tokens[0] if nl_tokens else None
 
-                # If prefix doesn't have a user message, add dummy one so template accepts it
-                dummy_added = False
-                if not any(m.get("role") == "user" for m in prefix):
-                    prefix.append({"role": "user", "content": ""})
-                    dummy_added = True
+                boundaries = []
+                for i, tok in enumerate(full_tokens):
+                    if tok == im_end_id:
+                        boundaries.append(i + 1)
 
-                try:
-                    prefix_prompt = self._apply_chat_template(
-                        prefix,
-                        tools=tools,
-                        num_images=num_images,
-                        num_audios=num_audios,
-                        chat_template_kwargs=boundary_kwargs_with_no_gen,
-                        enable_thinking=enable_thinking,
-                    )
-                except Exception as e:
-                    logger.info(f"[turn_cache] prefix i={i}: template failed: {e}")
-                    continue
+                logger.info(
+                    f"[turn_cache] _compute_turn_boundaries: "
+                    f"{len(full_tokens)} tokens, {len(boundaries)} boundaries"
+                )
+                return boundaries
 
-                prefix_tokens = tokenizer.encode(prefix_prompt)
-
-                # If we added a dummy user message, try to remove it from the encoded tokens
-                # by comparing with a version that has the dummy message explicitly
-                if dummy_added and i == 1:
-                    # Detect system boundary by template structure comparison
-                    # Find where second user message starts in [system, user, user] template
-
+            # Fallback: detect boundaries by finding message boundaries in the template
+            # Only add boundaries after system and completed assistant messages
+            boundaries = []
+            try:
+                for i in range(1, len(messages) + 1):
+                    prefix = list(messages[:i])
                     try:
-                        # Single dummy: system + 1st user
-                        one_dummy = self._apply_chat_template(
-                            [messages[0], {"role": "user", "content": ""}],
-                            tools=tools, num_images=num_images, num_audios=num_audios,
-                            chat_template_kwargs=boundary_kwargs_with_no_gen,
+                        prefix_prompt = self._apply_chat_template(
+                            prefix,
+                            tools=tools,
+                            num_images=num_images,
+                            num_audios=num_audios,
+                            chat_template_kwargs=boundary_kwargs,
                             enable_thinking=enable_thinking,
                         )
+                    except Exception:
+                        continue
 
-                        # Double dummy: system + 1st user + 2nd user
-                        two_dummies = self._apply_chat_template(
-                            [messages[0], {"role": "user", "content": ""}, {"role": "user", "content": ""}],
-                            tools=tools, num_images=num_images, num_audios=num_audios,
-                            chat_template_kwargs=boundary_kwargs_with_no_gen,
-                            enable_thinking=enable_thinking,
-                        )
+                    prefix_tokens = tokenizer.encode(prefix_prompt)
 
-                        # Find where second user message starts by finding the repeating pattern
-                        # two_dummies = one_dummy + (second_user_part)
-                        # The second user part is identical to the first user part in structure
-                        # So find where the pattern repeats in two_dummies
+                    # Check if prefix matches the start of full tokens
+                    if len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]:
+                        # Add boundary only for:
+                        # 1. System message (first message, i==1)
+                        # 2. Completed assistant turns (when current message is assistant)
+                        current_role = messages[i - 1].get("role") if i <= len(messages) else None
 
-                        # Look for the end of one_dummy by finding first difference
-                        # Then backtrack to find where the user marker starts
-                        import re
-                        # Find all "<user>" markers in two_dummies
-                        user_markers = [(m.start(), m.end()) for m in re.finditer(r'<user>', two_dummies)]
-                        if len(user_markers) >= 2:
-                            # System boundary is where the first <user> marker starts
-                            boundary_pos = user_markers[0][0]
-                        else:
-                            # Fallback: use the length of one_dummy
-                            boundary_pos = len(one_dummy)
+                        should_add = False
+                        if i == 1:
+                            # Always add system boundary
+                            should_add = True
+                        elif current_role == "assistant":
+                            # Add boundary after assistant messages
+                            should_add = True
 
-                        # Tokenize just the system part
-                        system_tokens = tokenizer.encode(full_prompt[:boundary_pos])
-                        logger.info(f"[turn_cache] system boundary: {len(system_tokens)} tokens")
+                        if should_add:
+                            boundary = len(prefix_tokens)
+                            if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
+                                boundaries.append(boundary)
 
-                        if system_tokens and system_tokens[0] == full_tokens[0]:
-                            # Find longest prefix match
-                            lcp = 0
-                            for j in range(min(len(system_tokens), len(full_tokens))):
-                                if system_tokens[j] == full_tokens[j]:
-                                    lcp = j + 1
-                                else:
-                                    break
-                            if 0 < lcp < len(full_tokens):
-                                boundaries.append(lcp)
-                    except Exception as e:
-                        logger.debug(f"[turn_cache] system boundary detection failed: {e}")
+            except Exception as e:
+                logger.debug(f"[turn_cache] fallback boundary detection error: {e}")
+                return []
 
-                    continue
-
-                # For prefixes with user messages, check if they match the full token prefix
-                matches = len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]
-                logger.info(f"[turn_cache] prefix i={i} ({messages[i-1].get('role')}): len={len(prefix_tokens)}, matches={matches}")
-
-                if matches:
-                    boundary = len(prefix_tokens)
-                    # Add each turn as a boundary
-                    if i > 1 and messages[i - 1].get("role") == "assistant":
-                        if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
-                            logger.info(f"[turn_cache] adding boundary {boundary} at i={i}")
-                            boundaries.append(boundary)
-
-            logger.info(f"[turn_cache] _compute_turn_boundaries final: {boundaries}")
+            logger.info(
+                f"[turn_cache] _compute_turn_boundaries (fallback): "
+                f"{len(full_tokens)} tokens, {len(boundaries)} boundaries"
+            )
             return boundaries
 
         except Exception as e:
-            logger.info(f"[turn_cache] _compute_turn_boundaries exception: {type(e).__name__}: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            logger.info(
+                f"[turn_cache] _compute_turn_boundaries exception: "
+                f"{type(e).__name__}: {e}"
+            )
             return []
 
     async def stream_chat(
