@@ -678,7 +678,15 @@ class TurnPrefixCache:
             ckpt = "✓" if node.is_permanent_checkpoint else " "
             has_kv = "K" if node.kv_arrays else " "
             has_state = "S" if node.recurrent_state else " "
-            return f"[{ntok}t {ckpt}{has_kv}{has_state}]"
+            label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
+
+            # Show last 5 tokens
+            if node.token_ids:
+                last_tokens = node.token_ids[-5:] if len(node.token_ids) >= 5 else node.token_ids
+                tokens_str = ",".join(str(t) for t in last_tokens)
+                label += f" ...{tokens_str}"
+
+            return label
 
         def visit(node: TurnNode, prefix: str = "", is_root: bool = False, depth: int = 0):
             if depth > max_depth:
