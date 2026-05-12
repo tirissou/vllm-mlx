@@ -1229,6 +1229,7 @@ class Scheduler:
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self._ssd_tier: Optional[SSDCacheTier] = None
+        self.turn_cache: Optional[Any] = None
 
         if self.config.enable_prefix_cache:
             if self.config.use_paged_cache:
@@ -1277,6 +1278,18 @@ class Scheduler:
                         f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
                         f"max={self.config.ssd_cache_max_gb}GB"
                     )
+
+            elif self.config.use_turn_cache:
+                from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+                self.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(
+                    checkpoint_stride=self.config.turn_cache_stride,
+                    max_memory_gb=self.config.turn_cache_memory_gb,
+                    ssd_max_gb=self.config.turn_cache_ssd_gb,
+                ))
+                logger.info(
+                    f"TurnPrefixCache enabled: stride={self.config.turn_cache_stride} "
+                    f"memory={self.config.turn_cache_memory_gb}GB"
+                )
             else:
                 # Use legacy entry-count based prefix cache
                 self.prefix_cache = PrefixCacheManager(
@@ -1286,19 +1299,6 @@ class Scheduler:
                 logger.info(
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
-
-        self.turn_cache: Optional[Any] = None
-        if self.config.use_turn_cache:
-            from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
-            self.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(
-                checkpoint_stride=self.config.turn_cache_stride,
-                max_memory_gb=self.config.turn_cache_memory_gb,
-                ssd_max_gb=self.config.turn_cache_ssd_gb,
-            ))
-            logger.info(
-                f"TurnPrefixCache enabled: stride={self.config.turn_cache_stride} "
-                f"memory={self.config.turn_cache_memory_gb}GB"
-            )
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
