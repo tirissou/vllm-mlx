@@ -2639,7 +2639,6 @@ class Scheduler:
                                 request.output_token_ids
                                 and last_boundary > 0
                                 and request.prompt_token_ids
-                                and new_segments
                             ):
                                 from .turn_prefix_cache import Segment as _Seg
                                 response_tokens = (
