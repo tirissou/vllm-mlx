@@ -298,6 +298,78 @@ class TestTurnBoundariesQwen3:
                 f"Boundaries not strictly increasing: {boundaries}"
             )
 
+    def test_exact_boundary_count_two_messages(self):
+        """system + user → exactly 2 boundaries (after system, after user)."""
+        eng = _make_engine_with_qwen3()
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Q1"},
+        ]
+        boundaries = eng._compute_turn_boundaries(messages)
+        assert len(boundaries) == 2, (
+            f"Expected 2 boundaries (system, user), got {len(boundaries)}: {boundaries}"
+        )
+
+    def test_exact_boundary_count_multi_turn(self):
+        """system + user + asst + user → exactly 4 boundaries."""
+        eng = _make_engine_with_qwen3()
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+        ]
+        boundaries = eng._compute_turn_boundaries(messages)
+        assert len(boundaries) == 4, (
+            f"Expected 4 boundaries, got {len(boundaries)}: {boundaries}"
+        )
+
+    def test_same_system_boundary_for_different_user_messages(self):
+        """Same system prompt → same system boundary regardless of user content."""
+        eng = _make_engine_with_qwen3()
+        sys_msg = "You are helpful."
+        messages_a = [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": "hey hey"},
+        ]
+        messages_b = [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": "write a poem"},
+        ]
+        ba = eng._compute_turn_boundaries(messages_a)
+        bb = eng._compute_turn_boundaries(messages_b)
+        assert len(ba) >= 1 and len(bb) >= 1
+        assert ba[0] == bb[0], (
+            f"System boundary should be identical for same system prompt: "
+            f"{ba[0]} != {bb[0]}"
+        )
+
+    def test_segments_end_with_im_end_newline(self):
+        """Every non-tail segment decoded from boundaries ends with <|im_end|>\\n."""
+        eng = _make_engine_with_qwen3()
+        tok = eng._tokenizer
+        messages = [
+            {"role": "system", "content": "System."},
+            {"role": "user", "content": "U1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "U2"},
+        ]
+        full_prompt = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        full_tokens = tok.encode(full_prompt)
+        boundaries = eng._compute_turn_boundaries(messages)
+
+        prev = 0
+        for b in boundaries:
+            seg_tokens = full_tokens[prev:b]
+            seg_text = tok.decode(seg_tokens)
+            assert seg_text.endswith("<|im_end|>\n"), (
+                f"Segment [{prev},{b}) should end with '<|im_end|>\\n', "
+                f"got: {repr(seg_text[-20:])}"
+            )
+            prev = b
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
