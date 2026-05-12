@@ -666,3 +666,42 @@ class TurnPrefixCache:
                     node.recurrent_state = None
 
         return True
+
+    def visualize(self, max_depth: int = 10) -> str:
+        """Return a tree representation of the trie structure."""
+        lines = []
+
+        def node_label(node: TurnNode, is_root: bool = False) -> str:
+            if is_root:
+                return "ROOT"
+            ntok = len(node.token_ids)
+            ckpt = "✓" if node.is_permanent_checkpoint else " "
+            has_kv = "K" if node.kv_arrays else " "
+            has_state = "S" if node.recurrent_state else " "
+            return f"[{ntok}t {ckpt}{has_kv}{has_state}]"
+
+        def visit(node: TurnNode, prefix: str = "", is_root: bool = False, depth: int = 0):
+            if depth > max_depth:
+                return
+            lines.append(prefix + node_label(node, is_root))
+            children = list(node.children.values())
+            for i, child in enumerate(children):
+                is_last = i == len(children) - 1
+                ext = "└── " if is_last else "├── "
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                visit(child, new_prefix, depth=depth+1)
+
+        visit(self.root, is_root=True)
+        summary = f"Nodes: {self._count_nodes()}, Memory: {self._memory_bytes / 1e9:.2f}GB"
+        return "\n".join(lines) + "\n" + summary
+
+    def _count_nodes(self) -> int:
+        """Count total nodes in trie."""
+        count = 1  # root
+        def visit(node):
+            nonlocal count
+            for child in node.children.values():
+                count += 1
+                visit(child)
+        visit(self.root)
+        return count

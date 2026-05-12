@@ -30,6 +30,7 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
@@ -2113,6 +2114,7 @@ class Scheduler:
                         request.cached_tokens = 0
                         request.remaining_tokens = request.prompt_token_ids
                     logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request.request_id}")
+                    logger.debug(f"[turn_cache] cache structure on HIT:\n{self.turn_cache.visualize()}")
                 else:
                     request.cache_hit_type = "miss"
                     request.remaining_tokens = request.prompt_token_ids
@@ -2665,6 +2667,9 @@ class Scheduler:
 
                             if path:
                                 self.turn_cache.release(path)
+
+                            # Debug: visualize cache structure
+                            logger.debug(f"[turn_cache] cache structure after store:\n{self.turn_cache.visualize()}")
                         except Exception as e:
                             logger.debug(f"[turn_cache] store failed for {request_id}: {e}")
 
