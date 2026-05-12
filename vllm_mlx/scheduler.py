@@ -2649,10 +2649,17 @@ class Scheduler:
                                 and request.prompt_token_ids
                             ):
                                 from .turn_prefix_cache import Segment as _Seg
-                                response_tokens = (
-                                    list(request.prompt_token_ids[last_boundary:])
-                                    + list(request.output_token_ids)
-                                )
+                                # When no boundaries exist, include full prompt (not just tokens after boundary)
+                                if _turn_boundaries:
+                                    response_tokens = (
+                                        list(request.prompt_token_ids[last_boundary:])
+                                        + list(request.output_token_ids)
+                                    )
+                                else:
+                                    response_tokens = (
+                                        list(request.prompt_token_ids)
+                                        + list(request.output_token_ids)
+                                    )
                                 ec = request._extracted_cache
                                 if isinstance(ec, list) and ec and isinstance(ec[0], dict):
                                     resp_state = ec
@@ -2663,10 +2670,14 @@ class Scheduler:
                                     _Seg(role="conversation", token_ids=response_tokens),
                                     [], [], resp_state, is_system_prompt=False,
                                 )
+                                if _turn_boundaries:
+                                    user_tokens = len(request.prompt_token_ids) - last_boundary
+                                else:
+                                    user_tokens = len(request.prompt_token_ids)
                                 logger.info(
                                     f"[turn_cache] stored response node: "
                                     f"{len(response_tokens)} tokens "
-                                    f"({len(request.prompt_token_ids) - last_boundary} user "
+                                    f"({user_tokens} user "
                                     f"+ {len(request.output_token_ids)} output) "
                                     f"for {request_id[:12]}"
                                 )
