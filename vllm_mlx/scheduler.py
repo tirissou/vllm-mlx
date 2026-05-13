@@ -2610,7 +2610,7 @@ class Scheduler:
                             resp_state = self._extract_cache_states(ec) or None
 
                         self.turn_cache.insert(
-                            self._messages_to_segments(request) + [_Seg(role="conversation", token_ids=response_tokens)],
+                            self._messages_to_segments(request)[:-1] + [_Seg(role="conversation", token_ids=response_tokens)],
                             resp_state
                         )
 
