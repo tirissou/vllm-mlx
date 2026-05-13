@@ -102,17 +102,23 @@ def _node_data_bytes(node: TurnNode) -> int:
     """Estimate bytes used by a node's kv_arrays and recurrent_state."""
     kv_total = 0
     rec_total = 0
+    i = 0
     if isinstance(node.kv_arrays, list):
         for arrs in node.kv_arrays:
             for arr in arrs:
+                if i < 8:
+                    print(arr.shape)
                 nbytes = arr.itemsize
                 for d in arr.shape:
                     nbytes *= d
                 kv_total += nbytes
+    i = 0
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
         layers = node.recurrent_state
         for arrs in layers:
             for arr in arrs:
+                if i < 8:
+                    print(arr.shape)
                 arr: mx.array
                 if hasattr(arr, "shape"):
                     nbytes = arr.itemsize
