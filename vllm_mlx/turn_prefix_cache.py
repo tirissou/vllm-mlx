@@ -315,7 +315,7 @@ class TurnPrefixCache:
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
     
-    def _split_cache_arrays(self, cache_states: list[Any]):
+    def _split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
         """
         Process the output from Scheduler._extract_cache_states.
         """
@@ -325,16 +325,22 @@ class TurnPrefixCache:
         recurrent_indices = []
         kv_cls = None
         recurrent_cls = None
+        logs = []
         for i, state in enumerate(cache_states):
             if "KVCache" in state['class_name']:
                 l, li = kv, kv_indices
                 if not kv_cls: kv_cls = state['class_ref']
                 assert kv_cls == state['class_ref']
+                state = state['state']
+                if len(state) > 2:
+                    logs.append("Only keeping first 2 arrays in KVCache arrays.")
+                state = tuple(arr[:,:,offset:,:] for arr in state[:2])
             else:
                 l, li = recurrent, recurrent_indices
                 if not recurrent_cls: recurrent_cls = state['class_ref']
                 assert recurrent_cls == state['class_ref']
-            l.append(state['state'])
+                state = state['state']
+            l.append(state)
             li.append(i)
         n = len(cache_states)
         kv_indices = tuple(kv_indices)
@@ -364,17 +370,10 @@ class TurnPrefixCache:
         if not hasattr(self, "_reassemble_cache_fn"):
             self._reassemble_cache_fn = reconstruct
 
+        for log in logs:
+            logger.debug(log)
+
         return kv, recurrent
-
-
-    def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
-        path = []
-        while node != self.root:
-            path.append(node)
-            node = node.parent
-        path.reverse()
-        return path
-
 
     def _retrieve_full_cache(self, node: TurnNode):
         # NOTE: Assuming no SSD for now
@@ -385,11 +384,20 @@ class TurnPrefixCache:
         path = self._inorder_path(node)
         kv = [n.kv_arrays for n in path]
         kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
+        n = kv[0][0].shape[2]
+        logger.info(f"Rebuilding cache... {n} tokens")
         recurrent = node.recurrent_state
         rval = self._reassemble_cache_fn(kv, recurrent)
         self._lock.release_lock()
         return rval
 
+    def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
+        path = []
+        while node != self.root:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        return path
 
     def insert(
         self,
@@ -419,7 +427,7 @@ class TurnPrefixCache:
         tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
         is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
 
-        kv, recur = self._split_cache_arrays(extracted_cache)
+        kv, recur = self._split_cache_arrays(extracted_cache, parent.n_tokens)
 
         # TODO: validate that additional tokens match the len of segment
         # assert sum(len(seg.token_ids) for seg in segments[:len(path)+1]) == 
