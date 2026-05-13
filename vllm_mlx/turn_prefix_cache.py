@@ -12,13 +12,13 @@ import sqlite3
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import mlx.core as mx
 from mlx.nn.utils import checkpoint
 import numpy as np
-from pandas.api.types import is_period_dtype
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -323,10 +323,15 @@ class TurnPrefixCache:
                 l, li = kv, kv_indices
                 if not kv_cls: kv_cls = state['class_ref']
                 assert kv_cls == state['class_ref']
-                state = state['state']
-                if len(state) > 2:
+                meta = state.get('meta_state')
+                raw_state = state['state']
+                try:
+                    actual_end = int(meta[0]) if meta else raw_state[0].shape[2]
+                except (ValueError, TypeError, IndexError):
+                    actual_end = raw_state[0].shape[2]
+                if len(raw_state) > 2:
                     logs.append("Only keeping first 2 arrays in KVCache arrays.")
-                state = tuple(arr[:,:,offset:,:] for arr in state[:2])
+                state = tuple(arr[:,:,offset:actual_end,:] for arr in raw_state[:2])
             else:
                 l, li = recurrent, recurrent_indices
                 if not recurrent_cls: recurrent_cls = state['class_ref']
@@ -334,6 +339,8 @@ class TurnPrefixCache:
                 state = state['state']
             l.append(state)
             li.append(i)
+
+        mx.eval(*(arr for l in (recurrent, kv) for arrs in l for arr in arrs))
         n = len(cache_states)
         kv_indices = tuple(kv_indices)
         recurrent_indices = tuple(recurrent_indices)
@@ -370,18 +377,19 @@ class TurnPrefixCache:
     def _retrieve_full_cache(self, node: TurnNode):
         # NOTE: Assuming no SSD for now
         """Reconstruct the cache for a node to pipe to _reconstruct_cache_from_states."""
-        self._lock.acquire_lock()
-        assert node.recurrent_state is not None
-        assert hasattr(self, '_reassemble_cache_fn')
-        path = self._inorder_path(node)
-        kv = [n.kv_arrays for n in path]
-        kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
-        n = kv[0][0].shape[2]
-        logger.info(f"Rebuilding cache... {n} tokens")
-        recurrent = node.recurrent_state
-        rval = self._reassemble_cache_fn(kv, recurrent)
-        self._lock.release_lock()
-        return rval
+        with self._lock:
+            assert node.recurrent_state is not None
+            assert hasattr(self, '_reassemble_cache_fn')
+            path = self._inorder_path(node)
+            kv = [n.kv_arrays for n in path]
+            kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
+            for layer_kv in kv:
+                mx.eval(*layer_kv)
+            n = kv[0][0].shape[2]
+            logger.info(f"Rebuilding cache... {n} tokens")
+            recurrent = node.recurrent_state
+            rval = self._reassemble_cache_fn(kv, recurrent)
+            return rval
 
     def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
         path = []
@@ -399,80 +407,76 @@ class TurnPrefixCache:
     ) -> TurnNode:
         logger.info("Trying to insert!")
 
-        if acquire_lock: self._lock.acquire_lock()
+        with self._lock if acquire_lock else nullcontext():
+            path = self.match(segments, acquire_lock=False)
 
+            # Check if there is already an exact match... hallelujah
+            if path and len(path) == len(segments):
+                node = path[-1]
+                node.touch()
+                return node
 
-        path = self.match(segments, acquire_lock=False)
+            is_system_prompt = not path
 
-        # Check if there is already an exact match... hallelujah
-        if path and len(path) == len(segments):
-            node = path[-1]
+            parent = self.root if is_system_prompt else path[-1]
+            segment = segments[len(path)]
+            logger.info(f"Inserting {len(segment.token_ids)} tokens")
+            tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
+            is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
+
+            kv, recur = self._split_cache_arrays(extracted_cache, parent.n_tokens)
+
+            h = _context_hash(parent.context_hash, segment.token_ids)
+            node = TurnNode(
+                token_ids=segment.token_ids,
+                context_hash=h,
+                kv_arrays=kv,
+                kv_scales=None,
+                recurrent_state=recur,
+                recurrent_scales=None,
+                parent=parent,
+                is_permanent_checkpoint=is_permanent,
+            )
             node.touch()
-            if acquire_lock: self._lock.release_lock()
+            parent.children[h] = node
+
+            # Prune parent's temp recurrent state if parent just became an inner node
+            # and its recurrent state was only a temp (leaf) checkpoint.
+            if (
+                len(parent.children) == 1          # parent just got its first child
+                and not parent.is_permanent_checkpoint
+                and parent is not self.root
+            ):
+                freed = _node_data_bytes(parent)  # KV + recurrent
+                parent.recurrent_state = None
+                parent.recurrent_scales = None
+                freed -= _node_data_bytes(parent)  # subtract KV portion → just recurrent
+                self._memory_bytes -= freed
+
+            self._memory_bytes += _node_data_bytes(node)
+            heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+            self._evict_if_needed_unlocked()
             return node
-
-        is_system_prompt = not path
-
-        parent = self.root if is_system_prompt else path[-1]
-        segment = segments[len(path)]
-        logger.info(f"Inserting {len(segment.token_ids)} tokens")
-        tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
-        is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
-
-        kv, recur = self._split_cache_arrays(extracted_cache, parent.n_tokens)
-
-        h = _context_hash(parent.context_hash, segment.token_ids)
-        node = TurnNode(
-            token_ids=segment.token_ids,
-            context_hash=h,
-            kv_arrays=kv,
-            kv_scales=None,
-            recurrent_state=recur,
-            recurrent_scales=None,
-            parent=parent,
-            is_permanent_checkpoint=is_permanent,
-        )
-        node.touch()
-        parent.children[h] = node
-
-        # Prune parent's temp recurrent state if parent just became an inner node
-        # and its recurrent state was only a temp (leaf) checkpoint.
-        if (
-            len(parent.children) == 1          # parent just got its first child
-            and not parent.is_permanent_checkpoint
-            and parent is not self.root
-        ):
-            parent.recurrent_state = None
-            parent.recurrent_scales = None
-
-        self._memory_bytes += _node_data_bytes(node)
-        heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
-        self._evict_if_needed_unlocked()
-        self._lock.release_lock()
-        return node
 
     def match(self, segments: list[Segment], acquire_lock=True) -> list[TurnNode]:
         """
         Walk trie matching segments. Returns (path, has_recurrent_at_deepest).
         Does NOT include root node in path.
         """
-        if acquire_lock: self._lock.acquire_lock()
+        with self._lock if acquire_lock else nullcontext():
+            path: list[TurnNode] = []
+            node = self.root
+            for segment in segments:
+                h = _context_hash(node.context_hash, segment.token_ids)
+                if h not in node.children:
+                    logger.info(f"Could not match {segment.role=}")
+                    break
+                logger.info(f"Matched {segment.role=}")
+                node = node.children[h]
+                path.append(node)
+            has_recurrent = bool(path) and path[-1].recurrent_state is not None
 
-        path: list[TurnNode] = []
-        node = self.root
-        for segment in segments:
-            h = _context_hash(node.context_hash, segment.token_ids)
-            if h not in node.children:
-                logger.info(f"Could not match {segment.role=}")
-                break
-            logger.info(f"Matched {segment.role=}")
-            node = node.children[h]
-            path.append(node)
-        has_recurrent = bool(path) and path[-1].recurrent_state is not None
-
-        if acquire_lock: self._lock.release_lock()
-
-        return path
+            return path
 
     def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode:
         """Return the deepest node in path with a recurrent state.
