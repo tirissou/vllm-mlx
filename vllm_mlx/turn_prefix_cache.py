@@ -100,25 +100,28 @@ def _context_hash(parent_hash: int, token_ids: list[int]) -> int:
 
 def _node_data_bytes(node: TurnNode) -> int:
     """Estimate bytes used by a node's kv_arrays and recurrent_state."""
-    total = 0
+    kv_total = 0
+    rec_total = 0
     if isinstance(node.kv_arrays, list):
         for arrs in node.kv_arrays:
             for arr in arrs:
-                nbytes = arr.dtype.size
+                nbytes = arr.itemsize
                 for d in arr.shape:
                     nbytes *= d
-                total += nbytes
+                kv_total += nbytes
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
         layers = node.recurrent_state
         for arrs in layers:
             for arr in arrs:
                 arr: mx.array
                 if hasattr(arr, "shape"):
-                    nbytes = arr.dtype.size
+                    nbytes = arr.itemsize
                     for d in arr.shape:
                         nbytes *= d
-                    total += nbytes
-    return total
+                    rec_total += nbytes
+    logger.info(f"Node has {kv_total // 1000}MB of KVArray data.")
+    logger.info(f"Node has {rec_total// 1000}MB of recurrent data.")
+    return kv_total + rec_total
 
 
 def _quantize_kv(
