@@ -11,6 +11,7 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+from functools import lru_cache
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -18,7 +19,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
+import mlx_lm
 from mlx_lm.generate import BatchGenerator
+from mlx_lm.models.cache import KVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -1622,11 +1625,9 @@ class Scheduler:
                 if total_cached in _turn_boundaries:
                     extracted = self._extract_cache_states(prompt_cache)
                     if extracted:
-                        if not hasattr(request, "_boundary_states") or request._boundary_states is None:
-                            request._boundary_states = {}
-                        request._boundary_states[total_cached] = extracted
+                        self.turn_cache.insert(self._messages_to_segments(request), extracted)
                         logger.info(
-                            f"[turn_cache] boundary_state captured at {total_cached} "
+                            f"[turn_cache] boundary_state captured and inserted into cache at {total_cached} "
                             f"layers={len(extracted)} for {request_id[:12]}"
                         )
 
@@ -1746,7 +1747,7 @@ class Scheduler:
 
         return True
 
-    def _extract_cache_states(self, raw_cache: List[Any]) -> List[Dict[str, Any]]:
+    def _extract_cache_states(self, raw_cache: List[KVCache]) -> List[Dict[str, Any]]:
         """
         Extract actual tensor state from each layer cache.
 
@@ -2081,38 +2082,24 @@ class Scheduler:
             segments = self._messages_to_segments(request)
             logger.info(f"[turn_cache] _messages_to_segments for {request.request_id[:12]}: {len(segments) if segments else 0} segments from _turn_boundaries={getattr(request, '_turn_boundaries', [])}")
             if segments:
-                path, has_recurrent = self.turn_cache.match(segments)
+                path = self.turn_cache.match(segments)
                 if path:
                     request.cache_hit_type = "hit"
-                    request._turn_cache_path = path
-                    ancestor = self.turn_cache.find_checkpoint_ancestor(path)
-                    raw_state = ancestor.recurrent_state if ancestor else None
-                    if (
-                        raw_state is not None
-                        and isinstance(raw_state, list)
-                        and raw_state
-                        and isinstance(raw_state[0], dict)
-                    ):
-                        request.prompt_cache = self._reconstruct_cache_from_states(raw_state)
-                    else:
-                        request.prompt_cache = raw_state
-                    if request.prompt_cache is not None:
-                        # cached_tokens must equal the KV coverage of the ancestor, not the
-                        # full matched depth. Structural nodes (no KV state) may sit deeper
-                        # in the path than the ancestor; skipping past them with mismatched
-                        # KV coverage corrupts the attention context and produces gibberish.
-                        ancestor_idx = next(
-                            (i for i, n in enumerate(path) if n is ancestor),
-                            len(path) - 1,
-                        )
-                        request.cached_tokens = sum(len(n.token_ids) for n in path[: ancestor_idx + 1])
-                        request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
-                    else:
-                        # Segment matched but no KV state yet (MVP: empty arrays).
-                        # Process the full prompt so output is correct; keep _turn_cache_path
-                        # so the store pass knows which segments are already in the trie.
+                    deepest_matching_node = self.turn_cache.find_checkpoint_ancestor(path)
+                    raw_state = self.turn_cache._retrieve_full_cache(deepest_matching_node)
+
+                    if raw_state is None:
+                        request.prompt_cache = None
                         request.cached_tokens = 0
                         request.remaining_tokens = request.prompt_token_ids
+                    if raw_state is not None:
+                        request.prompt_cache = self._reconstruct_cache_from_states(raw_state)
+                        request.cached_tokens = (
+                                sum(len(n.token_ids) for n in 
+                                self.turn_cache._inorder_path(deepest_matching_node))
+                        )
+                        request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
+
                     logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request.request_id}")
                     logger.debug(f"[turn_cache] cache structure on HIT:\n{self.turn_cache.visualize(tokenizer=self.tokenizer)}")
                 else:
@@ -2595,117 +2582,52 @@ class Scheduler:
                             )
 
                 elif self.turn_cache is not None:
-                    has_extracted = hasattr(request, "_extracted_cache") and request._extracted_cache is not None
-                    logger.info(f"[turn_cache] cleanup for {request_id[:12]}: has_extracted_cache={has_extracted}, output_tokens={len(request.output_token_ids) if request.output_token_ids else 0}")
-                    if has_extracted:
-                        try:
-                            segments = self._messages_to_segments(request)
-                            logger.info(f"[turn_cache] store phase: segments={len(segments)}, _turn_boundaries={getattr(request, '_turn_boundaries', [])}")
-                            path = getattr(request, "_turn_cache_path", [])
-                            matched_depth = len(path)
-                            parent = path[-1] if path else self.turn_cache.root
-                            new_segments = segments[matched_depth:]
-                            _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-                            _boundary_states = getattr(request, "_boundary_states", None) or {}
-                            logger.info(f"[turn_cache] store: new_segments={len(new_segments)}, last_boundary would be {_turn_boundaries[-1] if _turn_boundaries else 0}")
-                            parent_before_user = parent
+                    # TODO: Remove basically all of this...
+                    _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+                    last_boundary = _turn_boundaries[-1] if _turn_boundaries else 0
 
-                            for i, segment in enumerate(new_segments):
-                                abs_idx = matched_depth + i
-                                is_sys = segment.role == "system" and abs_idx == 0
-                                is_last = i == len(new_segments) - 1
+                    if (
+                        request.output_token_ids
+                        and last_boundary > 0
+                        and request.prompt_token_ids
+                    ):
+                        from .turn_prefix_cache import Segment as _Seg
+                        # When no boundaries exist, include full prompt (not just tokens after boundary)
+                        if _turn_boundaries:
+                            response_tokens = (
+                                list(request.prompt_token_ids[last_boundary:])
+                                + list(request.output_token_ids)
+                            )
+                        else:
+                            response_tokens = (
+                                list(request.prompt_token_ids)
+                                + list(request.output_token_ids)
+                            )
+                        ec = request._extracted_cache
+                        if isinstance(ec, list) and ec and isinstance(ec[0], dict):
+                            resp_state = ec
+                        else:
+                            resp_state = self._extract_cache_states(ec) or None
 
-                                # Skip inserting thinking block prefix (added by template for generation)
-                                # The thinking block prefix is just \n<|im_start|>assistant\n<think>\n (6 tokens)
-                                # It will be included in response_tokens, so we don't insert it separately
-                                if is_last and len(segment.token_ids) <= 10:
-                                    try:
-                                        seg_text = self._tokenizer.decode(segment.token_ids)
-                                        if "<think>" in seg_text and "<|im_start|>" in seg_text:
-                                            logger.info(
-                                                f"[turn_cache] skipping thinking block prefix: "
-                                                f"{len(segment.token_ids)} tokens"
-                                            )
-                                            continue
-                                    except Exception:
-                                        pass  # If decoding fails, proceed with normal insert
+                        self.turn_cache.insert(
+                            self._messages_to_segments(request) + [_Seg(role="conversation", token_ids=response_tokens)],
+                            resp_state
+                        )
 
-                                if is_last:
-                                    state = None
-                                elif abs_idx < len(_turn_boundaries):
-                                    state = _boundary_states.get(_turn_boundaries[abs_idx])
-                                else:
-                                    state = None
+                        if _turn_boundaries:
+                            user_tokens = len(request.prompt_token_ids) - last_boundary
+                        else:
+                            user_tokens = len(request.prompt_token_ids)
+                        logger.info(
+                            f"[turn_cache] stored response node: "
+                            f"{len(response_tokens)} tokens "
+                            f"({user_tokens} user "
+                            f"+ {len(request.output_token_ids)} output) "
+                            f"for {request_id[:12]}"
+                        )
 
-                                parent = self.turn_cache.insert(
-                                    parent, segment, [], [], state, is_system_prompt=is_sys
-                                )
-                                if not is_last:
-                                    parent_before_user = parent
-
-                            # Store completed exchange as a response node under parent_before_user.
-                            last_boundary = _turn_boundaries[-1] if _turn_boundaries else 0
-
-                            # When no boundaries exist (first turn, no assistant yet), use full prompt as boundary
-                            # to enable caching for future turns
-                            if not _turn_boundaries and request.prompt_token_ids:
-                                last_boundary = len(request.prompt_token_ids)
-
-                            store_cond = {
-                                "has_output": bool(request.output_token_ids),
-                                "last_boundary_gt_0": last_boundary > 0,
-                                "has_prompt": bool(request.prompt_token_ids),
-                                "has_segments": bool(new_segments),
-                            }
-                            logger.info(f"[turn_cache] store condition: {store_cond}")
-                            if (
-                                request.output_token_ids
-                                and last_boundary > 0
-                                and request.prompt_token_ids
-                            ):
-                                from .turn_prefix_cache import Segment as _Seg
-                                # When no boundaries exist, include full prompt (not just tokens after boundary)
-                                if _turn_boundaries:
-                                    response_tokens = (
-                                        list(request.prompt_token_ids[last_boundary:])
-                                        + list(request.output_token_ids)
-                                    )
-                                else:
-                                    response_tokens = (
-                                        list(request.prompt_token_ids)
-                                        + list(request.output_token_ids)
-                                    )
-                                ec = request._extracted_cache
-                                if isinstance(ec, list) and ec and isinstance(ec[0], dict):
-                                    resp_state = ec
-                                else:
-                                    resp_state = self._extract_cache_states(ec) or None
-
-
-                                self.turn_cache.insert(
-                                    parent_before_user,
-                                    _Seg(role="conversation", token_ids=response_tokens),
-                                    [], [], resp_state, is_system_prompt=False,
-                                )
-                                if _turn_boundaries:
-                                    user_tokens = len(request.prompt_token_ids) - last_boundary
-                                else:
-                                    user_tokens = len(request.prompt_token_ids)
-                                logger.info(
-                                    f"[turn_cache] stored response node: "
-                                    f"{len(response_tokens)} tokens "
-                                    f"({user_tokens} user "
-                                    f"+ {len(request.output_token_ids)} output) "
-                                    f"for {request_id[:12]}"
-                                )
-
-                            if path:
-                                self.turn_cache.release(path)
-
-                            # Debug: visualize cache structure with decoded tokens
-                            logger.debug(f"[turn_cache] cache structure after store:\n{self.turn_cache.visualize(tokenizer=self._actual_tokenizer)}")
-                        except Exception as e:
-                            logger.debug(f"[turn_cache] store failed for {request_id}: {e}")
+                    # Debug: visualize cache structure with decoded tokens
+                    logger.debug(f"[turn_cache] cache structure after store:\n{self.turn_cache.visualize(tokenizer=self._actual_tokenizer)}")
 
                 elif self.prefix_cache is not None:
                     # Store in legacy prefix cache
@@ -3447,6 +3369,7 @@ class Scheduler:
             logger.warning(f"[ssd_promote] reconstruction failed: {e}")
             return None
 
+    # TODO: Cache this?
     def _messages_to_segments(self, request: "Request") -> list:
         """Split a request's token sequence into per-message Segment objects.
 

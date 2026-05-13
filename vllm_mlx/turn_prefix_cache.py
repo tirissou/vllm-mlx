@@ -13,12 +13,15 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import mlx.core as mx
+from mlx.nn.utils import checkpoint
 import numpy as np
+from pandas.api.types import is_period_dtype
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 _CACHE_FORMAT_VERSION = 2
 
@@ -43,12 +46,17 @@ class TurnNode:
     kv_scales: list[float] | None
     recurrent_state: Any | SSDRef | None         # list of per-layer states, or SSDRef
     recurrent_scales: list[list[float]] | None   # per-layer, per-tensor per-channel scales (int8 only)
-    tokens_since_checkpoint: int                 # from nearest permanent checkpoint ancestor at creation
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
     ref_count: int = 0
     last_used: float = field(default_factory=time.time)
     is_permanent_checkpoint: bool = False
+
+    @property
+    def tokens_since_checkpoint(self) -> int:
+        if self.is_permanent_checkpoint:
+            return 0
+        return len(self.token_ids) + (self.parent.tokens_since_checkpoint if self.parent else 0)
 
     @property
     def is_leaf(self) -> bool:
@@ -57,6 +65,17 @@ class TurnNode:
     @property
     def is_evictable(self) -> bool:
         return self.ref_count == 0 and self.is_leaf
+
+    def touch(self, tstamp=None):
+        if tstamp is None:
+            tstamp = time.time()
+        self.last_used = tstamp
+        if self.parent: self.parent.touch(tstamp)
+
+    @property
+    def n_tokens(self) -> int:
+        return len(self.token_ids) + (self.parent.n_tokens if self.parent else 0)
+
 
 
 @dataclass
@@ -83,36 +102,24 @@ def _node_data_bytes(node: TurnNode) -> int:
     """Estimate bytes used by a node's kv_arrays and recurrent_state."""
     total = 0
     if isinstance(node.kv_arrays, list):
-        for arr in node.kv_arrays:
-            nbytes = 1
-            for d in arr.shape:
-                nbytes *= d
-            nbytes *= arr.itemsize
-            total += nbytes
+        for arrs in node.kv_arrays:
+            for arr in arrs:
+                nbytes = arr.dtype.size
+                for d in arr.shape:
+                    nbytes *= d
+                nbytes *= arr.itemsize
+                total += nbytes
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
-        state = node.recurrent_state
-        if isinstance(state, list) and state and isinstance(state[0], dict):
-            # Dict format (_extract_cache_states): sum tensor sizes in each layer's state tuple
-            for layer_dict in state:
-                for arr in layer_dict.get("state", ()):
-                    if hasattr(arr, "shape"):
-                        nbytes = 1
-                        for d in arr.shape:
-                            nbytes *= d
-                        nbytes *= arr.itemsize
-                        total += nbytes
-        else:
-            # Legacy SSM raw-tensor format
-            items = state if isinstance(state, (list, tuple)) else [state]
-            for item in items:
-                sub = item if isinstance(item, (list, tuple)) else [item]
-                for arr in sub:
-                    if hasattr(arr, "shape"):
-                        nbytes = 1
-                        for d in arr.shape:
-                            nbytes *= d
-                        nbytes *= arr.itemsize
-                        total += nbytes
+        layers = node.recurrent_state
+        for arrs in layers:
+            for arr in arrs:
+                arr: mx.array
+                if hasattr(arr, "shape"):
+                    nbytes = arr.dtype.size
+                    for d in arr.shape:
+                        nbytes *= d
+                    nbytes *= arr.itemsize
+                    total += nbytes
     return total
 
 
@@ -294,122 +301,186 @@ class TurnPrefixCache:
             kv_scales=None,
             recurrent_state=None,
             recurrent_scales=None,
-            tokens_since_checkpoint=0,
             parent=None,
             is_permanent_checkpoint=True,  # root acts as checkpoint anchor
         )
         self._lock = threading.Lock()
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
+    
+    def _split_cache_arrays(self, cache_states: list[Any]):
+        """
+        Process the output from Scheduler._extract_cache_states.
+        """
+        kv = []
+        kv_indices = []
+        recurrent = []
+        recurrent_indices = []
+        kv_cls = None
+        recurrent_cls = None
+        for i, state in enumerate(cache_states):
+            if "KVCache" in state['class_name']:
+                l, li = kv, kv_indices
+                if not kv_cls: kv_cls = state['class_ref']
+                assert kv_cls == state['class_ref']
+            else:
+                l, li = recurrent, recurrent_indices
+                if not recurrent_cls: recurrent_cls = state['class_ref']
+                assert recurrent_cls == state['class_ref']
+            l.append(state['state'])
+            li.append(i)
+        n = len(cache_states)
+        kv_indices = tuple(kv_indices)
+        recurrent_indices = tuple(recurrent_indices)
+
+        def reconstruct(kv, recurrent):
+            rval: list[Any] = [None] * n
+            assert len(kv) == len(kv_indices)
+            assert len(recurrent) == len(recurrent_indices)
+            for i, out_i in enumerate(kv_indices):
+                rval[out_i]  = {
+                            "state": kv[i],
+                            "meta_state": '',
+                            "class_name": kv_cls.__name__,
+                            "class_ref": kv_cls,
+                }
+            for i, out_i in enumerate(recurrent_indices):
+                rval[out_i]  = {
+                            "state": recurrent[i],
+                            "meta_state": '',
+                            "class_name": recurrent_cls.__name__,
+                            "class_ref": recurrent_cls,
+                }
+            assert not any(x is None for x in rval)
+            return rval
+
+        if not hasattr(self, "_reassemble_cache_fn"):
+            self._reassemble_cache_fn = reconstruct
+
+        return kv, recurrent
+
+
+    def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
+        path = []
+        while node != self.root:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        return path
+
+
+    def _retrieve_full_cache(self, node: TurnNode):
+        # NOTE: Assuming no SSD for now
+        """Reconstruct the cache for a node to pipe to _reconstruct_cache_from_states."""
+        self._lock.acquire_lock()
+        assert node.recurrent_state is not None
+        assert hasattr(self, '_reassemble_cache_fn')
+        path = self._inorder_path(node)
+        kv = [n.kv_arrays for n in path]
+        kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
+        recurrent = node.recurrent_state
+        rval = self._reassemble_cache_fn(kv, recurrent)
+        self._lock.release_lock()
+        return rval
+
 
     def insert(
         self,
-        parent: TurnNode,
-        segment: Segment,
-        kv_arrays: list[mx.array],
-        kv_scales: list[float],
-        recurrent_state: Any | None,
-        is_system_prompt: bool = False,
+        segments: list[Segment],
+        extracted_cache,
+        acquire_lock=True
     ) -> TurnNode:
-        with self._lock:
-            h = _context_hash(parent.context_hash, segment.token_ids)
-            if h in parent.children:
-                node = parent.children[h]
-                node.last_used = time.time()
-                return node
+        logger.info("Trying to insert!")
 
-            if parent.is_permanent_checkpoint:
-                tokens_since = len(segment.token_ids)
-            else:
-                tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
+        if acquire_lock: self._lock.acquire_lock()
 
-            is_permanent = is_system_prompt or (
-                self.config.checkpoint_stride == 0
-                or tokens_since >= self.config.checkpoint_stride
-            )
+        logger.info("Acquired lock!")
 
-            # Quantize KV if configured
-            stored_kv = kv_arrays
-            stored_scales = kv_scales
-            if self.config.kv_dtype == "int8" and kv_arrays:
-                stored_kv, stored_scales = _quantize_kv(kv_arrays)
+        path = self.match(segments, acquire_lock=False)
 
-            # Quantize/cast recurrent state if configured
-            stored_recurrent = recurrent_state
-            stored_recurrent_scales = None
-            if self.config.recurrent_dtype != "none" and recurrent_state is not None:
-                stored_recurrent, stored_recurrent_scales = _quantize_recurrent(
-                    recurrent_state, self.config.recurrent_dtype
-                )
-
-            node = TurnNode(
-                token_ids=segment.token_ids,
-                context_hash=h,
-                kv_arrays=stored_kv,
-                kv_scales=stored_scales,
-                recurrent_state=stored_recurrent,
-                recurrent_scales=stored_recurrent_scales,
-                tokens_since_checkpoint=tokens_since if not is_permanent else 0,
-                parent=parent,
-                is_permanent_checkpoint=is_permanent,
-            )
-            parent.children[h] = node
-
-            # Prune parent's temp recurrent state if parent just became an inner node
-            # and its recurrent state was only a temp (leaf) checkpoint.
-            if (
-                len(parent.children) == 1          # parent just got its first child
-                and not parent.is_permanent_checkpoint
-                and parent is not self.root
-            ):
-                parent.recurrent_state = None
-                parent.recurrent_scales = None
-
-            self._memory_bytes += _node_data_bytes(node)
-            heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
-            self._evict_if_needed_unlocked()
-            __import__('pdb').set_trace()
+        # Check if there is already an exact match... hallelujah
+        if path and len(path) == len(segments):
+            node = path[-1]
+            node.touch()
+            if acquire_lock: self._lock.release_lock()
             return node
 
-    def match(self, segments: list[Segment]) -> tuple[list[TurnNode], bool]:
-        """Walk trie matching segments. Returns (path, has_recurrent_at_deepest)."""
+        is_system_prompt = not path
+
+        parent = self.root if is_system_prompt else path[-1]
+        segment = segments[len(path)]
+        tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
+        is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
+
+        kv, recur = self._split_cache_arrays(extracted_cache)
+
+        # TODO: validate that additional tokens match the len of segment
+        # assert sum(len(seg.token_ids) for seg in segments[:len(path)+1]) == 
+
+        h = _context_hash(parent.context_hash, segment.token_ids)
+        node = TurnNode(
+            token_ids=segment.token_ids,
+            context_hash=h,
+            kv_arrays=kv,
+            kv_scales=None,
+            recurrent_state=recur,
+            recurrent_scales=None,
+            parent=parent,
+            is_permanent_checkpoint=is_permanent,
+        )
+        node.touch()
+        parent.children[h] = node
+
+        # Prune parent's temp recurrent state if parent just became an inner node
+        # and its recurrent state was only a temp (leaf) checkpoint.
+        if (
+            len(parent.children) == 1          # parent just got its first child
+            and not parent.is_permanent_checkpoint
+            and parent is not self.root
+        ):
+            parent.recurrent_state = None
+            parent.recurrent_scales = None
+
+        self._memory_bytes += _node_data_bytes(node)
+        heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+        self._evict_if_needed_unlocked()
+        self._lock.release_lock()
+        return node
+
+    def match(self, segments: list[Segment], acquire_lock=True) -> list[TurnNode]:
+        """
+        Walk trie matching segments. Returns (path, has_recurrent_at_deepest).
+        Does NOT include root node in path.
+        """
+        if acquire_lock: self._lock.acquire_lock()
+
         path: list[TurnNode] = []
         node = self.root
-        now = time.time()
-        with self._lock:
-            for segment in segments:
-                h = _context_hash(node.context_hash, segment.token_ids)
-                if h not in node.children:
-                    logger.info(f"Could not match {segment.role=}")
-                    break
-                logger.info(f"Matched {segment.role=}")
-                node = node.children[h]
-                node.last_used = now
-                node.ref_count += 1
-                path.append(node)
+        for segment in segments:
+            h = _context_hash(node.context_hash, segment.token_ids)
+            if h not in node.children:
+                logger.info(f"Could not match {segment.role=}")
+                break
+            logger.info(f"Matched {segment.role=}")
+            node = node.children[h]
+            path.append(node)
         has_recurrent = bool(path) and path[-1].recurrent_state is not None
-        return path, has_recurrent
 
-    def release(self, path: list[TurnNode]) -> None:
-        """Decrement ref_count for all nodes in a matched path. Call on request completion."""
-        with self._lock:
-            for node in path:
-                node.ref_count = max(0, node.ref_count - 1)
+        if acquire_lock: self._lock.release_lock()
 
-    def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode | None:
+        return path
+
+    def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode:
         """Return the deepest node in path with a recurrent state.
 
-        First searches for the deepest permanent checkpoint with a recurrent state
-        (excluding SSDRef). Falls back to the deepest node with any recurrent state
-        if no permanent checkpoint is found.
+        Returns the deepest node with recurrent state stored. Including SSDFRef.
+        Fallback to `self.root`.
         """
         # First pass: look for deepest permanent checkpoint with recurrent state
         for node in reversed(path):
-            if (node.recurrent_state is not None and
-                not isinstance(node.recurrent_state, SSDRef)):
+            if node.recurrent_state:
                 return node
-
-        return None
+        return self.root
 
     def _walk_nodes(self, node: TurnNode) -> list[TurnNode]:
         """DFS walk to collect all nodes in subtree."""
