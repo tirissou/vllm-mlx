@@ -107,7 +107,6 @@ def _node_data_bytes(node: TurnNode) -> int:
                 nbytes = arr.dtype.size
                 for d in arr.shape:
                     nbytes *= d
-                nbytes *= arr.itemsize
                 total += nbytes
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
         layers = node.recurrent_state
@@ -118,7 +117,6 @@ def _node_data_bytes(node: TurnNode) -> int:
                     nbytes = arr.dtype.size
                     for d in arr.shape:
                         nbytes *= d
-                    nbytes *= arr.itemsize
                     total += nbytes
     return total
 
