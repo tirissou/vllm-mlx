@@ -25,6 +25,8 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from vllm_mlx.turn_prefix_cache import Segment
+
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -2609,8 +2611,9 @@ class Scheduler:
                         else:
                             resp_state = self._extract_cache_states(ec) or None
 
+                        prior = self._messages_to_segments(request)
                         self.turn_cache.insert(
-                            self._messages_to_segments(request)[:-1] + [_Seg(role="conversation", token_ids=response_tokens)],
+                            prior[:-1] + [_Seg(role="conversation", token_ids=response_tokens)],
                             resp_state
                         )
 
@@ -3370,7 +3373,7 @@ class Scheduler:
             return None
 
     # TODO: Cache this?
-    def _messages_to_segments(self, request: "Request") -> list:
+    def _messages_to_segments(self, request: "Request") -> list[Segment]:
         """Split a request's token sequence into per-message Segment objects.
 
         Uses _turn_boundaries = [B_sys, B_1, ..., B_{N-1}] computed by

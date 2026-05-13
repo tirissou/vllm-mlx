@@ -394,7 +394,6 @@ class TurnPrefixCache:
 
         if acquire_lock: self._lock.acquire_lock()
 
-        logger.info("Acquired lock!")
 
         path = self.match(segments, acquire_lock=False)
 
@@ -409,6 +408,7 @@ class TurnPrefixCache:
 
         parent = self.root if is_system_prompt else path[-1]
         segment = segments[len(path)]
+        logger.info(f"Inserting {len(segment.token_ids)} tokens")
         tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
         is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
 
