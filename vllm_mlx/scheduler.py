@@ -34,6 +34,9 @@ from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
+from .patches.mlx_lm_quantized_sdpa import patch_quantized_sdpa
+
+patch_quantized_sdpa()
 
 
 def _make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4):
@@ -332,16 +335,24 @@ def _install_chunked_prefill(
     # through the model, but no output token has been fed back yet.
     # This is the only safe capture point for hybrid Mamba+Transformer
     # models whose MambaCache state is cumulative.
-    if prompt_cache_save is not None:
+    if prompt_cache_save is not None or kv_quant:
 
         def _patched_process_prompts(prompts, _self=batch_gen):
             batch = _orig_process_prompts(prompts)
-            for e, uid in enumerate(batch.uids):
-                if batch.num_tokens[e] == 0:
-                    try:
-                        prompt_cache_save(uid, batch.extract_cache(e))
-                    except Exception:
-                        pass
+            # Ensure caches are quantized so they are compatible with
+            # BatchQuantizedKVCache objects created in the chunked-prefill
+            # path. Without this, BatchKVCache (from _orig_process_prompts)
+            # and BatchQuantizedKVCache end up in the same active_batch and
+            # BatchKVCache.extend(BatchQuantizedKVCache) crashes.
+            if kv_quant:
+                _quantize_batch_kv_cache(batch.cache)
+            if prompt_cache_save is not None:
+                for e, uid in enumerate(batch.uids):
+                    if batch.num_tokens[e] == 0:
+                        try:
+                            prompt_cache_save(uid, batch.extract_cache(e))
+                        except Exception:
+                            pass
             return batch
 
         batch_gen._process_prompts = _patched_process_prompts
