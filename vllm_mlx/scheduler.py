@@ -33,6 +33,7 @@ from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
+from .mllm_batch_generator import _eval_prompt_cache
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -413,7 +414,7 @@ def _install_chunked_prefill(
                     f"remaining={remaining} prompt_checkpoint={prompt_checkpoint} "
                     f"is_cached={partial.get('is_cached')} inputs.shape={inputs.shape}"
                 )
-                mx.eval([c.state for c in prompt_cache])
+                _eval_prompt_cache(prompt_cache)
                 inputs = inputs[:, n_to_process:]
                 partial["inputs"] = inputs
                 partial["processed"] += n_to_process
@@ -442,7 +443,7 @@ def _install_chunked_prefill(
                         f"[chunked_prefill][finalize-cached-eval] "
                         f"inputs.shape={inputs.shape} prompt_checkpoint={prompt_checkpoint}"
                     )
-                    mx.eval([c.state for c in prompt_cache])
+                    _eval_prompt_cache(prompt_cache)
                     inputs = partial["last_inputs"]
 
                 for c in prompt_cache:
@@ -473,7 +474,7 @@ def _install_chunked_prefill(
                         mx.contiguous(inputs[:, : prompt_checkpoint - 1]),
                         cache=prompt_cache,
                     )
-                    mx.eval([c.state for c in prompt_cache])
+                    _eval_prompt_cache(prompt_cache)
                     mx.clear_cache()
 
                 y, logprobs = self._step(
@@ -642,7 +643,7 @@ def _install_chunked_prefill(
                             f"[chunked_prefill][init-eval] n_to_process={n_to_process} "
                             f"padded.shape={padded.shape}"
                         )
-                        mx.eval([c.state for c in prompt_cache])
+                        _eval_prompt_cache(prompt_cache)
                         padded = padded[:, n_to_process:]
                         if is_cached:
                             mx.clear_cache()
