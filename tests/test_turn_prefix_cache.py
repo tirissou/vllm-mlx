@@ -1996,3 +1996,152 @@ def test_chunked_prefill_boundary_aware_continuation_lands_on_boundary():
     dist = next_b - total_pos
     n_to_process = min(dist, budget) if dist <= budget else budget
     assert n_to_process == 40
+
+
+# ── QuantizedKVCache integration tests ────────────────────────────────────
+
+def _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10, head_dim=256, n_kv_heads=4):
+    """Create extracted_cache in KVCache (bf16) format matching _extract_cache_states output."""
+    from mlx_lm.models.cache import KVCache
+    return [
+        {
+            "state": (
+                mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(mx.bfloat16),
+                mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(mx.bfloat16),
+            ),
+            "meta_state": (str(n_tokens),),
+            "class_name": "KVCache",
+            "class_ref": KVCache,
+        }
+        for _ in range(n_layers)
+    ]
+
+
+def test_split_cache_arrays_produces_quantized_tuples():
+    """_split_cache_arrays should quantize bf16 KV slices into int4 (packed, scales, biases) 3-tuples."""
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
+    kv, _ = cache._split_cache_arrays(extracted, offset=0)
+
+    assert len(kv) == 2  # 2 layers
+    for layer_kv in kv:
+        assert len(layer_kv) == 2  # (q_keys, q_values)
+        for q_component in layer_kv:
+            assert isinstance(q_component, (tuple, list)), f"Expected 3-element sequence, got {type(q_component)}"
+            assert len(q_component) == 3
+            packed, scales, biases = q_component
+            assert packed.dtype == mx.uint32, f"Expected uint32 packed, got {packed.dtype}"
+            assert packed.shape[2] == 10  # token dimension preserved
+
+
+def test_split_cache_arrays_respects_offset():
+    """KV delta should only include tokens from offset to actual_end."""
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    extracted = _make_bf16_kvcache_extracted(n_layers=1, n_tokens=10)
+    kv, _ = cache._split_cache_arrays(extracted, offset=5)
+
+    packed = kv[0][0][0]  # layer 0, q_keys, packed component
+    assert packed.shape[2] == 5  # 10 - 5 = 5 tokens
+
+
+def test_split_cache_arrays_uses_quantized_kvcache_class_ref():
+    """reconstruct closure should use QuantizedKVCache as class_ref, not the original KVCache."""
+    from mlx_lm.models.cache import QuantizedKVCache
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
+    kv, recurrent = cache._split_cache_arrays(extracted, offset=0)
+
+    result = cache._reassemble_cache_fn(kv, recurrent)
+    kv_layers = [d for d in result if "KVCache" in d["class_name"]]
+    for d in kv_layers:
+        assert d["class_ref"] is QuantizedKVCache, (
+            f"Expected QuantizedKVCache, got {d['class_ref']}"
+        )
+
+
+def test_reconstruct_cache_from_quantized_state_gives_quantized_kvcache():
+    """_reconstruct_cache_from_states on quantized trie state produces QuantizedKVCache objects."""
+    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.scheduler import Scheduler
+
+    sched = object.__new__(Scheduler)
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
+    kv, recurrent = cache._split_cache_arrays(extracted, offset=0)
+    raw_state = cache._reassemble_cache_fn(kv, recurrent)
+
+    prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+
+    assert prompt_cache is not None
+    assert len(prompt_cache) == 2
+    for layer in prompt_cache:
+        assert isinstance(layer, QuantizedKVCache), f"Expected QuantizedKVCache, got {type(layer)}"
+        assert layer.group_size == 64
+        assert layer.bits == 4
+        assert layer.offset == 10
+
+
+def test_node_data_bytes_handles_quantized_tuples():
+    """_node_data_bytes correctly accounts for quantized (packed, scales, biases) tuple format."""
+    bf16 = mx.zeros([1, 4, 10, 256], dtype=mx.bfloat16)
+    q = mx.quantize(bf16, group_size=64, bits=4)
+    kv_arrays = [(q, q), (q, q)]  # 2 layers, (q_keys, q_values)
+
+    node = TurnNode(
+        token_ids=[1],
+        context_hash=1,
+        kv_arrays=kv_arrays,
+        kv_scales=None,
+        recurrent_state=None,
+        recurrent_scales=None,
+    )
+
+    bytes_used = _node_data_bytes(node)
+    assert bytes_used > 0
+    # Quantized should be smaller than bf16 equivalent (4x reduction minus scales overhead)
+    bf16_bytes = 2 * 2 * (1 * 4 * 10 * 256 * 2)  # 2 layers × (keys+values) × bf16
+    assert bytes_used < bf16_bytes
+
+
+def test_retrieve_full_cache_produces_quantized_kvcache():
+    """Full path: insert with bf16 → _retrieve_full_cache → _reconstruct → QuantizedKVCache."""
+    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.scheduler import Scheduler
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sys_extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
+    segs_sys = [Segment(role="system", token_ids=list(range(10)))]
+    sys_node = trie.insert(segs_sys, sys_extracted)
+
+    raw_state = trie._retrieve_full_cache(sys_node)
+    assert raw_state is not None
+
+    sched = object.__new__(Scheduler)
+    prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+    assert prompt_cache is not None
+    for layer in prompt_cache:
+        assert isinstance(layer, QuantizedKVCache), f"Expected QuantizedKVCache, got {type(layer)}"
+        assert layer.offset == 10
+
+
+def test_retrieve_full_cache_concatenates_two_nodes():
+    """_retrieve_full_cache across two nodes concatenates quantized arrays correctly."""
+    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.scheduler import Scheduler
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    # Node 1: 10 tokens
+    ext1 = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
+    node1 = trie.insert([Segment(role="system", token_ids=list(range(10)))], ext1)
+    # Node 2: 5 more tokens (total 15, offset=10)
+    ext2 = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=15)
+    node2 = trie.insert([Segment(role="system", token_ids=list(range(10))),
+                          Segment(role="user", token_ids=list(range(10, 15)))], ext2)
+
+    raw_state = trie._retrieve_full_cache(node2)
+    sched = object.__new__(Scheduler)
+    prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+
+    for layer in prompt_cache:
+        assert isinstance(layer, QuantizedKVCache)
+        assert layer.offset == 15  # 10 + 5 tokens

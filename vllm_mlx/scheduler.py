@@ -213,6 +213,13 @@ def _install_chunked_prefill(
         _merge_caches,
         _right_pad_prompts,
     )
+    from mlx_lm.models.cache import BatchKVCache as _BatchKVCache
+    from .batch_quantized_kv_cache import BatchQuantizedKVCache as _BatchQuantizedKVCache
+
+    def _quantize_batch_kv_cache(cache_list):
+        for i, c in enumerate(cache_list):
+            if isinstance(c, _BatchKVCache):
+                cache_list[i] = _BatchQuantizedKVCache.from_batch_kvcache(c)
 
     try:
         from mlx_lm.generate import _lazy_extract_cache
@@ -415,6 +422,7 @@ def _install_chunked_prefill(
                     f"is_cached={partial.get('is_cached')} inputs.shape={inputs.shape}"
                 )
                 _eval_prompt_cache(prompt_cache)
+                _quantize_batch_kv_cache(prompt_cache)
                 inputs = inputs[:, n_to_process:]
                 partial["inputs"] = inputs
                 partial["processed"] += n_to_process
