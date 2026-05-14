@@ -427,7 +427,12 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
 
 
 def _needs_kv_trim(layer: Any) -> bool:
-    """Check if a cache layer has oversized KV arrays (duck-typed, no MLX import)."""
+    """Check if a cache layer needs KV materialization before storage.
+
+    Returns True for any KVCache layer with a valid offset — we always
+    want to evaluate into an independent Metal buffer so that the stored
+    entry does not hold a live reference back to the active batch cache.
+    """
     keys = getattr(layer, "keys", None)
     offset = getattr(layer, "offset", None)
     if keys is None or offset is None:
@@ -437,15 +442,16 @@ def _needs_kv_trim(layer: Any) -> bool:
     shape = getattr(keys, "shape", None)
     if shape is None or len(shape) < 3:
         return False
-    return 0 < offset < shape[2]
+    return offset > 0
 
 
 def _trim_to_offset(cache: list[Any]) -> list[Any]:
     """Trim KV arrays to their actual used size (offset) before storage.
 
-    KV arrays are often pre-allocated larger than needed (e.g. 4096 slots
-    when only 100 are used).  This slices them down to ``offset`` and
-    evaluates the result so the original large buffer can be freed.
+    Even when no size trimming is needed (offset == shape[2]), we still
+    create a new evaluated KVCache so the stored entry holds an independent
+    Metal buffer.  Without this, the stored entry would keep the live batch
+    cache buffer alive after expansion, preventing it from being freed.
 
     Args:
         cache: List of cache layer objects (KVCache or other types).
@@ -465,7 +471,7 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
     for layer in cache:
         if isinstance(layer, KVCache) and layer.keys is not None:
             offset = layer.offset
-            if offset <= 0 or offset >= layer.keys.shape[2]:
+            if offset <= 0:
                 trimmed.append(layer)
                 continue
             tc = KVCache()

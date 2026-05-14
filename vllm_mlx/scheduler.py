@@ -2054,6 +2054,7 @@ class Scheduler:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
             # Release cache references so Metal buffers can be freed
             request.prompt_cache = None
+            request.remaining_tokens = None
             request._extracted_cache = None
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
@@ -2416,6 +2417,7 @@ class Scheduler:
                 # which under sustained traffic can accumulate hundreds of GB
                 # of wired memory (issue #442).
                 request.prompt_cache = None
+                request.remaining_tokens = None
                 self.running[request.request_id] = request
                 scheduled.append(request)
 
