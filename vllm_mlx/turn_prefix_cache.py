@@ -98,17 +98,28 @@ def _context_hash(parent_hash: int, token_ids: list[int]) -> int:
     return struct.unpack("<q", digest[:8])[0]
 
 
+def _arr_bytes(arr) -> int:
+    """Return byte size of an mx.array, or 0 for non-arrays."""
+    if not hasattr(arr, "itemsize"):
+        return 0
+    n = arr.itemsize
+    for d in arr.shape:
+        n *= d
+    return n
+
+
 def _node_data_bytes(node: TurnNode) -> int:
     """Estimate bytes used by a node's kv_arrays and recurrent_state."""
     kv_total = 0
     rec_total = 0
     if isinstance(node.kv_arrays, list):
         for arrs in node.kv_arrays:
-            for arr in arrs:
-                nbytes = arr.itemsize
-                for d in arr.shape:
-                    nbytes *= d
-                kv_total += nbytes
+            for kv_item in arrs:
+                if isinstance(kv_item, (tuple, list)):
+                    # quantized format: [packed, scales, biases]
+                    kv_total += sum(_arr_bytes(a) for a in kv_item)
+                else:
+                    kv_total += _arr_bytes(kv_item)
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
         layers = node.recurrent_state
         for arrs in layers:
@@ -310,19 +321,20 @@ class TurnPrefixCache:
     def _split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
         """
         Process the output from Scheduler._extract_cache_states.
+        KV arrays are quantized to int4 (group_size=64) before storage.
         """
+        from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
+        _KV_GROUP_SIZE = 64
+        _KV_BITS = 4
+
         kv = []
         kv_indices = []
         recurrent = []
         recurrent_indices = []
-        kv_cls = None
         recurrent_cls = None
         logs = []
         for i, state in enumerate(cache_states):
             if "KVCache" in state['class_name']:
-                l, li = kv, kv_indices
-                if not kv_cls: kv_cls = state['class_ref']
-                assert kv_cls == state['class_ref']
                 meta = state.get('meta_state')
                 raw_state = state['state']
                 try:
@@ -331,19 +343,28 @@ class TurnPrefixCache:
                     actual_end = raw_state[0].shape[2]
                 if len(raw_state) > 2:
                     logs.append("Only keeping first 2 arrays in KVCache arrays.")
-                state = tuple(arr[:,:,offset:actual_end,:] for arr in raw_state[:2])
+                # Slice then quantize to int4: (packed_uint32, scales, biases)
+                state = tuple(
+                    mx.quantize(arr[:, :, offset:actual_end, :], group_size=_KV_GROUP_SIZE, bits=_KV_BITS)
+                    for arr in raw_state[:2]
+                )
                 for arr in raw_state[:2]:
                     del arr
+                kv.append(state)
+                kv_indices.append(i)
             else:
-                l, li = recurrent, recurrent_indices
                 if not recurrent_cls: recurrent_cls = state['class_ref']
                 assert recurrent_cls == state['class_ref']
-                state = state['state']
-            l.append(state)
-            li.append(i)
+                recurrent.append(state['state'])
+                recurrent_indices.append(i)
 
-        mx.eval(*(arr for l in (recurrent, kv) for arrs in l for arr in arrs))
+        # Eval quantized tuples and recurrent arrays
+        arrays_to_eval = [comp for arrs in kv for q_tuple in arrs for comp in q_tuple]
+        arrays_to_eval += [arr for arrs in recurrent for arr in arrs if isinstance(arr, mx.array)]
+        if arrays_to_eval:
+            mx.eval(*arrays_to_eval)
         mx.clear_cache()
+
         n = len(cache_states)
         kv_indices = tuple(kv_indices)
         recurrent_indices = tuple(recurrent_indices)
@@ -353,18 +374,20 @@ class TurnPrefixCache:
             assert len(kv) == len(kv_indices)
             assert len(recurrent) == len(recurrent_indices)
             for i, out_i in enumerate(kv_indices):
-                rval[out_i]  = {
-                            "state": kv[i],
-                            "meta_state": '',
-                            "class_name": kv_cls.__name__,
-                            "class_ref": kv_cls,
+                q_keys, q_values = kv[i]
+                n_tokens = q_keys[0].shape[2]  # packed array; axis=2 is token dim
+                rval[out_i] = {
+                    "state": kv[i],
+                    "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS)),
+                    "class_name": _QuantizedKVCache.__name__,
+                    "class_ref": _QuantizedKVCache,
                 }
             for i, out_i in enumerate(recurrent_indices):
-                rval[out_i]  = {
-                            "state": recurrent[i],
-                            "meta_state": '',
-                            "class_name": recurrent_cls.__name__,
-                            "class_ref": recurrent_cls,
+                rval[out_i] = {
+                    "state": recurrent[i],
+                    "meta_state": '',
+                    "class_name": recurrent_cls.__name__,
+                    "class_ref": recurrent_cls,
                 }
             assert not any(x is None for x in rval)
             return rval
@@ -385,8 +408,17 @@ class TurnPrefixCache:
             assert hasattr(self, '_reassemble_cache_fn')
             path = self._inorder_path(node)
             kv = [n.kv_arrays for n in path]
-            kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
-            n = kv[0][0].shape[2]
+            # Each node's kv_arrays: list of per-layer ((pk,sk,bk),(pv,sv,bv)) quantized tuples.
+            # zip(*kv) groups by layer; for each layer, zip(*arrs) groups by key/value;
+            # then concatenate each of the 3 components along the token axis (axis=2).
+            kv = [
+                tuple(
+                    tuple(mx.concatenate([t[j] for t in kv_group], axis=2) for j in range(3))
+                    for kv_group in zip(*arrs)
+                )
+                for arrs in zip(*kv)
+            ]
+            n = kv[0][0][0].shape[2]  # layer 0, q_keys, packed component, token dim
             logger.info(f"Rebuilding cache... {n} tokens")
             recurrent = node.recurrent_state
             rval = self._reassemble_cache_fn(kv, recurrent)
