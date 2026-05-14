@@ -85,9 +85,14 @@ class BatchQuantizedKVCache:
             [v[..., : self._idx, :] for v in self.values],
         )
 
-    def make_mask(self, N: int, **kwargs):
+    def make_mask(
+        self,
+        N: int,
+        window_size: int | None = None,
+        return_array: bool = False,
+    ):
         return create_causal_mask(
-            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+            N, offset=self._idx, left_padding=self.left_padding, window_size=window_size
         )
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
@@ -103,6 +108,19 @@ class BatchQuantizedKVCache:
 
     def finalize(self):
         pass
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return (
+            [k[..., : self._idx, :] for k in self.keys],
+            [v[..., : self._idx, :] for v in self.values],
+        )
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self._idx, self.group_size, self.bits)))
 
     def size(self):
         return self._idx
