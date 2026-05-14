@@ -331,9 +331,7 @@ class TurnPrefixCache:
                     actual_end = raw_state[0].shape[2]
                 if len(raw_state) > 2:
                     logs.append("Only keeping first 2 arrays in KVCache arrays.")
-                state = tuple(arr[:,:,offset:actual_end,:] for arr in raw_state[:2])
-                for arr in raw_state[:2]:
-                    del arr
+                state = tuple(mx.contiguous(arr[:,:,offset:actual_end,:]) for arr in raw_state[:2])
             else:
                 l, li = recurrent, recurrent_indices
                 if not recurrent_cls: recurrent_cls = state['class_ref']
