@@ -465,7 +465,8 @@ def _install_chunked_prefill(
                     f"is_cached={partial.get('is_cached')} inputs.shape={inputs.shape}"
                 )
                 _eval_prompt_cache(prompt_cache)
-                _quantize_batch_kv_cache(prompt_cache)
+                if kv_quant and partial.get("is_cached"):
+                    _quantize_batch_kv_cache(prompt_cache)
                 inputs = inputs[:, n_to_process:]
                 partial["inputs"] = inputs
                 partial["processed"] += n_to_process
@@ -636,9 +637,15 @@ def _install_chunked_prefill(
 
                     if not is_cached:
                         padded = _left_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _make_cache(
-                            self.model, padding, self.max_kv_size
-                        )
+                        if kv_quant:
+                            prompt_cache = _make_quantized_cache(
+                                self.model, padding, self.max_kv_size,
+                                group_size=kv_group_size, bits=kv_bits,
+                            )
+                        else:
+                            prompt_cache = _make_cache(
+                                self.model, padding, self.max_kv_size
+                            )
                     else:
                         last_inputs = mx.array(
                             [p[-prompt_checkpoint:] for p in inputs_raw]
