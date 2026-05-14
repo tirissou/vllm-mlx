@@ -45,18 +45,13 @@ class TurnNode:
     kv_arrays: list[mx.array] | SSDRef | None   # None only for root sentinel
     kv_scales: list[float] | None
     recurrent_state: Any | SSDRef | None         # list of per-layer states, or SSDRef
-    recurrent_scales: list[list[float]] | None   # per-layer, per-tensor per-channel scales (int8 only)
+    recurrent_scales: list[list[float]] | None = None   # per-layer, per-tensor per-channel scales (int8 only)
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
     ref_count: int = 0
     last_used: float = field(default_factory=time.time)
     is_permanent_checkpoint: bool = False
-
-    @property
-    def tokens_since_checkpoint(self) -> int:
-        if self.is_permanent_checkpoint:
-            return 0
-        return len(self.token_ids) + (self.parent.tokens_since_checkpoint if self.parent else 0)
+    tokens_since_checkpoint: int = 0  # cumulative tokens since last permanent checkpoint
 
     @property
     def is_leaf(self) -> bool:
@@ -80,7 +75,7 @@ class TurnNode:
 
 @dataclass
 class TurnPrefixCacheConfig:
-    checkpoint_stride: int = 4000 # tokens between permanent checkpoints; 0 = every node
+    checkpoint_stride: int = 512 # tokens between permanent checkpoints; 0 = every node
     max_memory_gb: float = 8.0
     kv_dtype: str = "int8"                      # "bf16" or "int8"
     recurrent_dtype: str = "bf16"                # "none", "fp16", "bf16", or "int8" (per-channel)
@@ -113,23 +108,32 @@ def _node_data_bytes(node: TurnNode) -> int:
     kv_total = 0
     rec_total = 0
     if isinstance(node.kv_arrays, list):
-        for arrs in node.kv_arrays:
-            for kv_item in arrs:
-                if isinstance(kv_item, (tuple, list)):
-                    # quantized format: [packed, scales, biases]
-                    kv_total += sum(_arr_bytes(a) for a in kv_item)
-                else:
-                    kv_total += _arr_bytes(kv_item)
+        for arr in node.kv_arrays:
+            if isinstance(arr, mx.array):
+                kv_total += _arr_bytes(arr)
+            elif isinstance(arr, (tuple, list)):
+                # nested format: (q_keys, q_values) where each is a (packed, scales, biases) 3-tuple
+                for item in arr:
+                    if isinstance(item, (tuple, list)):
+                        kv_total += sum(_arr_bytes(a) for a in item)
+                    elif isinstance(item, mx.array):
+                        kv_total += _arr_bytes(item)
     if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
-        layers = node.recurrent_state
-        for arrs in layers:
-            for arr in arrs:
-                arr: mx.array
-                if hasattr(arr, "shape"):
-                    nbytes = arr.itemsize
-                    for d in arr.shape:
-                        nbytes *= d
-                    rec_total += nbytes
+        state = node.recurrent_state
+        if isinstance(state, mx.array):
+            rec_total += _arr_bytes(state)
+        elif isinstance(state, list):
+            for layer in state:
+                if isinstance(layer, dict):
+                    for arr in layer.get("state", ()):
+                        if hasattr(arr, "itemsize"):
+                            rec_total += _arr_bytes(arr)
+                elif isinstance(layer, mx.array):
+                    rec_total += _arr_bytes(layer)
+                elif isinstance(layer, (list, tuple)):
+                    for arr in layer:
+                        if hasattr(arr, "itemsize"):
+                            rec_total += _arr_bytes(arr)
     return kv_total + rec_total
 
 
@@ -314,7 +318,7 @@ class TurnPrefixCache:
             parent=None,
             is_permanent_checkpoint=True,  # root acts as checkpoint anchor
         )
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
     
@@ -440,28 +444,117 @@ class TurnPrefixCache:
 
     def insert(
         self,
-        segments: list[Segment],
-        extracted_cache,
-        acquire_lock=True
+        parent_or_segments,
+        segment_or_extracted=None,
+        kv_arrays: list | None = None,
+        kv_scales: list | None = None,
+        recurrent_state: Any = None,
+        is_system_prompt: bool = False,
+        recurrent_scales: list | None = None,
+        acquire_lock: bool = True,
     ) -> TurnNode:
-        logger.info("Trying to insert!")
+        """Insert a node into the trie.
 
+        New API: insert(parent, segment, kv_arrays, kv_scales, recurrent_state, ...)
+        Legacy API: insert(segments_list, extracted_cache[, acquire_lock])
+        """
+        if isinstance(parent_or_segments, list):
+            # Legacy API: insert(segments, extracted_cache, acquire_lock=True)
+            actual_lock = kv_arrays if isinstance(kv_arrays, bool) else True
+            return self._insert_legacy(
+                parent_or_segments, segment_or_extracted, acquire_lock=actual_lock
+            )
+        return self._insert_node(
+            parent_or_segments, segment_or_extracted,
+            kv_arrays or [], kv_scales, recurrent_state,
+            is_system_prompt, recurrent_scales, acquire_lock,
+        )
+
+    def _insert_node(
+        self,
+        parent: TurnNode,
+        segment: Segment,
+        kv_arrays: list,
+        kv_scales: list | None,
+        recurrent_state: Any,
+        is_system_prompt: bool = False,
+        recurrent_scales: list | None = None,
+        acquire_lock: bool = True,
+    ) -> TurnNode:
         with self._lock if acquire_lock else nullcontext():
-            path = self.match(segments, acquire_lock=False)
+            h = _context_hash(parent.context_hash, segment.token_ids)
 
-            # Check if there is already an exact match... hallelujah
-            if path and len(path) == len(segments):
-                node = path[-1]
+            # Exact match: child already exists
+            if h in parent.children:
+                node = parent.children[h]
                 node.touch()
                 return node
 
-            is_system_prompt = not path
+            tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
+            is_permanent = (
+                is_system_prompt
+                or self.config.checkpoint_stride == 0
+                or tokens_since >= self.config.checkpoint_stride
+            )
+            node_tsc = 0 if is_permanent else tokens_since
 
+            # Quantize KV to int8 if configured
+            if self.config.kv_dtype == "int8" and kv_arrays:
+                kv_arrays, kv_scales = _quantize_kv(kv_arrays)
+
+            node = TurnNode(
+                token_ids=segment.token_ids,
+                context_hash=h,
+                kv_arrays=kv_arrays,
+                kv_scales=kv_scales,
+                recurrent_state=recurrent_state,
+                recurrent_scales=recurrent_scales,
+                parent=parent,
+                is_permanent_checkpoint=is_permanent,
+                tokens_since_checkpoint=node_tsc,
+            )
+            node.touch()
+            parent.children[h] = node
+
+            # Prune temp recurrent from parent when it becomes an inner node
+            if (
+                len(parent.children) == 1          # parent just got its first child
+                and not parent.is_permanent_checkpoint
+                and parent is not self.root
+            ):
+                freed = _node_data_bytes(parent)
+                parent.recurrent_state = None
+                parent.recurrent_scales = None
+                freed -= _node_data_bytes(parent)
+                self._memory_bytes -= freed
+
+            self._memory_bytes += _node_data_bytes(node)
+            heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+            self._evict_if_needed_unlocked()
+            return node
+
+    def _insert_legacy(
+        self,
+        segments: list[Segment],
+        extracted_cache,
+        acquire_lock: bool = True,
+    ) -> TurnNode:
+        """Legacy insert: walks the trie, splits extracted_cache with _split_cache_arrays."""
+        with self._lock if acquire_lock else nullcontext():
+            path, _ = self.match(segments, acquire_lock=False)
+
+            if path and len(path) == len(segments):
+                node = path[-1]
+                node.touch()
+                self.release(path)
+                return node
+
+            is_system_prompt = not path
             parent = self.root if is_system_prompt else path[-1]
             segment = segments[len(path)]
-            logger.info(f"Inserting {len(segment.token_ids)} tokens")
             tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
             is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
+            node_tsc = 0 if is_permanent else tokens_since
 
             kv, recur = self._split_cache_arrays(extracted_cache, parent.n_tokens)
 
@@ -475,60 +568,79 @@ class TurnPrefixCache:
                 recurrent_scales=None,
                 parent=parent,
                 is_permanent_checkpoint=is_permanent,
+                tokens_since_checkpoint=node_tsc,
             )
             node.touch()
             parent.children[h] = node
 
-            # Prune parent's temp recurrent state if parent just became an inner node
-            # and its recurrent state was only a temp (leaf) checkpoint.
             if (
-                len(parent.children) == 1          # parent just got its first child
+                len(parent.children) == 1
                 and not parent.is_permanent_checkpoint
                 and parent is not self.root
             ):
-                freed = _node_data_bytes(parent)  # KV + recurrent
+                freed = _node_data_bytes(parent)
                 parent.recurrent_state = None
                 parent.recurrent_scales = None
-                freed -= _node_data_bytes(parent)  # subtract KV portion → just recurrent
+                freed -= _node_data_bytes(parent)
                 self._memory_bytes -= freed
 
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
             self._evict_if_needed_unlocked()
-            logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
-            self.visualize()
+            if path:
+                self.release(path)
             return node
 
-    def match(self, segments: list[Segment], acquire_lock=True) -> list[TurnNode]:
-        """
-        Walk trie matching segments. Returns (path, has_recurrent_at_deepest).
+    def match(self, segments: list[Segment], acquire_lock=True) -> tuple[list[TurnNode], bool]:
+        """Walk trie matching segments. Returns (path, has_recurrent).
+
+        Increments ref_count for all matched nodes (caller must call release()).
         Does NOT include root node in path.
         """
         with self._lock if acquire_lock else nullcontext():
             path: list[TurnNode] = []
             node = self.root
+            tstamp = time.time()
             for segment in segments:
                 h = _context_hash(node.context_hash, segment.token_ids)
                 if h not in node.children:
-                    logger.info(f"Could not match {segment.role=}")
                     break
                 node = node.children[h]
+                node.last_used = tstamp
+                node.ref_count += 1
                 path.append(node)
-            has_recurrent = bool(path) and path[-1].recurrent_state is not None
+            has_recurrent = (
+                bool(path)
+                and path[-1].recurrent_state is not None
+                and not isinstance(path[-1].recurrent_state, SSDRef)
+            )
+            return path, has_recurrent
 
-            return path
+    def release(self, path: list[TurnNode]) -> None:
+        """Decrement ref_count for all nodes in path; re-add newly evictable ones to heap."""
+        with self._lock:
+            for node in path:
+                node.ref_count = max(0, node.ref_count - 1)
+                if node.is_evictable:
+                    heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
 
-    def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode:
-        """Return the deepest node in path with a recurrent state.
+    def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode | None:
+        """Return the deepest node in path with recurrent state, preferring permanent checkpoints.
 
-        Returns the deepest node with recurrent state stored. Including SSDFRef.
-        Fallback to `self.root`.
+        First pass: deepest permanent checkpoint with real recurrent state.
+        Second pass: deepest node with any real recurrent state (temp leaf fallback).
+        Returns None if nothing found.
         """
-        # First pass: look for deepest permanent checkpoint with recurrent state
+        def _has_real_recurrent(node: TurnNode) -> bool:
+            return node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef)
+
         for node in reversed(path):
-            if node.recurrent_state:
+            if node.is_permanent_checkpoint and _has_real_recurrent(node):
                 return node
-        return self.root
+        for node in reversed(path):
+            if _has_real_recurrent(node):
+                return node
+        return None
 
     def _walk_nodes(self, node: TurnNode) -> list[TurnNode]:
         """DFS walk to collect all nodes in subtree."""
@@ -559,8 +671,9 @@ class TurnPrefixCache:
         max_bytes = int(self.config.max_memory_gb * 1024**3)
         while self._memory_bytes > max_bytes and self._eviction_heap:
             last_used, _, node = heapq.heappop(self._eviction_heap)
-            # Lazy deletion: node may no longer be evictable
-            if node.last_used != last_used or not node.is_evictable:
+            # Lazy deletion: skip if node was touched after this entry was pushed,
+            # or is no longer a leaf/unpinned.
+            if node.last_used > last_used or not node.is_evictable:
                 continue
             self._evict_node(node)
 
@@ -754,6 +867,7 @@ class TurnPrefixCache:
                     continue
 
             recurrent_state = None
+            recurrent_scales = None
             if rec_path and os.path.exists(rec_path):
                 try:
                     tensors = st_load(rec_path)
