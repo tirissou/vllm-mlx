@@ -663,6 +663,8 @@ def _install_chunked_prefill(
                         )
                         padded = _right_pad_prompts(inputs_raw, max_length=max_length)
                         prompt_cache = _merge_caches(caches)
+                        if kv_quant:
+                            _quantize_batch_kv_cache(prompt_cache)
                         for c in prompt_cache:
                             c.prepare(
                                 lengths=[ln - prompt_checkpoint for ln in lengths],
