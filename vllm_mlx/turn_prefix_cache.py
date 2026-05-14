@@ -332,6 +332,8 @@ class TurnPrefixCache:
                 if len(raw_state) > 2:
                     logs.append("Only keeping first 2 arrays in KVCache arrays.")
                 state = tuple(arr[:,:,offset:actual_end,:] for arr in raw_state[:2])
+                for arr in raw_state[:2]:
+                    del arr
             else:
                 l, li = recurrent, recurrent_indices
                 if not recurrent_cls: recurrent_cls = state['class_ref']
@@ -383,8 +385,6 @@ class TurnPrefixCache:
             path = self._inorder_path(node)
             kv = [n.kv_arrays for n in path]
             kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
-            # for layer_kv in kv:
-            #     mx.eval(*layer_kv)
             n = kv[0][0].shape[2]
             logger.info(f"Rebuilding cache... {n} tokens")
             recurrent = node.recurrent_state
