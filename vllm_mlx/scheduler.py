@@ -35,6 +35,46 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
 
+
+def _make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4):
+    """Like mlx-lm's _make_cache but emits BatchQuantizedKVCache for KV layers.
+
+    ArraysCache (recurrent) and RotatingKVCache layers are left unchanged
+    so hybrid Mamba+Transformer models work correctly.
+    """
+    from mlx_lm.models.cache import (
+        ArraysCache,
+        BatchRotatingKVCache,
+        CacheList,
+        KVCache,
+        RotatingKVCache,
+    )
+    from .batch_quantized_kv_cache import BatchQuantizedKVCache
+
+    def to_quantized_batch(c):
+        if type(c) is KVCache:
+            return BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
+        elif isinstance(c, ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, CacheList):
+            return CacheList(*(to_quantized_batch(sub) for sub in c.caches))
+        else:
+            raise ValueError(f"{type(c)} does not yet support batching")
+
+    if hasattr(model, "make_cache"):
+        return [to_quantized_batch(c) for c in model.make_cache()]
+    if max_kv_size is not None:
+        from mlx_lm.models.cache import BatchRotatingKVCache
+        return [BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers]
+    return [BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
+            for _ in model.layers]
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
