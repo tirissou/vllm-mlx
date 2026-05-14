@@ -413,7 +413,7 @@ def _install_chunked_prefill(
                     f"remaining={remaining} prompt_checkpoint={prompt_checkpoint} "
                     f"is_cached={partial.get('is_cached')} inputs.shape={inputs.shape}"
                 )
-                mx.eval([c.state for c in prompt_cache])
+                # mx.eval([c.state for c in prompt_cache])
                 inputs = inputs[:, n_to_process:]
                 partial["inputs"] = inputs
                 partial["processed"] += n_to_process
@@ -426,10 +426,10 @@ def _install_chunked_prefill(
                 )
 
                 # Save intermediate cache for disconnect resilience
-                if mid_prefill_save is not None and len(partial["uids"]) == 1:
-                    mid_prefill_save(
-                        partial["uids"][0], partial["processed"], prompt_cache
-                    )
+                # if mid_prefill_save is not None and len(partial["uids"]) == 1:
+                #     mid_prefill_save(
+                #         partial["uids"][0], partial["processed"], prompt_cache
+                #     )
 
                 if partial.get("is_cached"):
                     mx.clear_cache()

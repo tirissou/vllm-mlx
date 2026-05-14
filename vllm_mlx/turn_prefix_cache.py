@@ -386,8 +386,8 @@ class TurnPrefixCache:
             path = self._inorder_path(node)
             kv = [n.kv_arrays for n in path]
             kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
-            n = kv[0][0].shape[2]
-            logger.info(f"Rebuilding cache... {n} tokens")
+            # n = kv[0][0].shape[2]
+            # logger.info(f"Rebuilding cache... {n} tokens")
             recurrent = node.recurrent_state
             rval = self._reassemble_cache_fn(kv, recurrent)
             logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
