@@ -459,6 +459,7 @@ class TurnPrefixCache:
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
             self._evict_if_needed_unlocked()
             logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
+            self.visualize()
             return node
 
     def match(self, segments: list[Segment], acquire_lock=True) -> list[TurnNode]:
