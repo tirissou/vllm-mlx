@@ -473,7 +473,6 @@ class TurnPrefixCache:
                 if h not in node.children:
                     logger.info(f"Could not match {segment.role=}")
                     break
-                logger.info(f"Matched {segment.role=}")
                 node = node.children[h]
                 path.append(node)
             has_recurrent = bool(path) and path[-1].recurrent_state is not None
