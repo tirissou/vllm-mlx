@@ -231,6 +231,9 @@ def _install_chunked_prefill(
     pending_abort_ids: Optional[Set[str]] = None,
     uid_to_request_id: Optional[Dict[int, str]] = None,
     requests: Optional[Dict[str, Any]] = None,
+    kv_quant: bool = False,
+    kv_bits: int = 4,
+    kv_group_size: int = 64,
 ) -> None:
     """
     Monkey-patch a BatchGenerator instance so that large prefills are
@@ -1515,6 +1518,9 @@ class Scheduler:
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
                 requests=self.requests,
+                kv_quant=self.config.kv_cache_quantization,
+                kv_bits=self.config.kv_cache_quantization_bits,
+                kv_group_size=self.config.kv_cache_quantization_group_size,
             )
         elif need_chunked and not chunked_compatible:
             logger.warning(
