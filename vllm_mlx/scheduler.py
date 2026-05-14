@@ -1724,9 +1724,11 @@ class Scheduler:
                     return False
                 # Validate batch dimension == 1 for KVCache layers
                 if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
-                    if layer_cache.keys.shape[0] != 1:
+                    # QuantizedKVCache.keys is a (packed, scales, biases) tuple
+                    keys_arr = layer_cache.keys[0] if isinstance(layer_cache.keys, (tuple, list)) else layer_cache.keys
+                    if keys_arr.shape[0] != 1:
                         logger.debug(
-                            f"Cache layer invalid: keys batch={layer_cache.keys.shape[0]}, expected 1"
+                            f"Cache layer invalid: keys batch={keys_arr.shape[0]}, expected 1"
                         )
                         return False
                 # Validate batch dimension for MambaCache layers
