@@ -389,6 +389,7 @@ class TurnPrefixCache:
             logger.info(f"Rebuilding cache... {n} tokens")
             recurrent = node.recurrent_state
             rval = self._reassemble_cache_fn(kv, recurrent)
+            logger.info(f"MLX Cache size: {mx.get_cache_size() / (1024 ** 3)} GB")
             return rval
 
     def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
@@ -456,6 +457,7 @@ class TurnPrefixCache:
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
             self._evict_if_needed_unlocked()
+            logger.info(f"MLX Cache size: {mx.get_cache_size() / (1024 ** 3)} GB")
             return node
 
     def match(self, segments: list[Segment], acquire_lock=True) -> list[TurnNode]:
