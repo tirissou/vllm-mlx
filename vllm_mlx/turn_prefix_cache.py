@@ -343,13 +343,11 @@ class TurnPrefixCache:
                     actual_end = raw_state[0].shape[2]
                 if len(raw_state) > 2:
                     logs.append("Only keeping first 2 arrays in KVCache arrays.")
-                # Slice then quantize to int4: (packed_uint32, scales, biases)
+                state = raw_state[:2]
                 state = tuple(
-                    mx.quantize(arr[:, :, offset:actual_end, :], group_size=_KV_GROUP_SIZE, bits=_KV_BITS)
-                    for arr in raw_state[:2]
+                    mx.quantize(mx.contiguous(arr[:, :, offset:actual_end, :]), group_size=_KV_GROUP_SIZE, bits=_KV_BITS)
+                    for arr in state
                 )
-                for arr in raw_state[:2]:
-                    del arr
                 kv.append(state)
                 kv_indices.append(i)
             else:
