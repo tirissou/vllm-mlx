@@ -343,6 +343,7 @@ class TurnPrefixCache:
             li.append(i)
 
         mx.eval(*(arr for l in (recurrent, kv) for arrs in l for arr in arrs))
+        mx.clear_cache()
         n = len(cache_states)
         kv_indices = tuple(kv_indices)
         recurrent_indices = tuple(recurrent_indices)
