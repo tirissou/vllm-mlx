@@ -383,8 +383,8 @@ class TurnPrefixCache:
             path = self._inorder_path(node)
             kv = [n.kv_arrays for n in path]
             kv = [tuple(mx.concatenate(arr, axis=2) for arr in zip(*arrs)) for arrs in zip(*kv)]
-            for layer_kv in kv:
-                mx.eval(*layer_kv)
+            # for layer_kv in kv:
+            #     mx.eval(*layer_kv)
             n = kv[0][0].shape[2]
             logger.info(f"Rebuilding cache... {n} tokens")
             recurrent = node.recurrent_state
