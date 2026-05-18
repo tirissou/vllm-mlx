@@ -31,7 +31,7 @@ class MemoryCacheAdapter:
     def store(self, request, cache: list) -> bool:
         _st = getattr(request, "store_tokens", None)
         tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
-        return self._inner.store(tokens, cache)
+        return self._inner.store(tokens, cache, evict_prefixes=False)
 
     def release(self, handle: Any) -> None:
         pass  # memory cache has no handle lifecycle
@@ -164,7 +164,11 @@ class TurnCacheAdapter:
             )
 
         response_tokens = list(segments[-1].token_ids) + list(request.output_token_ids)
-        resp_state = cache if (cache and isinstance(cache[0], dict)) else None
+        # Normalize to dict form if raw KV layer objects were passed
+        if cache and not isinstance(cache[0], dict):
+            from .kv_cache import extract_layer_state
+            cache = [d for layer in cache if (d := extract_layer_state(layer)) is not None]
+        resp_state = cache if cache else None
         resp_kv, resp_recur = (
             self._inner._split_cache_arrays(resp_state, parent.n_tokens)
             if resp_state is not None else ([], None)

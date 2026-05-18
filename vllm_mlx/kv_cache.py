@@ -92,3 +92,20 @@ class PersistableCache(PrefixCache, Protocol):
 
     def save(self, cache_dir: str) -> bool: ...
     def load(self, cache_dir: str) -> int: ...
+
+
+def extract_layer_state(layer) -> dict | None:
+    """Extract state dict from a single KV cache layer.
+
+    Converts raw KVCache or BatchKVCache objects to normalized dict form with
+    state, meta_state, class_name, and class_ref. Returns None if layer lacks
+    the required .state and .meta_state attributes.
+    """
+    if hasattr(layer, "state") and hasattr(layer, "meta_state"):
+        return {
+            "state": layer.state,
+            "meta_state": layer.meta_state,
+            "class_name": type(layer).__name__,
+            "class_ref": type(layer),
+        }
+    return None
