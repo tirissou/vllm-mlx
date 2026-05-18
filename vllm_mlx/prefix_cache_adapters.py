@@ -131,7 +131,49 @@ class TurnCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        return False  # turn cache stores via mid-prefill callbacks, not via store()
+        from .turn_prefix_cache import Segment
+
+        segments = self.messages_to_segments(request)
+        if not segments or not getattr(request, "output_token_ids", None):
+            return False
+
+        path = getattr(request, "_turn_cache_path", None) or []
+        matched_depth = len(path)
+        parent = path[-1] if path else self._inner.root
+        new_segments = segments[matched_depth:]
+        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+        _boundary_states = getattr(request, "_boundary_states", None) or {}
+
+        if not new_segments:
+            return False
+
+        for i, segment in enumerate(new_segments[:-1]):
+            abs_idx = matched_depth + i
+            is_sys = segment.role == "system" and abs_idx == 0
+            full_state = (
+                _boundary_states.get(_turn_boundaries[abs_idx])
+                if abs_idx < len(_turn_boundaries) else None
+            )
+            kv_slice, recur = (
+                self._inner._split_cache_arrays(full_state, parent.n_tokens)
+                if full_state is not None else ([], None)
+            )
+            parent = self._inner.insert(
+                parent, segment, kv_slice, None, recur, is_system_prompt=is_sys
+            )
+
+        response_tokens = list(segments[-1].token_ids) + list(request.output_token_ids)
+        resp_state = cache if (cache and isinstance(cache[0], dict)) else None
+        resp_kv, resp_recur = (
+            self._inner._split_cache_arrays(resp_state, parent.n_tokens)
+            if resp_state is not None else ([], None)
+        )
+        self._inner.insert(
+            parent,
+            Segment(role="conversation", token_ids=response_tokens),
+            resp_kv, None, resp_recur,
+        )
+        return True
 
     def release(self, handle) -> None:
         if handle is not None:
