@@ -51,12 +51,13 @@ from unittest.mock import MagicMock, call, patch
 def _make_turn_cache_request(
     prompt_token_ids, output_token_ids, turn_boundaries, boundary_states=None, path=None
 ):
+    from vllm_mlx.kv_cache import RequestCacheState
     req = MagicMock()
     req.prompt_token_ids = prompt_token_ids
     req.output_token_ids = output_token_ids
     req._turn_boundaries = turn_boundaries
     req._boundary_states = boundary_states or {}
-    req._turn_cache_path = path or []
+    req._cache_state = RequestCacheState(adapter_state=path or [])
     return req
 
 
@@ -128,11 +129,10 @@ def test_memory_cache_adapter_on_prefill_checkpoint_stores_prefix():
 
     adapter = MemoryCacheAdapter(inner)
 
+    from vllm_mlx.kv_cache import RequestCacheState
     request = MagicMock()
     request.prompt_token_ids = list(range(10))
-    request.cached_tokens = 0
-    request._mid_prefill_last_save = 0
-    request._mid_prefill_cache_key = None
+    request._cache_state = RequestCacheState(cached_tokens=0, mid_prefill_last_save=0, mid_prefill_cache_key=None)
 
     extracted = [{"state": (None, None), "class_name": "KVCache", "class_ref": None}]
     fake_reconstructed = [MagicMock()]
@@ -148,11 +148,12 @@ def test_memory_cache_adapter_on_prefill_checkpoint_stores_prefix():
 
 def test_turn_cache_adapter_on_prefill_checkpoint_captures_boundary_state():
     """TurnCacheAdapter must record boundary state at boundary-1 positions."""
+    from vllm_mlx.kv_cache import RequestCacheState
     inner = MagicMock()
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
-    request.cached_tokens = 0
+    request._cache_state = RequestCacheState(cached_tokens=0)
     request._turn_boundaries = [5]   # boundary at 5
     request._boundary_states = {}
 
@@ -166,11 +167,12 @@ def test_turn_cache_adapter_on_prefill_checkpoint_captures_boundary_state():
 
 
 def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
+    from vllm_mlx.kv_cache import RequestCacheState
     inner = MagicMock()
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
-    request.cached_tokens = 0
+    request._cache_state = RequestCacheState(cached_tokens=0)
     request._turn_boundaries = [5]
     request._boundary_states = {}
 
@@ -244,3 +246,15 @@ def test_compose_n_minus_1_cache_replaces_recurrent_with_snapshot():
     )
     assert composed[0]["class_name"] == "KVCache"
     assert composed[1]["state"] == "SNAPSHOT"   # replaced with N-1 snapshot
+
+
+def test_request_cache_state_is_single_attribute():
+    """After wiring, all cache state lives at request._cache_state."""
+    from vllm_mlx.kv_cache import RequestCacheState
+    cs = RequestCacheState(hit_type="hit", cached_tokens=42)
+    class FakeRequest:
+        pass
+    req = FakeRequest()
+    req._cache_state = cs
+    assert req._cache_state.hit_type == "hit"
+    assert req._cache_state.cached_tokens == 42

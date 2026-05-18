@@ -30,7 +30,8 @@ class MemoryCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        _st = getattr(request, "store_tokens", None)
+        cs = getattr(request, "_cache_state", None)
+        _st = (cs.store_tokens if cs is not None else None)
         tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
         # Memory cache requires live KV objects; reconstruct from dict form if needed
         if cache and isinstance(cache[0], dict):
@@ -54,8 +55,9 @@ class MemoryCacheAdapter:
     ) -> None:
         from .turn_prefix_cache import reconstruct_cache_from_states
 
-        total_cached = (getattr(request, "cached_tokens", 0) or 0) + processed_tokens
-        last_save = getattr(request, "_mid_prefill_last_save", 0)
+        cs = getattr(request, "_cache_state", None)
+        total_cached = ((cs.cached_tokens if cs is not None else None) or 0) + processed_tokens
+        last_save = (cs.mid_prefill_last_save if cs is not None else 0)
 
         interval = self._save_interval
         if interval > 0 and total_cached - last_save < interval:
@@ -66,13 +68,14 @@ class MemoryCacheAdapter:
             return
 
         prefix_tokens = list((request.prompt_token_ids or [])[:total_cached])
-        old_key = getattr(request, "_mid_prefill_cache_key", None)
+        old_key = (cs.mid_prefill_cache_key if cs is not None else None)
         if old_key is not None:
             self._inner.remove(list(old_key))
 
         if self._inner.store(prefix_tokens, reconstructed):
-            request._mid_prefill_last_save = total_cached
-            request._mid_prefill_cache_key = tuple(prefix_tokens)
+            if cs is not None:
+                cs.mid_prefill_last_save = total_cached
+                cs.mid_prefill_cache_key = tuple(prefix_tokens)
 
     # PersistableCache extension
     def save(self, cache_dir: str) -> bool:
@@ -134,7 +137,11 @@ class TurnCacheAdapter:
             return None
 
         # Store path on request so _cleanup_finished can access it for the store step
-        request._turn_cache_path = path
+        cs = getattr(request, "_cache_state", None)
+        if cs is not None:
+            cs.adapter_state = path
+        else:
+            request._turn_cache_path = path
 
         ancestor = self._inner.find_checkpoint_ancestor(path)
         if ancestor is None:
@@ -165,7 +172,8 @@ class TurnCacheAdapter:
         if not segments or not getattr(request, "output_token_ids", None):
             return False
 
-        path = getattr(request, "_turn_cache_path", None) or []
+        cs = getattr(request, "_cache_state", None)
+        path = (cs.adapter_state if cs is not None else None) or getattr(request, "_turn_cache_path", None) or []
         matched_depth = len(path)
         parent = path[-1] if path else self._inner.root
         new_segments = segments[matched_depth:]
@@ -220,7 +228,8 @@ class TurnCacheAdapter:
     def on_prefill_checkpoint(
         self, request, processed_tokens: int, extracted_cache: list
     ) -> None:
-        total_cached = (getattr(request, "cached_tokens", 0) or 0) + processed_tokens
+        cs = getattr(request, "_cache_state", None)
+        total_cached = ((cs.cached_tokens if cs is not None else None) or 0) + processed_tokens
         _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
 
         # Split-chunk convention: checkpoint fires at B-1, boundary key is B.
@@ -270,7 +279,8 @@ class PagedCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        _st = getattr(request, "store_tokens", None)
+        cs = getattr(request, "_cache_state", None)
+        _st = (cs.store_tokens if cs is not None else None)
         tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
         self._inner.store_cache(request.request_id, tokens, cache)
         return True
@@ -318,7 +328,8 @@ class LegacyCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        _st = getattr(request, "store_tokens", None)
+        cs = getattr(request, "_cache_state", None)
+        _st = (cs.store_tokens if cs is not None else None)
         tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
         self._inner.store_cache(tokens, cache)
         return True

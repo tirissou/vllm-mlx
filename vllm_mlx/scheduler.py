@@ -32,6 +32,7 @@ from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .kv_cache import RequestCacheState
 from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
 from .patches.mlx_lm_quantized_sdpa import patch_quantized_sdpa
@@ -1833,6 +1834,9 @@ class Scheduler:
         # to avoid MLX stream/thread mismatches (lazy ops must stay on the
         # thread that will evaluate them).
 
+        # Initialise consolidated cache state
+        request._cache_state = RequestCacheState()
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
@@ -1915,12 +1919,12 @@ class Scheduler:
         if request is not None:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
             # Release cache references so Metal buffers can be freed
-            request.prompt_cache = None
-            request._extracted_cache = None
-            turn_path = getattr(request, "_turn_cache_path", None)
+            request._cache_state.cache = None
+            request._cache_state.decoded_cache = None
+            turn_path = getattr(request._cache_state, "adapter_state", None)
             if turn_path and self.turn_cache is not None:
                 self.turn_cache.release(turn_path)
-                request._turn_cache_path = []
+                request._cache_state.adapter_state = []
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -1955,24 +1959,24 @@ class Scheduler:
         stream that will later evaluate them inside BatchGenerator.
         """
         if self._prefix_cache is None:
-            request.cache_hit_type = "miss"
-            request.remaining_tokens = request.prompt_token_ids
+            request._cache_state.hit_type = "miss"
+            request._cache_state.remaining_tokens = request.prompt_token_ids
             return
 
         hit = self._prefix_cache.fetch(request)
         if hit is not None:
-            request.cache_hit_type = hit.hit_type
-            request.prompt_cache = hit.cache
-            request.cached_tokens = hit.cached_tokens
-            request.remaining_tokens = hit.remaining_tokens
+            request._cache_state.hit_type = hit.hit_type
+            request._cache_state.cache = hit.cache
+            request._cache_state.cached_tokens = hit.cached_tokens
+            request._cache_state.remaining_tokens = hit.remaining_tokens
             self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
             logger.info(
                 f"[cache_fetch] request={request.request_id[:12]} HIT "
-                f"cached={request.cached_tokens} remaining={len(hit.remaining_tokens)}"
+                f"cached={request._cache_state.cached_tokens} remaining={len(hit.remaining_tokens)}"
             )
         else:
-            request.cache_hit_type = "miss"
-            request.remaining_tokens = request.prompt_token_ids
+            request._cache_state.hit_type = "miss"
+            request._cache_state.remaining_tokens = request.prompt_token_ids
             self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
             logger.info(
                 f"[cache_fetch] request={request.request_id[:12]} MISS "
@@ -1982,8 +1986,8 @@ class Scheduler:
             if self._ssd_tier is not None and self.memory_aware_cache is not None:
                 ssd_candidate = self.memory_aware_cache.check_ssd(request.prompt_token_ids)
                 if ssd_candidate is not None:
-                    request.cache_hit_type = "ssd_pending"
-                    request._ssd_candidate = ssd_candidate
+                    request._cache_state.hit_type = "ssd_pending"
+                    request._cache_state.ssd_candidate = ssd_candidate
 
     def _try_promote_ssd_for_request(self, request: Request) -> None:
         """Attempt synchronous SSD promotion for a single request tagged ssd_pending.
@@ -1991,19 +1995,19 @@ class Scheduler:
         Called from _schedule_waiting() after _fetch_cache_for_request() detects
         an SSD candidate. Sets request.prompt_cache and remaining_tokens on success.
         """
-        candidate = getattr(request, "_ssd_candidate", None)
+        candidate = request._cache_state.ssd_candidate
         if candidate is None:
             return
 
         memory_bytes = candidate["memory_bytes"]
 
         if self.memory_aware_cache is None:
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             return
 
         if not self.memory_aware_cache.try_reserve_memory(memory_bytes):
             self._ssd_tier._stats.promotion_failures += 1
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             logger.info(
                 f"[ssd_promote] request={request.request_id[:12]} "
                 f"budget denied ({memory_bytes} bytes)"
@@ -2020,7 +2024,7 @@ class Scheduler:
         except Exception:
             self.memory_aware_cache.release_reserved_memory(memory_bytes)
             self._ssd_tier._stats.promotion_failures += 1
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             logger.exception(
                 f"[ssd_promote] request={request.request_id[:12]} disk read failed"
             )
@@ -2029,24 +2033,24 @@ class Scheduler:
         if cache_layers is None:
             self.memory_aware_cache.release_reserved_memory(memory_bytes)
             self._ssd_tier._stats.promotion_failures += 1
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             return
 
         self.memory_aware_cache.release_reserved_memory(memory_bytes)
 
         reconstructed = self._reconstruct_ssd_layers(cache_layers)
         if reconstructed is None:
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             return
 
         self.memory_aware_cache.store(
             list(matched_tokens), reconstructed, evict_prefixes=False
         )
 
-        request.prompt_cache = reconstructed
-        request.cached_tokens = matched_count
-        request.remaining_tokens = request.prompt_token_ids[matched_count:]
-        request.cache_hit_type = "ssd_hit"
+        request._cache_state.cache = reconstructed
+        request._cache_state.cached_tokens = matched_count
+        request._cache_state.remaining_tokens = request.prompt_token_ids[matched_count:]
+        request._cache_state.hit_type = "ssd_hit"
 
         self._ssd_tier._stats.ssd_hits += 1
         self._ssd_tier._index.touch(matched_tokens)
@@ -2055,7 +2059,7 @@ class Scheduler:
             f"[ssd_promote] request={request.request_id[:12]} "
             f"{candidate.get('match_type', 'exact')} promote: "
             f"{matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
-            f"{len(request.remaining_tokens)} remaining"
+            f"{len(request._cache_state.remaining_tokens)} remaining"
         )
 
     def _schedule_waiting(self) -> List[Request]:
@@ -2073,9 +2077,9 @@ class Scheduler:
 
             # Fetch cache on the worker thread so all MLX ops (dequantize,
             # reconstruct) are enqueued on the correct stream.
-            if request.remaining_tokens is None:
+            if request._cache_state.remaining_tokens is None:
                 self._fetch_cache_for_request(request)
-                if getattr(request, "cache_hit_type", None) == "ssd_pending":
+                if request._cache_state.hit_type == "ssd_pending":
                     self._try_promote_ssd_for_request(request)
 
             # Ensure we have a batch generator
@@ -2087,11 +2091,11 @@ class Scheduler:
                 break
 
             # Determine tokens to process and cache to use
-            if request.remaining_tokens:
-                tokens_to_process = request.remaining_tokens
+            if request._cache_state.remaining_tokens:
+                tokens_to_process = request._cache_state.remaining_tokens
             else:
                 tokens_to_process = request.prompt_token_ids
-            cache_to_use = request.prompt_cache  # May be None
+            cache_to_use = request._cache_state.cache  # May be None
 
             # Create bounded cache when max_kv_size is configured and no cache exists
             if cache_to_use is None and self.config.max_kv_size > 0:
@@ -2108,9 +2112,9 @@ class Scheduler:
                     f"proceeding without cache"
                 )
                 cache_to_use = None
-                request.prompt_cache = None
-                request.cached_tokens = 0
-                request.remaining_tokens = request.prompt_token_ids
+                request._cache_state.cache = None
+                request._cache_state.cached_tokens = 0
+                request._cache_state.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
             # Build per-request logits_processors from repetition_penalty and
@@ -2158,9 +2162,9 @@ class Scheduler:
                         f"cache insert failed ({e}), retrying without cache"
                     )
                     cache_to_use = None
-                    request.prompt_cache = None
-                    request.cached_tokens = 0
-                    request.remaining_tokens = request.prompt_token_ids
+                    request._cache_state.cache = None
+                    request._cache_state.cached_tokens = 0
+                    request._cache_state.remaining_tokens = request.prompt_token_ids
                     tokens_to_process = request.prompt_token_ids
                     insert_kwargs["caches"] = None
                     uids = self.batch_generator.insert(
@@ -2181,14 +2185,14 @@ class Scheduler:
                 # freeing the Metal buffers until the request object is GC'd,
                 # which under sustained traffic can accumulate hundreds of GB
                 # of wired memory (issue #442).
-                request.prompt_cache = None
+                request._cache_state.cache = None
                 self.running[request.request_id] = request
                 scheduled.append(request)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = (
-                    f", {request.cached_tokens} cached"
-                    if request.cached_tokens > 0
+                    f", {request._cache_state.cached_tokens} cached"
+                    if request._cache_state.cached_tokens > 0
                     else ""
                 )
                 tokens_to_prefill = len(tokens_to_process)
@@ -2294,7 +2298,7 @@ class Scheduler:
                             if self.block_aware_cache is not None:
                                 extracted_cache = self._extract_cache_states(raw_cache)
                                 if extracted_cache:
-                                    request._extracted_cache = extracted_cache
+                                    request._cache_state.decoded_cache = extracted_cache
                                     logger.info(
                                         f"[paged_cache] request={request_id[:12]} "
                                         f"EXTRACTED {len(extracted_cache)} layers "
@@ -2308,7 +2312,7 @@ class Scheduler:
                                     )
                             else:
                                 # Standard cache stores object references
-                                request._extracted_cache = raw_cache
+                                request._cache_state.decoded_cache = raw_cache
                         else:
                             if self.block_aware_cache is not None:
                                 logger.info(
@@ -2320,23 +2324,23 @@ class Scheduler:
 
                     # Normalize to dict form if raw objects were assigned
                     if (
-                        request._extracted_cache
-                        and not isinstance(request._extracted_cache[0], dict)
+                        request._cache_state.decoded_cache
+                        and not isinstance(request._cache_state.decoded_cache[0], dict)
                     ):
-                        request._extracted_cache = self._extract_cache_states(
-                            request._extracted_cache
+                        request._cache_state.decoded_cache = self._extract_cache_states(
+                            request._cache_state.decoded_cache
                         )
 
                     # Compose N-1 cache (trim KV by 1, replace recurrent with snapshot)
-                    if request._extracted_cache:
-                        _prev_recur = getattr(request, "_prev_recurrent", [])
-                        request._extracted_cache = _compose_n_minus_1_cache(
-                            request._extracted_cache, _prev_recur
+                    if request._cache_state.decoded_cache:
+                        _prev_recur = request._cache_state.prev_recurrent or []
+                        request._cache_state.decoded_cache = _compose_n_minus_1_cache(
+                            request._cache_state.decoded_cache, _prev_recur
                         )
                         _full_tokens = (
                             list(request.prompt_token_ids) + list(request.output_token_ids)
                         )
-                        request.store_tokens = _full_tokens[:-1]  # N-1 key
+                        request._cache_state.store_tokens = _full_tokens[:-1]  # N-1 key
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
@@ -2357,33 +2361,32 @@ class Scheduler:
 
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids and self._prefix_cache is not None:
-                _store_cache = getattr(request, "_extracted_cache", None)
+                _store_cache = request._cache_state.decoded_cache
                 if _store_cache is not None:
                     # Preserve N-1 key set by _process_batch_responses; fall back to full N
-                    if not getattr(request, "store_tokens", None):
-                        request.store_tokens = (
+                    if not request._cache_state.store_tokens:
+                        request._cache_state.store_tokens = (
                             list(request.prompt_token_ids) + list(request.output_token_ids)
                         )
                     try:
                         self._prefix_cache.store(request, _store_cache)
                     except Exception as e:
                         logger.debug(f"[cache_store] store failed for {request_id}: {e}")
-                _handle = getattr(request, "_turn_cache_path", None)
+                _handle = request._cache_state.adapter_state
                 try:
                     self._prefix_cache.release(_handle)
                 except Exception as e:
                     logger.debug(f"[cache_store] release failed for {request_id}: {e}")
-                request._turn_cache_path = []
+                request._cache_state.adapter_state = []
 
             # Evaluate stored cache tensors incrementally (per-layer) to prevent
             # a deferred batch evaluation spike when all lazy ops resolve at once.
             # This spreads the VRAM cost across smaller per-layer evaluations.
             if (
                 request is not None
-                and hasattr(request, "_extracted_cache")
-                and request._extracted_cache
+                and request._cache_state.decoded_cache
             ):
-                for layer in request._extracted_cache:
+                for layer in request._cache_state.decoded_cache:
                     if isinstance(layer, dict) and "state" in layer:
                         keys, values = layer["state"]
                         mx.eval(keys, values)
@@ -2413,8 +2416,8 @@ class Scheduler:
             # keeping a second reference here pins the buffers in wired memory
             # until the request object is GC'd (issue #442).
             if request is not None:
-                request.prompt_cache = None
-                request._extracted_cache = None
+                request._cache_state.cache = None
+                request._cache_state.decoded_cache = None
                 request._sys_prompt_state = None
                 request._conv_end_state = None
                 request._turn_boundary_states = {}
@@ -2509,9 +2512,9 @@ class Scheduler:
             # Reset request state
             request.status = RequestStatus.WAITING
             request.batch_uid = None
-            request.prompt_cache = None
-            request.cached_tokens = 0
-            request.remaining_tokens = request.prompt_token_ids
+            request._cache_state.cache = None
+            request._cache_state.cached_tokens = 0
+            request._cache_state.remaining_tokens = request.prompt_token_ids
 
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
@@ -2562,7 +2565,7 @@ class Scheduler:
                                 _live_cache = _ab.extract_cache(_e)
                                 if _live_cache:
                                     _req_recur = _extract_recurrent_state(_live_cache)
-                                    _req._prev_recurrent = (
+                                    _req._cache_state.prev_recurrent = (
                                         self._extract_cache_states(_req_recur)
                                         if _req_recur else []
                                     )
@@ -2918,10 +2921,10 @@ class Scheduler:
         Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
         """
         for request in self.waiting:
-            if getattr(request, "cache_hit_type", None) != "ssd_pending":
+            if request._cache_state.hit_type != "ssd_pending":
                 continue
 
-            candidate = getattr(request, "_ssd_candidate", None)
+            candidate = request._cache_state.ssd_candidate
             if candidate is None:
                 continue
 
@@ -2929,12 +2932,12 @@ class Scheduler:
 
             # Check RAM budget availability
             if self.memory_aware_cache is None:
-                request.cache_hit_type = "miss"
+                request._cache_state.hit_type = "miss"
                 continue
 
             if not self.memory_aware_cache.try_reserve_memory(memory_bytes):
                 self._ssd_tier._stats.promotion_failures += 1
-                request.cache_hit_type = "miss"
+                request._cache_state.hit_type = "miss"
                 logger.info(
                     f"[ssd_promote] request={request.request_id[:12]} "
                     f"budget denied ({memory_bytes} bytes)"
@@ -2953,7 +2956,7 @@ class Scheduler:
             except Exception:
                 self.memory_aware_cache.release_reserved_memory(memory_bytes)
                 self._ssd_tier._stats.promotion_failures += 1
-                request.cache_hit_type = "miss"
+                request._cache_state.hit_type = "miss"
                 logger.exception(
                     f"[ssd_promote] request={request.request_id[:12]} "
                     f"disk read failed"
@@ -2963,7 +2966,7 @@ class Scheduler:
             if cache_layers is None:
                 self.memory_aware_cache.release_reserved_memory(memory_bytes)
                 self._ssd_tier._stats.promotion_failures += 1
-                request.cache_hit_type = "miss"
+                request._cache_state.hit_type = "miss"
                 continue
 
             # Release tentative budget (store() will account properly)
@@ -2972,17 +2975,17 @@ class Scheduler:
             # Reconstruct and store under the matched prefix tokens
             reconstructed = self._reconstruct_ssd_layers(cache_layers)
             if reconstructed is None:
-                request.cache_hit_type = "miss"
+                request._cache_state.hit_type = "miss"
                 continue
 
             self.memory_aware_cache.store(
                 list(matched_tokens), reconstructed, evict_prefixes=False
             )
 
-            request.prompt_cache = reconstructed
-            request.cached_tokens = matched_count
-            request.remaining_tokens = request.prompt_token_ids[matched_count:]
-            request.cache_hit_type = "ssd_hit"
+            request._cache_state.cache = reconstructed
+            request._cache_state.cached_tokens = matched_count
+            request._cache_state.remaining_tokens = request.prompt_token_ids[matched_count:]
+            request._cache_state.hit_type = "ssd_hit"
 
             self._ssd_tier._stats.ssd_hits += 1
             self._ssd_tier._index.touch(matched_tokens)
@@ -2990,7 +2993,7 @@ class Scheduler:
             logger.info(
                 f"[ssd_promote] request={request.request_id[:12]} "
                 f"{candidate['match_type']} promote: {matched_count}/{len(request.prompt_token_ids)} tokens from SSD, "
-                f"{len(request.remaining_tokens)} remaining"
+                f"{len(request._cache_state.remaining_tokens)} remaining"
             )
 
     async def promote_from_ssd(self, request) -> bool:
@@ -3004,7 +3007,7 @@ class Scheduler:
         if self._ssd_tier is None:
             return False
 
-        candidate = getattr(request, "_ssd_candidate", None)
+        candidate = request._cache_state.ssd_candidate
         if candidate is None:
             return False
 
@@ -3028,7 +3031,7 @@ class Scheduler:
         )
 
         if cache_layers is None:
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             return False
 
         # Release tentative budget — store() will account properly
@@ -3037,7 +3040,7 @@ class Scheduler:
         # Reconstruct cache objects from deserialized layer dicts
         reconstructed = self._reconstruct_ssd_layers(cache_layers)
         if reconstructed is None:
-            request.cache_hit_type = "miss"
+            request._cache_state.hit_type = "miss"
             return False
 
         # Store in RAM cache — the worker thread will fetch it via the normal
@@ -3048,8 +3051,8 @@ class Scheduler:
         )
 
         # Clear the SSD candidate so the worker thread doesn't re-promote.
-        request._ssd_candidate = None
-        request.cache_hit_type = "miss"
+        request._cache_state.ssd_candidate = None
+        request._cache_state.hit_type = "miss"
 
         remaining_count = len(request.prompt_token_ids) - matched_count
         logger.info(
