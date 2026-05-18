@@ -490,8 +490,10 @@ def _install_chunked_prefill(
                     _total_pos = _cached0 + partial["processed"]
                     _next_b = next((b for b in sorted(_turn_bds) if b > _total_pos), None)
                     if _next_b is not None:
-                        _dist = _next_b - _total_pos
-                        if _dist <= budget:
+                        # Stop one token before the boundary so on_prefill_checkpoint
+                        # fires at total_cached = B-1, keying _boundary_states[B].
+                        _dist = (_next_b - 1) - _total_pos
+                        if 0 < _dist <= budget:
                             n_to_process = min(_dist, remaining - prompt_checkpoint)
 
             if n_to_process > 0:
