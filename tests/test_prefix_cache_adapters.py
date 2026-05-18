@@ -176,3 +176,71 @@ def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
 
     adapter.on_prefill_checkpoint(request, 3, [])  # total=3, boundary=5 → 3+1=4 ≠ 5
     assert request._boundary_states == {}
+
+
+import mlx.core as mx
+
+
+def _make_kv_cache():
+    from mlx_lm.models.cache import KVCache
+    c = KVCache()
+    c.keys = mx.zeros((1, 8, 4, 64))
+    c.values = mx.zeros((1, 8, 4, 64))
+    c.offset = 4
+    return c
+
+
+def _make_recurrent_layer():
+    """A fake recurrent cache layer (no .offset or .keys attributes)."""
+    class FakeRecurrent:
+        pass
+    return FakeRecurrent()
+
+
+def test_extract_recurrent_state_returns_only_non_kv_layers():
+    from vllm_mlx.scheduler import _extract_recurrent_state
+    kv = _make_kv_cache()
+    recur = _make_recurrent_layer()
+    result = _extract_recurrent_state([kv, recur, kv])
+    assert len(result) == 1
+    assert result[0] is recur
+
+
+def test_extract_recurrent_state_empty_for_pure_kv():
+    from vllm_mlx.scheduler import _extract_recurrent_state
+    result = _extract_recurrent_state([_make_kv_cache(), _make_kv_cache()])
+    assert result == []
+
+
+def test_compose_n_minus_1_cache_trims_kv_offset():
+    from vllm_mlx.scheduler import _compose_n_minus_1_cache
+
+    kv_dict = {
+        "state": (mx.zeros((1, 8, 4, 64)), mx.zeros((1, 8, 4, 64))),
+        "meta_state": (4,),
+        "class_name": "KVCache",
+        "class_ref": None,
+    }
+    composed = _compose_n_minus_1_cache([kv_dict], prev_recurrent_extracted=[])
+    # offset should be reduced from 4 to 3
+    assert composed[0]["meta_state"][0] == 3
+
+
+def test_compose_n_minus_1_cache_replaces_recurrent_with_snapshot():
+    from vllm_mlx.scheduler import _compose_n_minus_1_cache
+
+    kv_dict = {
+        "state": (mx.zeros((1, 8, 4, 64)), mx.zeros((1, 8, 4, 64))),
+        "meta_state": (4,),
+        "class_name": "KVCache",
+        "class_ref": None,
+    }
+    snapshot_recur = {"state": "SNAPSHOT", "class_name": "MambaCache", "class_ref": None}
+    current_recur = {"state": "CURRENT", "class_name": "MambaCache", "class_ref": None}
+
+    composed = _compose_n_minus_1_cache(
+        [kv_dict, current_recur],
+        prev_recurrent_extracted=[snapshot_recur],
+    )
+    assert composed[0]["class_name"] == "KVCache"
+    assert composed[1]["state"] == "SNAPSHOT"   # replaced with N-1 snapshot

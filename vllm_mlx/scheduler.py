@@ -56,6 +56,68 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
+def _extract_recurrent_state(cache: list) -> list:
+    """Return only the non-KV layers from a live cache list.
+
+    KV layers have an `offset` attribute and a `keys` attribute.
+    Recurrent layers (Mamba, DeltaRNN) have neither.
+    """
+    from mlx_lm.models.cache import KVCache, BatchKVCache, RotatingKVCache
+    try:
+        from .batch_quantized_kv_cache import BatchQuantizedKVCache as _QuantizedCacheWrapper
+        kv_types = (KVCache, BatchKVCache, RotatingKVCache, _QuantizedCacheWrapper)
+    except ImportError:
+        kv_types = (KVCache, BatchKVCache, RotatingKVCache)
+    return [layer for layer in cache if not isinstance(layer, kv_types)]
+
+
+def _is_kv_extracted(layer: dict) -> bool:
+    """True if an extracted state dict represents a KV (not recurrent) layer."""
+    name = layer.get("class_name", "")
+    return "KV" in name or "Quantized" in name or name == "RotatingKVCache"
+
+
+def _compose_n_minus_1_cache(
+    decoded_cache: list, prev_recurrent_extracted: list
+) -> list:
+    """Build the N-1 cache from extracted state dicts.
+
+    KV layers: offset (meta_state[0]) trimmed by 1.
+    Recurrent layers: replaced with prev_recurrent_extracted snapshot.
+
+    decoded_cache: extracted state dicts at offset N (from _extract_cache_states).
+    prev_recurrent_extracted: extracted recurrent-only state dicts at offset N-1.
+    """
+    if not decoded_cache:
+        return []
+
+    # Trim KV offsets by 1 and replace recurrent with snapshot
+    result = []
+    recurrent_idx = 0
+    for layer in decoded_cache:
+        if not isinstance(layer, dict):
+            result.append(layer)
+            continue
+
+        if _is_kv_extracted(layer):
+            # Trim offset by 1 for KV layers (meta_state is a tuple)
+            meta = layer.get("meta_state")
+            if meta and len(meta) > 0:
+                new_meta = (max(0, meta[0] - 1),) + meta[1:]
+                result.append({**layer, "meta_state": new_meta})
+            else:
+                result.append(layer)
+        else:
+            # Recurrent layer: replace with N-1 snapshot if available
+            if recurrent_idx < len(prev_recurrent_extracted):
+                result.append(prev_recurrent_extracted[recurrent_idx])
+                recurrent_idx += 1
+            else:
+                result.append(layer)
+
+    return result
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -2374,6 +2436,26 @@ class Scheduler:
                     except Exception as e:
                         logger.warning(f"[paged_cache] request={request_id[:12]} extract exception: {e}")
 
+                    # Normalize to dict form if raw objects were assigned
+                    if (
+                        request._extracted_cache
+                        and not isinstance(request._extracted_cache[0], dict)
+                    ):
+                        request._extracted_cache = self._extract_cache_states(
+                            request._extracted_cache
+                        )
+
+                    # Compose N-1 cache (trim KV by 1, replace recurrent with snapshot)
+                    if request._extracted_cache:
+                        _prev_recur = getattr(request, "_prev_recurrent", [])
+                        request._extracted_cache = _compose_n_minus_1_cache(
+                            request._extracted_cache, _prev_recur
+                        )
+                        _full_tokens = (
+                            list(request.prompt_token_ids) + list(request.output_token_ids)
+                        )
+                        request.store_tokens = _full_tokens[:-1]  # N-1 key
+
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
 
@@ -2587,6 +2669,20 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
+                    # Snapshot recurrent state before this decode step (gives N-1 snapshot).
+                    _ab = getattr(self.batch_generator, "active_batch", None)
+                    if _ab is not None:
+                        for _e, _uid in enumerate(_ab.uids):
+                            _rid = self.uid_to_request_id.get(_uid)
+                            _req = self.running.get(_rid) if _rid else None
+                            if _req is not None:
+                                _live_cache = _ab.extract_cache(_e)
+                                if _live_cache:
+                                    _req_recur = _extract_recurrent_state(_live_cache)
+                                    _req._prev_recurrent = (
+                                        self._extract_cache_states(_req_recur)
+                                        if _req_recur else []
+                                    )
                     result = self.batch_generator.next()
                     output.has_work = True
 
