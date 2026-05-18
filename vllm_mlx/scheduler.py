@@ -225,38 +225,11 @@ class SchedulerOutput:
     has_work: bool = False
 
 
-def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -> None:
-    """Monkey-patch ``_process_prompts`` to capture prompt-only cache state.
-
-    Can be installed independently of chunked prefill.  If chunked prefill is
-    also installed, *it* takes over ``_process_prompts`` and invokes the
-    callback itself, so call this **before** ``_install_chunked_prefill``.
-    """
-    _orig_process_prompts = batch_gen._process_prompts
-
-    try:
-        from mlx_lm.generate import Batch as _batch_cls
-    except ImportError:
-        _batch_cls = None  # extract_cache fallback handled in patched fn
-
-    def _patched_process_prompts(prompts, _self=batch_gen):
-        batch = _orig_process_prompts(prompts)
-        for e, uid in enumerate(batch.uids):
-            if batch.num_tokens[e] == 0:
-                try:
-                    prompt_cache_save(uid, batch.extract_cache(e))
-                except Exception:
-                    pass
-        return batch
-
-    batch_gen._process_prompts = _patched_process_prompts
-
 
 def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
     mid_prefill_save=None,
-    prompt_cache_save=None,
     pending_abort_ids: Optional[Set[str]] = None,
     uid_to_request_id: Optional[Dict[int, str]] = None,
     requests: Optional[Dict[str, Any]] = None,
@@ -355,30 +328,16 @@ def _install_chunked_prefill(
     # Partial prefill state (None when no prefill in progress)
     batch_gen._partial = None
 
-    # Monkey-patch _process_prompts to capture prompt-only cache state.
-    # At the point where _process_prompts returns, the Batch cache contains
-    # the exact prompt-only state: all prompt tokens have been processed
-    # through the model, but no output token has been fed back yet.
-    # This is the only safe capture point for hybrid Mamba+Transformer
-    # models whose MambaCache state is cumulative.
-    if prompt_cache_save is not None or kv_quant:
+    # Monkey-patch _process_prompts to ensure caches are quantized so they
+    # are compatible with BatchQuantizedKVCache objects created in the
+    # chunked-prefill path. Without this, BatchKVCache (from
+    # _orig_process_prompts) and BatchQuantizedKVCache end up in the same
+    # active_batch and BatchKVCache.extend(BatchQuantizedKVCache) crashes.
+    if kv_quant:
 
         def _patched_process_prompts(prompts, _self=batch_gen):
             batch = _orig_process_prompts(prompts)
-            # Ensure caches are quantized so they are compatible with
-            # BatchQuantizedKVCache objects created in the chunked-prefill
-            # path. Without this, BatchKVCache (from _orig_process_prompts)
-            # and BatchQuantizedKVCache end up in the same active_batch and
-            # BatchKVCache.extend(BatchQuantizedKVCache) crashes.
-            if kv_quant:
-                _quantize_batch_kv_cache(batch.cache)
-            if prompt_cache_save is not None:
-                for e, uid in enumerate(batch.uids):
-                    if batch.num_tokens[e] == 0:
-                        try:
-                            prompt_cache_save(uid, batch.extract_cache(e))
-                        except Exception:
-                            pass
+            _quantize_batch_kv_cache(batch.cache)
             return batch
 
         batch_gen._process_prompts = _patched_process_prompts
@@ -588,17 +547,6 @@ def _install_chunked_prefill(
                     list(partial["logits_processors"]),
                     partial["tokens"],
                 )
-
-                # Save prompt-only cache BEFORE merging into active batch.
-                # This is the chunked-prefill equivalent of the
-                # _patched_process_prompts hook — at this point the cache
-                # contains the exact prompt-only state (num_tokens == 0).
-                if prompt_cache_save is not None and len(partial["uids"]) == 1:
-                    uid = partial["uids"][0]
-                    try:
-                        prompt_cache_save(uid, new_batch.extract_cache(0))
-                    except Exception:
-                        pass
 
                 if self.active_batch is None:
                     self.active_batch = new_batch
@@ -1560,10 +1508,6 @@ class Scheduler:
             bg, "active_batch"
         )
 
-        prompt_cache_cb = None
-        if self.memory_aware_cache is not None:
-            prompt_cache_cb = self._make_prompt_cache_save_callback()
-
         if need_chunked and chunked_compatible:
             # Full chunked prefill with mid-prefill saves and prompt cache
             # save wired through the chunked next() and _process_prompts
@@ -1577,7 +1521,6 @@ class Scheduler:
                 bg,
                 chunked_budget,
                 mid_prefill_cb,
-                prompt_cache_save=prompt_cache_cb,
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
                 requests=self.requests,
@@ -1591,14 +1534,6 @@ class Scheduler:
                 "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
                 "check compatibility."
             )
-
-        # When chunked prefill is off but memory_aware_cache is active,
-        # install the lightweight _process_prompts hook so prompt-only
-        # cache entries are still captured.  This is the only safe capture
-        # point for hybrid Mamba+Transformer models (#178).
-        if not need_chunked and prompt_cache_cb is not None:
-            if hasattr(bg, "_process_prompts"):
-                _install_prompt_cache_save(bg, prompt_cache_cb)
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
@@ -1616,52 +1551,6 @@ class Scheduler:
                 )
 
         return bg
-
-    def _make_prompt_cache_save_callback(self):
-        """Create a callback that stores prompt-only KV/Mamba cache.
-
-        Called from ``_generation_step`` right before the first output token
-        is fed into the model.  At that point ``num_tokens == 0`` and the
-        batch cache contains the exact prompt-only state (correct for both
-        KVCache and MambaCache/ArraysCache layers).
-
-        The cache is stored with key = prompt_token_ids so that a future
-        request with the identical prompt gets an exact hit.
-        """
-        import time as _time
-
-        def _prompt_cache_save(uid, extracted_cache):
-            request_id = self.uid_to_request_id.get(uid)
-            if not request_id:
-                return
-            request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
-                return
-
-            prompt_tokens = list(request.prompt_token_ids)
-            # Trim cache by 1 so the stored KV has offset = N-1.
-            # On exact fetch the scheduler sends the last prompt token
-            # for reprocessing (lines 1872-1877).  Without this trim
-            # the last token would be placed at position N instead of N-1.
-            from .memory_cache import _trim_cache_offset
-
-            trimmed_cache = _trim_cache_offset(extracted_cache, 1)
-            _t0 = _time.monotonic()
-            # evict_prefixes=False: keep mid-prefill boundary entries so
-            # that future requests with the same prefix but different
-            # suffix get a prefix cache hit (critical for agentic multi-turn).
-            stored = self.memory_aware_cache.store(
-                prompt_tokens, trimmed_cache, evict_prefixes=False
-            )
-            _dt = _time.monotonic() - _t0
-            if stored:
-                logger.info(
-                    f"[prompt_cache_save] request={request_id[:12]} "
-                    f"prompt_tokens={len(prompt_tokens)} "
-                    f"store_time={_dt:.3f}s"
-                )
-
-        return _prompt_cache_save
 
     def _make_mid_prefill_save_callback(self, save_interval: int):
         """Create a callback for saving intermediate KV cache during chunked prefill.
@@ -2198,16 +2087,7 @@ class Scheduler:
                 break
 
             # Determine tokens to process and cache to use
-            # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
-            # is falsy in Python. For exact cache match, remaining_tokens=[] but we should
-            # pass just the last token so BatchGenerator can start generation.
-            if (
-                request.remaining_tokens is not None
-                and len(request.remaining_tokens) == 0
-            ):
-                # Exact cache match - pass only last token for generation kickoff
-                tokens_to_process = request.prompt_token_ids[-1:]
-            elif request.remaining_tokens:
+            if request.remaining_tokens:
                 tokens_to_process = request.remaining_tokens
             else:
                 tokens_to_process = request.prompt_token_ids
