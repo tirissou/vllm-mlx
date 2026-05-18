@@ -156,7 +156,7 @@ class TurnCacheAdapter:
             )
             kv_slice, recur = (
                 self._inner._split_cache_arrays(full_state, parent.n_tokens)
-                if full_state is not None else ([], None)
+                if full_state else ([], None)
             )
             parent = self._inner.insert(
                 parent, segment, kv_slice, None, recur, is_system_prompt=is_sys

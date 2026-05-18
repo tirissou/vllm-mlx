@@ -100,6 +100,6 @@ def test_turn_cache_adapter_store_returns_false_when_no_output():
     inner.root = MagicMock(n_tokens=0)
     adapter = TurnCacheAdapter(inner)
     req = _make_turn_cache_request(
-        prompt_token_ids=[1, 2, 3], output_token_ids=[], turn_boundaries=[3]
+        prompt_token_ids=[1, 2, 3, 4], output_token_ids=[], turn_boundaries=[3]
     )
     assert adapter.store(req, []) is False
