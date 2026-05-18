@@ -473,3 +473,38 @@ class TestSchedulerPrefixCacheIntegration:
 
         assert req._cache_state.hit_type == "miss"
         assert req._cache_state.remaining_tokens == req.prompt_token_ids
+
+
+# ---------------------------------------------------------------------------
+# Regression: _extract_recurrent_state must filter QuantizedKVCache (mlx_lm)
+# ---------------------------------------------------------------------------
+
+def test_extract_recurrent_state_filters_mlx_quantized_kv_cache():
+    """mlx_lm.QuantizedKVCache must be treated as a KV layer, not recurrent.
+
+    Before the fix, only KVCache / BatchKVCache / RotatingKVCache / our own
+    BatchQuantizedKVCache were excluded. QuantizedKVCache from mlx_lm leaked
+    into the recurrent snapshot, which later caused _split_cache_arrays to
+    produce fewer recurrent entries than the stored closure expected, triggering
+    IndexError: list index out of range at recurrent[i].
+    """
+    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.scheduler import _extract_recurrent_state
+
+    layer = QuantizedKVCache()
+    result = _extract_recurrent_state([layer])
+    assert result == [], (
+        "QuantizedKVCache from mlx_lm must be excluded by _extract_recurrent_state"
+    )
+
+
+def test_extract_recurrent_state_keeps_non_kv_layers():
+    """Non-KV layers (e.g. plain objects) are returned as recurrent state."""
+    from vllm_mlx.scheduler import _extract_recurrent_state
+
+    class FakeMambaLayer:
+        pass
+
+    layer = FakeMambaLayer()
+    result = _extract_recurrent_state([layer])
+    assert result == [layer]

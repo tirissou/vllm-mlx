@@ -63,12 +63,12 @@ def _extract_recurrent_state(cache: list) -> list:
     KV layers have an `offset` attribute and a `keys` attribute.
     Recurrent layers (Mamba, DeltaRNN) have neither.
     """
-    from mlx_lm.models.cache import KVCache, BatchKVCache, RotatingKVCache
+    from mlx_lm.models.cache import KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache
     try:
         from .batch_quantized_kv_cache import BatchQuantizedKVCache as _QuantizedCacheWrapper
-        kv_types = (KVCache, BatchKVCache, RotatingKVCache, _QuantizedCacheWrapper)
+        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache, _QuantizedCacheWrapper)
     except ImportError:
-        kv_types = (KVCache, BatchKVCache, RotatingKVCache)
+        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache)
     return [layer for layer in cache if not isinstance(layer, kv_types)]
 
 
@@ -104,7 +104,7 @@ def _compose_n_minus_1_cache(
             # Trim offset by 1 for KV layers (meta_state is a tuple)
             meta = layer.get("meta_state")
             if meta and len(meta) > 0:
-                new_meta = (max(0, meta[0] - 1),) + meta[1:]
+                new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
                 result.append({**layer, "meta_state": new_meta})
             else:
                 result.append(layer)
@@ -446,7 +446,8 @@ def _install_chunked_prefill(
                 _req0 = (requests or {}).get(_rid0) if _rid0 else None
                 if _req0 is not None:
                     _turn_bds = getattr(_req0, "_turn_boundaries", [])
-                    _cached0 = getattr(_req0, "cached_tokens", 0)
+                    _cs0 = getattr(_req0, "_cache_state", None)
+                    _cached0 = (_cs0.cached_tokens if _cs0 is not None else 0)
                     _total_pos = _cached0 + partial["processed"]
                     _next_b = next((b for b in sorted(_turn_bds) if b > _total_pos), None)
                     if _next_b is not None:
@@ -665,7 +666,8 @@ def _install_chunked_prefill(
                         _rid0 = uid_to_request_id.get(_uid0)
                         _req0 = requests.get(_rid0) if _rid0 else None
                         _turn_bds = getattr(_req0, "_turn_boundaries", []) if _req0 else []
-                        _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
+                        _cs_req0 = getattr(_req0, "_cache_state", None) if _req0 else None
+                        _cached = (_cs_req0.cached_tokens if _cs_req0 is not None else 0)
                         _bds_to_hit = sorted(b for b in _turn_bds if b > _cached)
                         if _bds_to_hit:
                             _dist = _bds_to_hit[0] - _cached

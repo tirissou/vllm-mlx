@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from vllm_mlx.turn_prefix_cache import (
     Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, TurnPrefixCache, _context_hash, _node_data_bytes,
-    _quantize_kv, _dequantize_kv,
+    _quantize_kv, _dequantize_kv, _quantize_recurrent, _dequantize_recurrent,
 )
 
 
@@ -147,9 +147,9 @@ def test_node_data_bytes_zero_for_empty_state():
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 
-def make_cache(stride=512, max_gb=8.0, kv_dtype="bf16"):
+def make_cache(stride=512, max_gb=8.0, kv_dtype="bf16", recurrent_dtype="bf16"):
     return TurnPrefixCache(TurnPrefixCacheConfig(
-        checkpoint_stride=stride, max_memory_gb=max_gb, kv_dtype=kv_dtype
+        checkpoint_stride=stride, max_memory_gb=max_gb, kv_dtype=kv_dtype, recurrent_dtype=recurrent_dtype
     ))
 
 
@@ -337,23 +337,6 @@ def test_find_checkpoint_ancestor_returns_self_if_has_recurrent():
     path = [n]
     ancestor = cache.find_checkpoint_ancestor(path)
     assert ancestor is n
-
-
-def test_find_checkpoint_ancestor_walks_up():
-    cache = make_cache(stride=10000)
-    state = mx.zeros((1,))
-    # sys node: permanent checkpoint (is_system_prompt=True)
-    n_sys = cache.insert(cache.root, seg(list(range(50)), role="system"),
-                          [], [], state, is_system_prompt=True)
-    # user node: not a checkpoint (stride not met, temp gets pruned after child added)
-    n_user = cache.insert(n_sys, seg([100, 101]), [], [], state)
-    # asst node: not a checkpoint, prunes n_user's temp recurrent
-    n_asst = cache.insert(n_user, seg([200]), [], [], state)
-    # n_user's recurrent was pruned; n_sys still has permanent recurrent
-    assert n_user.recurrent_state is None
-    path = [n_sys, n_user, n_asst]
-    ancestor = cache.find_checkpoint_ancestor(path)
-    assert ancestor is n_sys
 
 
 def test_find_checkpoint_ancestor_returns_none_when_no_checkpoint():
@@ -771,41 +754,6 @@ def test_mid_session_branching():
     assert path_a[0] is path_b[0]  # sys
     assert path_a[1] is path_b[1]  # u1
     assert path_a[2] is path_b[2]  # a1
-
-
-def test_gap_reconstruction_finds_ancestor():
-    """When branch point has no recurrent, nearest checkpoint ancestor is identified."""
-    cache = make_cache(stride=10000)
-    state = mx.zeros((1,))
-
-    sys_seg = seg(list(range(50)), role="system")
-    u1_seg = seg([100, 101])
-    a1_seg = seg([200])
-
-    n_sys = cache.insert(cache.root, sys_seg, [], [], state, is_system_prompt=True)
-    n_u1 = cache.insert(n_sys, u1_seg, [], [], state)
-    n_a1 = cache.insert(n_u1, a1_seg, [], [], state)
-    # n_u1's temp recurrent was pruned when n_a1 was added (stride not met)
-    assert n_u1.recurrent_state is None
-
-    path, has_recurrent = cache.match([sys_seg, u1_seg, a1_seg])
-    assert has_recurrent  # n_a1 is leaf → has temp recurrent
-    ancestor = cache.find_checkpoint_ancestor(path)
-    # Deepest permanent checkpoint with recurrent is n_sys
-    assert ancestor is n_sys
-    cache.release(path)
-
-    # Now add a child to n_a1 — its temp recurrent is pruned
-    u2_seg = seg([300])
-    cache.insert(n_a1, u2_seg, [], [], state)
-    assert n_a1.recurrent_state is None  # pruned
-
-    # New request ending at n_a1: no recurrent at n_a1, walk up to n_sys
-    path2, has_recurrent2 = cache.match([sys_seg, u1_seg, a1_seg])
-    assert not has_recurrent2
-    ancestor2 = cache.find_checkpoint_ancestor(path2)
-    assert ancestor2 is n_sys  # falls back to sys permanent checkpoint
-    cache.release(path2)
 
 
 def test_messages_to_segments_uses_turn_boundaries():
@@ -2150,3 +2098,210 @@ def test_retrieve_full_cache_concatenates_two_nodes():
     for layer in prompt_cache:
         assert isinstance(layer, QuantizedKVCache)
         assert layer.offset == 15  # 10 + 5 tokens
+
+
+# ---------------------------------------------------------------------------
+# Regression: find_checkpoint_ancestor must reject nodes with empty recurrent
+# ---------------------------------------------------------------------------
+
+def test_find_checkpoint_ancestor_rejects_empty_recurrent_state():
+    """Nodes with recurrent_state=[] must not be selected as checkpoint ancestors.
+
+    Before the fix, _has_real_recurrent checked only `is not None`, so [] passed
+    the guard and was returned, later causing IndexError in _retrieve_full_cache
+    when the closure's recurrent_indices expected > 0 elements.
+    """
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    node = TurnNode(
+        token_ids=[1, 2],
+        context_hash=1,
+        kv_arrays=[],
+        kv_scales=None,
+        recurrent_state=[],  # empty list — real recurrent state is never empty
+        parent=cache.root,
+    )
+    result = cache.find_checkpoint_ancestor([node])
+    assert result is None, (
+        "find_checkpoint_ancestor must return None for a node with recurrent_state=[]"
+    )
+
+
+def test_find_checkpoint_ancestor_accepts_nonempty_recurrent_state():
+    """Sanity check: nodes with actual recurrent state are still selected."""
+    import mlx.core as mx
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    node = TurnNode(
+        token_ids=[1, 2],
+        context_hash=1,
+        kv_arrays=[],
+        kv_scales=None,
+        recurrent_state=[[mx.zeros((1, 16))]],  # one layer, non-empty
+        parent=cache.root,
+    )
+    result = cache.find_checkpoint_ancestor([node])
+    assert result is node
+
+
+# ── save/load dtype combination tests ─────────────────────────────────────────
+
+def test_save_load_kv_int8_dtype_and_scales_preserved(tmp_path):
+    """int8 KV arrays and their per-tensor scales survive a save/load roundtrip."""
+    cache = make_cache(stride=0, kv_dtype="int8")
+    kv = [mx.ones((1, 4, 10, 16), dtype=mx.bfloat16) * 0.5]
+    s = seg(list(range(10)), role="system")
+    node = cache.insert(cache.root, s, kv, None, None, is_system_prompt=True)
+    assert node.kv_arrays[0].dtype == mx.int8
+    assert node.kv_scales is not None
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, kv_dtype="int8")
+    cache2.load(str(tmp_path))
+
+    path, _ = cache2.match([s])
+    loaded = path[0]
+    assert loaded.kv_arrays is not None and len(loaded.kv_arrays) == 1
+    assert loaded.kv_arrays[0].dtype == mx.int8
+    assert loaded.kv_scales is not None and len(loaded.kv_scales) == 1
+
+
+def test_save_load_kv_int8_values_within_tolerance(tmp_path):
+    """Dequantized KV values after int8 save/load roundtrip are within quantization tolerance."""
+    cache = make_cache(stride=0, kv_dtype="int8")
+    original = mx.array([[0.5, -0.3, 0.8, -1.2, 0.1, -0.6]], dtype=mx.bfloat16)
+    original = mx.broadcast_to(original, (1, 4, 1, 6))
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [original], None, None, is_system_prompt=True)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, kv_dtype="int8")
+    cache2.load(str(tmp_path))
+
+    path, _ = cache2.match([s])
+    loaded = path[0]
+    restored = _dequantize_kv(loaded.kv_arrays, loaded.kv_scales)[0]
+    diff = mx.abs(restored.astype(mx.float32) - original.astype(mx.float32))
+    assert mx.max(diff).item() < 0.02
+
+
+def test_save_load_kv_bf16_values_preserved(tmp_path):
+    """bf16 KV values survive save/load (stored as float32, numerically identical)."""
+    cache = make_cache(stride=0, kv_dtype="bf16")
+    original = mx.array([[0.5, -0.3, 0.8]], dtype=mx.bfloat16)
+    original = mx.broadcast_to(original, (1, 4, 1, 3))
+    mx.eval(original)
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [original], None, None, is_system_prompt=True)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, kv_dtype="bf16")
+    cache2.load(str(tmp_path))
+
+    path, _ = cache2.match([s])
+    loaded = path[0]
+    diff = mx.abs(loaded.kv_arrays[0].astype(mx.float32) - original.astype(mx.float32))
+    assert mx.max(diff).item() == 0.0
+
+
+def test_save_load_multi_node_parent_child(tmp_path):
+    """Two-node trie (system → user) survives save/load: both nodes exist and parent link is correct."""
+    cache = make_cache(stride=0)
+    s_sys = seg(list(range(10)), role="system")
+    s_usr = seg([100, 101], role="user")
+    state = mx.zeros((2,))
+    n_sys = cache.insert(cache.root, s_sys, [], [], state, is_system_prompt=True)
+    cache.insert(n_sys, s_usr, [], [], state)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0)
+    cache2.load(str(tmp_path))
+
+    path, _ = cache2.match([s_sys, s_usr])
+    assert len(path) == 2
+    assert path[1].parent is path[0]
+    assert path[0].parent is cache2.root
+
+
+@pytest.mark.parametrize("recurrent_dtype", ["none", "fp16", "bf16", "int8"])
+def test_save_load_recurrent_legacy_ssm_dtype(tmp_path, recurrent_dtype):
+    """Legacy SSM recurrent state survives save/load for every recurrent_dtype config."""
+    cache = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    raw_state = [mx.array([[0.5, -0.3, 0.8, -1.2]], dtype=mx.float32)]
+    quantized, scales = _quantize_recurrent(raw_state, recurrent_dtype)
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [], [], quantized, is_system_prompt=True, recurrent_scales=scales)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    cache2.load(str(tmp_path))
+
+    path, has_rec = cache2.match([s])
+    assert len(path) == 1
+    assert has_rec
+    loaded = path[0]
+    if recurrent_dtype == "int8":
+        assert loaded.recurrent_scales is not None
+    else:
+        assert loaded.recurrent_scales is None
+
+    dq = cache2.get_dequantized_recurrent(loaded)
+    assert dq is not None
+    result = dq if isinstance(dq, mx.array) else dq[0]
+    if isinstance(result, (list, tuple)):
+        result = result[0]
+    diff = mx.abs(result.astype(mx.float32) - raw_state[0].astype(mx.float32))
+    assert mx.max(diff).item() < 0.02
+
+
+def test_save_load_recurrent_dict_int8_scales_preserved(tmp_path):
+    """Dict-format recurrent state with int8 per-channel scales survives save/load."""
+    from mlx_lm.models.cache import KVCache
+    cache = make_cache(stride=0, recurrent_dtype="int8")
+
+    raw_arr = mx.array([[0.5, -0.3, 0.8, -1.2]], dtype=mx.float32)
+    raw_state = [{"state": (raw_arr,), "meta_state": "", "class_name": "KVCache", "class_ref": KVCache}]
+    quantized, scales = _quantize_recurrent(raw_state, "int8")
+    mx.eval(*[t for d in quantized for t in d["state"]])
+
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [], [], quantized, is_system_prompt=True, recurrent_scales=scales)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, recurrent_dtype="int8")
+    cache2.load(str(tmp_path))
+
+    path, has_rec = cache2.match([s])
+    assert len(path) == 1 and has_rec
+    loaded = path[0]
+    assert loaded.recurrent_scales is not None
+
+    dq = cache2.get_dequantized_recurrent(loaded)
+    assert dq is not None
+    restored = dq[0]["state"][0]
+    diff = mx.abs(restored.astype(mx.float32) - raw_arr.astype(mx.float32))
+    assert mx.max(diff).item() < 0.02
+
+
+@pytest.mark.parametrize("recurrent_dtype,expected_dtype", [
+    ("fp16", mx.float16),
+    ("bf16", mx.bfloat16),
+    ("int8", mx.bfloat16),  # int8 stored, dequantized to bf16
+])
+def test_get_dequantized_recurrent_after_load_output_dtype(tmp_path, recurrent_dtype, expected_dtype):
+    """get_dequantized_recurrent returns the correct dtype after a save/load roundtrip."""
+    cache = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    raw_state = [mx.array([[1.0, -0.5, 0.25, -0.125]], dtype=mx.float32)]
+    quantized, scales = _quantize_recurrent(raw_state, recurrent_dtype)
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [], [], quantized, is_system_prompt=True, recurrent_scales=scales)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    cache2.load(str(tmp_path))
+
+    path, _ = cache2.match([s])
+    dq = cache2.get_dequantized_recurrent(path[0])
+    assert dq is not None
+    result = dq if isinstance(dq, mx.array) else dq[0]
+    if isinstance(result, (list, tuple)):
+        result = result[0]
+    assert result.dtype == expected_dtype

@@ -638,7 +638,11 @@ class TurnPrefixCache:
         Returns None if nothing found.
         """
         def _has_real_recurrent(node: TurnNode) -> bool:
-            return node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef)
+            return (
+                node.recurrent_state is not None
+                and not isinstance(node.recurrent_state, SSDRef)
+                and len(node.recurrent_state) > 0
+            )
 
         for node in reversed(path):
             if _has_real_recurrent(node):
@@ -896,10 +900,10 @@ class TurnPrefixCache:
                             j = 0
                             while f"ext_{li}_state_{j}" in tensors:
                                 state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
-                                # Check for per-tensor scale (int8 quantization)
+                                # Check for per-channel scale (int8 quantization)
                                 if f"ext_{li}_scale_{j}" in tensors:
                                     layer_scales.append(
-                                        float(tensors[f"ext_{li}_scale_{j}"])
+                                        tensors[f"ext_{li}_scale_{j}"].tolist()
                                     )
                                 j += 1
                             if layer_scales:
@@ -941,7 +945,7 @@ class TurnPrefixCache:
                                     layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
                                     if f"r_{k}_scale_{m}" in tensors:
                                         layer_scales.append(
-                                            float(tensors[f"r_{k}_scale_{m}"])
+                                            tensors[f"r_{k}_scale_{m}"].tolist()
                                         )
                                     m += 1
                                 if layer_scales:
@@ -1123,7 +1127,7 @@ class TurnPrefixCache:
                                 state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
                                 if f"ext_{li}_scale_{j}" in tensors:
                                     layer_scales.append(
-                                        float(tensors[f"ext_{li}_scale_{j}"])
+                                        tensors[f"ext_{li}_scale_{j}"].tolist()
                                     )
                                 j += 1
                             if layer_scales:
@@ -1166,7 +1170,7 @@ class TurnPrefixCache:
                                 layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
                                 if f"r_{k}_scale_{m}" in tensors:
                                     layer_scales.append(
-                                        float(tensors[f"r_{k}_scale_{m}"])
+                                        tensors[f"r_{k}_scale_{m}"].tolist()
                                     )
                                 m += 1
                             if layer_scales:
@@ -1202,8 +1206,9 @@ class TurnPrefixCache:
         if state is None:
             return None
 
-        # Dequantize if scales are present (int8 storage)
-        if scales is not None:
+        # Always cast for fp16/bf16 configs (fixes float32 dtype after bf16 disk roundtrip)
+        # and dequantize when int8 scales are present.
+        if scales is not None or self.config.recurrent_dtype in ("fp16", "bf16"):
             state = _dequantize_recurrent(state, scales, self.config.recurrent_dtype)
 
         return state
@@ -1284,3 +1289,55 @@ class TurnPrefixCache:
                 visit(child)
         visit(self.root)
         return count
+
+
+def reconstruct_cache_from_states(extracted_states):
+    """Reconstruct cache objects from extracted cache states.
+
+    Inverse of Scheduler._extract_cache_states(). Pure function — no scheduler
+    state needed. Uses mlx-lm's _BaseCache.from_state() to reconstruct any
+    cache type (KVCache, MambaCache, etc.) from its state/meta_state.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    if not extracted_states:
+        return None
+
+    try:
+        caches = []
+        for layer_state in extracted_states:
+            state = layer_state.get("state")
+            meta_state = layer_state.get("meta_state")
+            cache_cls = layer_state.get("class_ref")
+            if state is None:
+                return None
+
+            if cache_cls is not None and hasattr(cache_cls, "from_state"):
+                from mlx_lm.models.cache import (
+                    BatchKVCache as _BatchKVCache,
+                    KVCache as _KVCache,
+                )
+                if cache_cls is _BatchKVCache:
+                    keys, values = state[0], state[1]
+                    cache = _KVCache()
+                    cache.keys = keys
+                    cache.values = values
+                    cache.offset = keys.shape[2]
+                else:
+                    cache = cache_cls.from_state(state, meta_state)
+            else:
+                from mlx_lm.models.cache import KVCache
+                if len(state) != 2:
+                    return None
+                cache = KVCache()
+                cache.keys, cache.values = state
+                cache.offset = int(meta_state[0]) if meta_state else cache.keys.shape[2]
+
+            caches.append(cache)
+
+        return caches
+
+    except Exception as e:
+        _log.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
+        return None
