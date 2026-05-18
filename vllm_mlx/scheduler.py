@@ -1310,7 +1310,10 @@ class Scheduler:
                     model=model,
                     config=cache_config,
                 )
-                self._prefix_cache = MemoryCacheAdapter(self.memory_aware_cache)
+                self._prefix_cache = MemoryCacheAdapter(
+                    self.memory_aware_cache,
+                    mid_prefill_save_interval=self.config.mid_prefill_save_interval,
+                )
                 logger.info(
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
@@ -1503,7 +1506,7 @@ class Scheduler:
             # monkey-patches inside _install_chunked_prefill.
             mid_prefill_cb = None
             save_interval = self.config.mid_prefill_save_interval
-            if save_interval > 0 and (self.memory_aware_cache is not None or self.turn_cache is not None):
+            if self._prefix_cache is not None and (save_interval > 0 or self.turn_cache is not None):
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
             _install_chunked_prefill(
@@ -1599,93 +1602,21 @@ class Scheduler:
     def _make_mid_prefill_save_callback(self, save_interval: int):
         """Create a callback for saving intermediate KV cache during chunked prefill.
 
-        The callback is called after each chunk with (uid, processed_tokens,
-        prompt_cache).  It extracts the cache state (immutable MLX array
-        snapshots), reconstructs KVCache objects, and stores them in the
-        memory-aware prefix cache so that a subsequent request with the same
-        prompt prefix can skip the already-computed tokens. For turn_cache,
-        it also captures the system-prompt state at the prefix boundary.
+        Dispatches to self._prefix_cache.on_prefill_checkpoint() which handles
+        both memory-cache throttling/storage and turn-cache boundary capture.
         """
-        import time as _time
-
         def _mid_prefill_save(uid, processed_tokens, prompt_cache):
             request_id = self.uid_to_request_id.get(uid)
             if not request_id:
                 return
             request = self.requests.get(request_id)
-            if not request or not request.prompt_token_ids:
+            if not request:
                 return
-
-            total_cached = (request.cached_tokens or 0) + processed_tokens
-
-            prefix_boundary = getattr(request, "prefix_boundary", 0)
-            sys_end_boundary = getattr(request, "sys_end_boundary", 0) or prefix_boundary
-            _tb = getattr(request, "turn_boundaries", None)
-            turn_boundaries = _tb if isinstance(_tb, list) else []
-            _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-
-            # Boundaries where we always save regardless of throttle:
-            # - sys_end_boundary: end of system prompt (for turn_cache sys node)
-            # - turn_boundaries[i]: end of each intermediate turn (for per-turn trie nodes)
-            # - prefix_boundary: end of conversation history before last user (for turn_cache conv node)
-            # - _turn_boundaries[i]: turn boundaries from turn_cache redesign
-            at_sys_end = sys_end_boundary > 0 and total_cached == sys_end_boundary
-            at_prefix_boundary = prefix_boundary > 0 and total_cached == prefix_boundary
-            at_turn_boundary_idx = next(
-                (i for i, b in enumerate(turn_boundaries) if b > 0 and total_cached == b),
-                -1,
-            )
-            at_turn_boundary_new = total_cached in _turn_boundaries
-            at_any_boundary = at_sys_end or at_prefix_boundary or at_turn_boundary_idx >= 0 or at_turn_boundary_new
-
-            # Throttle: only save every save_interval tokens,
-            # unless we're at a cache boundary.
-            last_save = getattr(request, "_mid_prefill_last_save", 0)
-            if not at_any_boundary and total_cached - last_save < save_interval:
+            if self._prefix_cache is None:
                 return
-
-            # memory_aware_cache: save intermediate state for prefix cache reuse
-            if self.memory_aware_cache is not None:
-                extracted = self._extract_cache_states(prompt_cache)
-                if extracted:
-                    reconstructed = self._reconstruct_cache_from_states(extracted)
-                    if reconstructed:
-                        prefix_tokens = list(request.prompt_token_ids[:total_cached])
-                        old_key = getattr(request, "_mid_prefill_cache_key", None)
-                        if old_key is not None:
-                            self.memory_aware_cache.remove(list(old_key))
-                        _t0 = _time.monotonic()
-                        stored = self.memory_aware_cache.store(prefix_tokens, reconstructed)
-                        _dt = _time.monotonic() - _t0
-                        if stored:
-                            request._mid_prefill_last_save = total_cached
-                            request._mid_prefill_cache_key = tuple(prefix_tokens)
-                            logger.info(
-                                f"[mid_prefill_cache] request={request_id[:12]} "
-                                f"saved {total_cached}/{len(request.prompt_token_ids)} tokens "
-                                f"({total_cached * 100 // len(request.prompt_token_ids)}%) "
-                                f"store_time={_dt:.3f}s"
-                            )
-                        else:
-                            logger.debug(
-                                f"[mid_prefill_cache] request={request_id[:12]} "
-                                f"store rejected for {total_cached} tokens"
-                            )
-
-            # turn_cache branch: save state at each boundary into _boundary_states
-            if self.turn_cache is not None:
-                _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-                if total_cached in _turn_boundaries:
-                    extracted = self._extract_cache_states(prompt_cache)
-                    if extracted:
-                        if not hasattr(request, "_boundary_states") or request._boundary_states is None:
-                            request._boundary_states = {}
-                        request._boundary_states[total_cached] = extracted
-                        logger.info(
-                            f"[turn_cache] boundary_state saved at {total_cached} "
-                            f"layers={len(extracted)} for {request_id[:12]}"
-                        )
-
+            extracted = self._extract_cache_states(prompt_cache)
+            if extracted:
+                self._prefix_cache.on_prefill_checkpoint(request, processed_tokens, extracted)
         return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:

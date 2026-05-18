@@ -37,10 +37,12 @@ def _make_minimal_scheduler_new():
     from unittest.mock import MagicMock
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
     from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
     sched = object.__new__(Scheduler)
     sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
     sched.memory_aware_cache = None
     sched.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    sched._prefix_cache = TurnCacheAdapter(sched.turn_cache)
     sched.requests = {}
     sched.uid_to_request_id = {}
     return sched
@@ -1712,7 +1714,11 @@ def test_messages_to_segments_new_sys_stable():
 
 
 def test_mid_prefill_saves_boundary_state():
-    """Test that _make_mid_prefill_save_callback saves state at boundaries."""
+    """Test that _make_mid_prefill_save_callback saves state at boundaries.
+
+    Split-chunk convention: checkpoint fires at processed=B-1 so that
+    total_cached+1 == B matches the boundary.
+    """
     from unittest.mock import MagicMock, patch
 
     sched = _make_minimal_scheduler_new()
@@ -1727,8 +1733,7 @@ def test_mid_prefill_saves_boundary_state():
     req.prompt_token_ids = list(range(100))
     req.cached_tokens = 0
     req._turn_boundaries = [50]  # boundary at 50 tokens
-    req.prefix_boundary = 0
-    req.sys_end_boundary = 0
+    req._boundary_states = {}
     req._mid_prefill_last_save = 0
 
     sched.requests["test-1"] = req
@@ -1737,15 +1742,15 @@ def test_mid_prefill_saves_boundary_state():
     # Mock _extract_cache_states
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
     with patch.object(sched, '_extract_cache_states', return_value=mock_extracted):
-        # Call callback at boundary: total_processed = 0 (cached) + 50 (processed) = 50
+        # Split-chunk convention: fire at processed=49 so total_cached=49, 49+1=50 in [50]
         prompt_cache = MagicMock()
-        callback(123, 50, prompt_cache)
+        callback(123, 49, prompt_cache)
 
-    # Verify _boundary_states was initialized and boundary saved
+    # Verify _boundary_states keyed by boundary position (50)
     assert hasattr(req, "_boundary_states")
     assert req._boundary_states is not None
     assert 50 in req._boundary_states
-    assert req._boundary_states[50] == mock_extracted
+    assert req._boundary_states[50] is mock_extracted
 
 
 def test_mid_prefill_does_not_save_away_from_boundary():
@@ -1763,8 +1768,7 @@ def test_mid_prefill_does_not_save_away_from_boundary():
     req.prompt_token_ids = list(range(100))
     req.cached_tokens = 0
     req._turn_boundaries = [50]  # boundary at 50, not at 30
-    req.prefix_boundary = 0
-    req.sys_end_boundary = 0
+    req._boundary_states = {}
     req._mid_prefill_last_save = 0
 
     sched.requests["test-2"] = req
@@ -1772,17 +1776,19 @@ def test_mid_prefill_does_not_save_away_from_boundary():
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
     with patch.object(sched, '_extract_cache_states', return_value=mock_extracted):
-        # Call at non-boundary position
+        # processed=29 → total=29, 29+1=30 not in [50] → no save
         prompt_cache = MagicMock()
-        callback(124, 30, prompt_cache)
+        callback(124, 29, prompt_cache)
 
     # Should NOT save to _boundary_states
-    has_boundary_states = hasattr(req, "_boundary_states") and req._boundary_states
-    assert not has_boundary_states or 30 not in (req._boundary_states or {})
+    assert req._boundary_states == {}
 
 
 def test_mid_prefill_saves_multiple_boundaries():
-    """Test that callback saves state at multiple boundaries."""
+    """Test that callback saves state at multiple boundaries.
+
+    Split-chunk convention: fire at processed=B-1 for each boundary B.
+    """
     from unittest.mock import MagicMock, patch
 
     sched = _make_minimal_scheduler_new()
@@ -1796,29 +1802,28 @@ def test_mid_prefill_saves_multiple_boundaries():
     req.prompt_token_ids = list(range(200))
     req.cached_tokens = 0
     req._turn_boundaries = [50, 100, 150]  # three boundaries
-    req.prefix_boundary = 0
-    req.sys_end_boundary = 0
+    req._boundary_states = {}
     req._mid_prefill_last_save = 0
 
     sched.requests["test-3"] = req
     sched.uid_to_request_id[125] = "test-3"
 
-    # Save at first boundary
+    # Save at first boundary (fire at B-1=49)
     mock_extracted_50 = _make_extracted_state(n_layers=2, n_tokens=50)
     with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_50):
-        callback(125, 50, MagicMock())
+        callback(125, 49, MagicMock())
 
-    # Save at second boundary
+    # Save at second boundary (fire at B-1=99)
     mock_extracted_100 = _make_extracted_state(n_layers=2, n_tokens=100)
     with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_100):
-        callback(125, 100, MagicMock())
+        callback(125, 99, MagicMock())
 
-    # Save at third boundary
+    # Save at third boundary (fire at B-1=149)
     mock_extracted_150 = _make_extracted_state(n_layers=2, n_tokens=150)
     with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_150):
-        callback(125, 150, MagicMock())
+        callback(125, 149, MagicMock())
 
-    # Verify all boundaries were saved
+    # Verify all boundaries were saved (keyed by boundary position)
     assert hasattr(req, "_boundary_states")
     assert 50 in req._boundary_states
     assert 100 in req._boundary_states

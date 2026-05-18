@@ -11,8 +11,9 @@ from .kv_cache import CacheHit
 class MemoryCacheAdapter:
     """Adapts MemoryAwarePrefixCache to the PrefixCache / PersistableCache protocol."""
 
-    def __init__(self, inner):
+    def __init__(self, inner, mid_prefill_save_interval: int = 0):
         self._inner = inner
+        self._save_interval = mid_prefill_save_interval
 
     def fetch(self, request) -> CacheHit | None:
         tokens = list(request.prompt_token_ids)
@@ -45,7 +46,27 @@ class MemoryCacheAdapter:
     def on_prefill_checkpoint(
         self, request, processed_tokens: int, extracted_cache: list
     ) -> None:
-        pass
+        from .turn_prefix_cache import reconstruct_cache_from_states
+
+        total_cached = (getattr(request, "cached_tokens", 0) or 0) + processed_tokens
+        last_save = getattr(request, "_mid_prefill_last_save", 0)
+
+        interval = self._save_interval
+        if interval > 0 and total_cached - last_save < interval:
+            return
+
+        reconstructed = reconstruct_cache_from_states(extracted_cache)
+        if not reconstructed:
+            return
+
+        prefix_tokens = list((request.prompt_token_ids or [])[:total_cached])
+        old_key = getattr(request, "_mid_prefill_cache_key", None)
+        if old_key is not None:
+            self._inner.remove(list(old_key))
+
+        if self._inner.store(prefix_tokens, reconstructed):
+            request._mid_prefill_last_save = total_cached
+            request._mid_prefill_cache_key = tuple(prefix_tokens)
 
     # PersistableCache extension
     def save(self, cache_dir: str) -> bool:
@@ -193,7 +214,16 @@ class TurnCacheAdapter:
     def on_prefill_checkpoint(
         self, request, processed_tokens: int, extracted_cache: list
     ) -> None:
-        pass
+        total_cached = (getattr(request, "cached_tokens", 0) or 0) + processed_tokens
+        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+
+        # Split-chunk convention: checkpoint fires at B-1, boundary key is B.
+        if total_cached + 1 not in _turn_boundaries:
+            return
+
+        if not hasattr(request, "_boundary_states") or request._boundary_states is None:
+            request._boundary_states = {}
+        request._boundary_states[total_cached + 1] = extracted_cache
 
     # PersistableCache extension
     def save(self, cache_dir: str) -> bool:

@@ -45,7 +45,7 @@ def test_on_prefill_checkpoint_no_op_does_not_raise():
         adapter.on_prefill_checkpoint(request, 100, [])
 
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 
 def _make_turn_cache_request(
@@ -119,3 +119,60 @@ def test_turn_cache_adapter_release_noop_on_none():
     adapter = TurnCacheAdapter(inner)
     adapter.release(None)  # must not raise
     inner.release.assert_not_called()
+
+
+def test_memory_cache_adapter_on_prefill_checkpoint_stores_prefix():
+    """MemoryCacheAdapter must store a prefix entry on checkpoint."""
+    inner = MagicMock()
+    inner.store.return_value = True
+
+    adapter = MemoryCacheAdapter(inner)
+
+    request = MagicMock()
+    request.prompt_token_ids = list(range(10))
+    request.cached_tokens = 0
+    request._mid_prefill_last_save = 0
+    request._mid_prefill_cache_key = None
+
+    extracted = [{"state": (None, None), "class_name": "KVCache", "class_ref": None}]
+    fake_reconstructed = [MagicMock()]
+    # The adapter does `from .turn_prefix_cache import reconstruct_cache_from_states`
+    # inside the method, so we patch the function in the turn_prefix_cache module.
+    with patch("vllm_mlx.turn_prefix_cache.reconstruct_cache_from_states", return_value=fake_reconstructed):
+        adapter.on_prefill_checkpoint(request, 5, extracted)
+
+    inner.store.assert_called_once()
+    stored_tokens = inner.store.call_args[0][0]
+    assert stored_tokens == list(range(5))
+
+
+def test_turn_cache_adapter_on_prefill_checkpoint_captures_boundary_state():
+    """TurnCacheAdapter must record boundary state at boundary-1 positions."""
+    inner = MagicMock()
+    adapter = TurnCacheAdapter(inner)
+
+    request = MagicMock()
+    request.cached_tokens = 0
+    request._turn_boundaries = [5]   # boundary at 5
+    request._boundary_states = {}
+
+    extracted = [{"state": (None, None), "class_name": "KVCache"}]
+    # checkpoint fires at processed=4 (one before boundary 5, per split-chunk convention)
+    adapter.on_prefill_checkpoint(request, 4, extracted)
+
+    # boundary_states keyed by boundary position (5), not checkpoint position (4)
+    assert 5 in request._boundary_states
+    assert request._boundary_states[5] is extracted
+
+
+def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
+    inner = MagicMock()
+    adapter = TurnCacheAdapter(inner)
+
+    request = MagicMock()
+    request.cached_tokens = 0
+    request._turn_boundaries = [5]
+    request._boundary_states = {}
+
+    adapter.on_prefill_checkpoint(request, 3, [])  # total=3, boundary=5 → 3+1=4 ≠ 5
+    assert request._boundary_states == {}
