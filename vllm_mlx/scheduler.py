@@ -2476,11 +2476,12 @@ class Scheduler:
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids and self._prefix_cache is not None:
                 _store_cache = getattr(request, "_extracted_cache", None)
-                _store_tokens = (
-                    list(request.prompt_token_ids) + list(request.output_token_ids)
-                )
                 if _store_cache is not None:
-                    request.store_tokens = _store_tokens
+                    # Preserve N-1 key set by _process_batch_responses; fall back to full N
+                    if not getattr(request, "store_tokens", None):
+                        request.store_tokens = (
+                            list(request.prompt_token_ids) + list(request.output_token_ids)
+                        )
                     try:
                         self._prefix_cache.store(request, _store_cache)
                     except Exception as e:

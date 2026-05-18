@@ -32,6 +32,12 @@ class MemoryCacheAdapter:
     def store(self, request, cache: list) -> bool:
         _st = getattr(request, "store_tokens", None)
         tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
+        # Memory cache requires live KV objects; reconstruct from dict form if needed
+        if cache and isinstance(cache[0], dict):
+            from .turn_prefix_cache import reconstruct_cache_from_states
+            cache = reconstruct_cache_from_states(cache) or []
+        if not cache:
+            return False
         return self._inner.store(tokens, cache, evict_prefixes=False)
 
     def release(self, handle: Any) -> None:
