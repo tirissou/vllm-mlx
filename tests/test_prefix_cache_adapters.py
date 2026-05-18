@@ -103,3 +103,19 @@ def test_turn_cache_adapter_store_returns_false_when_no_output():
         prompt_token_ids=[1, 2, 3, 4], output_token_ids=[], turn_boundaries=[3]
     )
     assert adapter.store(req, []) is False
+
+
+def test_turn_cache_adapter_release_calls_inner_release():
+    """TurnCacheAdapter.release() must forward to inner.release()."""
+    inner = MagicMock()
+    adapter = TurnCacheAdapter(inner)
+    path = [MagicMock(), MagicMock()]
+    adapter.release(path)
+    inner.release.assert_called_once_with(path)
+
+
+def test_turn_cache_adapter_release_noop_on_none():
+    inner = MagicMock()
+    adapter = TurnCacheAdapter(inner)
+    adapter.release(None)  # must not raise
+    inner.release.assert_not_called()

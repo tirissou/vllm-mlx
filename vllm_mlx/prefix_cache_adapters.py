@@ -29,7 +29,8 @@ class MemoryCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        tokens = list(request.prompt_token_ids)
+        _st = getattr(request, "store_tokens", None)
+        tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
         return self._inner.store(tokens, cache)
 
     def release(self, handle: Any) -> None:
@@ -229,7 +230,8 @@ class PagedCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        tokens = list(request.prompt_token_ids)
+        _st = getattr(request, "store_tokens", None)
+        tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
         self._inner.store_cache(request.request_id, tokens, cache)
         return True
 
@@ -276,7 +278,8 @@ class LegacyCacheAdapter:
         )
 
     def store(self, request, cache: list) -> bool:
-        tokens = list(request.prompt_token_ids)
+        _st = getattr(request, "store_tokens", None)
+        tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
         self._inner.store_cache(tokens, cache)
         return True
 

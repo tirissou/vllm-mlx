@@ -39,43 +39,7 @@ from .patches.mlx_lm_quantized_sdpa import patch_quantized_sdpa
 patch_quantized_sdpa()
 
 
-def _make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4):
-    """Like mlx-lm's _make_cache but emits BatchQuantizedKVCache for KV layers.
-
-    ArraysCache (recurrent) and RotatingKVCache layers are left unchanged
-    so hybrid Mamba+Transformer models work correctly.
-    """
-    from mlx_lm.models.cache import (
-        ArraysCache,
-        BatchRotatingKVCache,
-        CacheList,
-        KVCache,
-        RotatingKVCache,
-    )
-    from .batch_quantized_kv_cache import BatchQuantizedKVCache
-
-    def to_quantized_batch(c):
-        if type(c) is KVCache:
-            return BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
-        elif isinstance(c, ArraysCache):
-            c.left_padding = mx.array(left_padding)
-            return c
-        elif isinstance(c, RotatingKVCache):
-            if c.keep > 0:
-                raise ValueError("RotatingKVCache with keep tokens is not supported.")
-            return BatchRotatingKVCache(c.max_size, left_padding)
-        elif isinstance(c, CacheList):
-            return CacheList(*(to_quantized_batch(sub) for sub in c.caches))
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        return [to_quantized_batch(c) for c in model.make_cache()]
-    if max_kv_size is not None:
-        from mlx_lm.models.cache import BatchRotatingKVCache
-        return [BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers]
-    return [BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
-            for _ in model.layers]
+from .batch_quantized_kv_cache import make_quantized_cache as _make_quantized_cache  # re-export for tests
 
 
 logger = logging.getLogger(__name__)
@@ -1301,6 +1265,7 @@ class Scheduler:
         self._cache_key_log_path: Optional[str] = self.config.cache_key_log_path
 
         # Prefix cache for KV state reuse
+        self._prefix_cache = None  # PrefixCache protocol adapter (new unified path)
         self.prefix_cache: Optional[PrefixCacheManager] = None
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
@@ -1309,6 +1274,13 @@ class Scheduler:
         self.turn_cache: Optional[TurnPrefixCache] = None
 
         if self.config.enable_prefix_cache:
+            from .prefix_cache_adapters import (
+                LegacyCacheAdapter,
+                MemoryCacheAdapter,
+                PagedCacheAdapter,
+                TurnCacheAdapter,
+            )
+
             if self.config.use_paged_cache:
                 # Use paged cache for memory efficiency
                 self.paged_cache_manager = PagedCacheManager(
@@ -1319,6 +1291,7 @@ class Scheduler:
                     model=model,
                     paged_cache_manager=self.paged_cache_manager,
                 )
+                self._prefix_cache = PagedCacheAdapter(self.block_aware_cache)
                 logger.info(
                     f"Paged cache enabled: block_size={self.config.paged_cache_block_size}, "
                     f"max_blocks={self.config.max_cache_blocks}"
@@ -1337,6 +1310,7 @@ class Scheduler:
                     model=model,
                     config=cache_config,
                 )
+                self._prefix_cache = MemoryCacheAdapter(self.memory_aware_cache)
                 logger.info(
                     f"Memory-aware cache enabled: "
                     f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
@@ -1363,6 +1337,7 @@ class Scheduler:
                     max_memory_gb=self.config.turn_cache_memory_gb,
                     ssd_max_gb=self.config.turn_cache_ssd_gb,
                 ))
+                self._prefix_cache = TurnCacheAdapter(self.turn_cache)
                 logger.info(
                     f"TurnPrefixCache enabled: stride={self.config.turn_cache_stride} "
                     f"memory={self.config.turn_cache_memory_gb}GB"
@@ -1373,6 +1348,7 @@ class Scheduler:
                     model=model,
                     max_entries=self.config.prefix_cache_size,
                 )
+                self._prefix_cache = LegacyCacheAdapter(self.prefix_cache)
                 logger.info(
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
@@ -2094,125 +2070,36 @@ class Scheduler:
         reconstruct/concat) are lazy and must be enqueued on the same
         stream that will later evaluate them inside BatchGenerator.
         """
-        import time as _time
+        if self._prefix_cache is None:
+            request.cache_hit_type = "miss"
+            request.remaining_tokens = request.prompt_token_ids
+            return
 
-        if self.block_aware_cache is not None:
-            block_table, remaining = self.block_aware_cache.fetch_cache(
-                request.request_id,
-                request.prompt_token_ids,
-            )
-            if block_table and block_table.num_tokens > 0:
-                reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
-                if reconstructed:
-                    request.cache_hit_type = "hit"
-                    request.prompt_cache = reconstructed
-                    request.block_table = block_table
-                    request.cached_tokens = block_table.num_tokens
-                    request.shared_prefix_blocks = len(block_table.block_ids)
-                    request.remaining_tokens = remaining
-                    logger.info(
-                        f"[paged_cache] request={request.request_id[:12]} HIT "
-                        f"cached={request.cached_tokens} remaining={len(remaining)} "
-                        f"blocks={request.shared_prefix_blocks}"
-                    )
-                else:
-                    request.cache_hit_type = "miss"
-                    request.remaining_tokens = request.prompt_token_ids
-                    # Release the refs incremented by fetch_cache for this failed hit
-                    self.block_aware_cache.release_cache(request.request_id)
-                    logger.info(
-                        f"[paged_cache] request={request.request_id[:12]} MISS "
-                        f"(reconstruct failed for {len(block_table.block_ids)} blocks)"
-                    )
-            else:
-                request.cache_hit_type = "miss"
-                request.remaining_tokens = request.prompt_token_ids
-                logger.info(
-                    f"[paged_cache] request={request.request_id[:12]} MISS "
-                    f"prompt_tokens={len(request.prompt_token_ids)}"
-                )
-
-        elif self.memory_aware_cache is not None:
-            _fetch_t0 = _time.monotonic()
-            cache, remaining = self.memory_aware_cache.fetch(request.prompt_token_ids)
-            _fetch_dt = _time.monotonic() - _fetch_t0
+        hit = self._prefix_cache.fetch(request)
+        if hit is not None:
+            request.cache_hit_type = hit.hit_type
+            request.prompt_cache = hit.cache
+            request.cached_tokens = hit.cached_tokens
+            request.remaining_tokens = hit.remaining_tokens
             self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
-            request.cache_hit_type = self.memory_aware_cache._last_match_type
-            if cache:
-                request.prompt_cache = cache
-                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
-                request.remaining_tokens = remaining
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} HIT "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"cached={request.cached_tokens} remaining={len(remaining)} "
-                    f"time={_fetch_dt:.3f}s"
-                )
-            else:
-                request.remaining_tokens = request.prompt_token_ids
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} MISS "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"time={_fetch_dt:.3f}s entries={len(self.memory_aware_cache._entries)}"
-                )
-                if self._ssd_tier is not None:
-                    ssd_candidate = self.memory_aware_cache.check_ssd(
-                        request.prompt_token_ids
-                    )
-                    if ssd_candidate is not None:
-                        request.cache_hit_type = "ssd_pending"
-                        request._ssd_candidate = ssd_candidate
-
-        elif self.turn_cache is not None:
-            segments = self._messages_to_segments(request)
-            logger.info(f"[turn_cache] _messages_to_segments for {request.request_id[:12]}: {len(segments) if segments else 0} segments from _turn_boundaries={getattr(request, '_turn_boundaries', [])}")
-            if segments:
-                path, has_recurrent = self.turn_cache.match(segments)
-                if path:
-                    request._turn_cache_path = path  # auto-pinned by match()
-                    request.cache_hit_type = "hit"
-                    logger.info(f"Cache hit: {[len(n.token_ids) for n in path]}")
-                    ancestor = self.turn_cache.find_checkpoint_ancestor(path)
-                    if ancestor is not None:
-                        assembled = self.turn_cache._retrieve_full_cache(ancestor)
-                        request.prompt_cache = self._reconstruct_cache_from_states(assembled)
-                        request.cached_tokens = ancestor.n_tokens
-                        request.remaining_tokens = request.prompt_token_ids[request.cached_tokens:]
-                    else:
-                        request.prompt_cache = None
-                        request.cached_tokens = 0
-                        request.remaining_tokens = request.prompt_token_ids
-
-                    logger.info(f"[turn_cache] HIT: {request.cached_tokens} tokens for {request.request_id}")
-                    logger.debug(f"[turn_cache] cache structure on HIT:\n{self.turn_cache.visualize(tokenizer=self.tokenizer)}")
-                else:
-                    request.cache_hit_type = "miss"
-                    request.remaining_tokens = request.prompt_token_ids
-                    logger.info(f"[turn_cache] MISS for {request.request_id}")
-            else:
-                request.cache_hit_type = "miss"
-                request.remaining_tokens = request.prompt_token_ids
-                logger.info(f"[turn_cache] MISS (no segments) for {request.request_id}")
-
-        elif self.prefix_cache is not None:
-            cache, remaining = self.prefix_cache.fetch_cache(request.prompt_token_ids)
-            if cache:
-                request.cache_hit_type = "hit"
-                request.prompt_cache = cache
-                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
-                request.remaining_tokens = remaining
-                logger.debug(
-                    f"Request {request.request_id}: cache hit, "
-                    f"{request.cached_tokens} tokens cached, "
-                    f"{len(remaining)} tokens remaining"
-                )
-            else:
-                request.cache_hit_type = "miss"
-                request.remaining_tokens = request.prompt_token_ids
-
+            logger.info(
+                f"[cache_fetch] request={request.request_id[:12]} HIT "
+                f"cached={request.cached_tokens} remaining={len(hit.remaining_tokens)}"
+            )
         else:
             request.cache_hit_type = "miss"
             request.remaining_tokens = request.prompt_token_ids
+            self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
+            logger.info(
+                f"[cache_fetch] request={request.request_id[:12]} MISS "
+                f"prompt_tokens={len(request.prompt_token_ids)}"
+            )
+            # SSD tier check (memory cache only): promote evicted entries async
+            if self._ssd_tier is not None and self.memory_aware_cache is not None:
+                ssd_candidate = self.memory_aware_cache.check_ssd(request.prompt_token_ids)
+                if ssd_candidate is not None:
+                    request.cache_hit_type = "ssd_pending"
+                    request._ssd_candidate = ssd_candidate
 
     def _try_promote_ssd_for_request(self, request: Request) -> None:
         """Attempt synchronous SSD promotion for a single request tagged ssd_pending.
@@ -2574,181 +2461,23 @@ class Scheduler:
             request = self.running.get(request_id)
 
             # Store cache for future reuse
-            if request is not None and request.prompt_token_ids:
-                if self.block_aware_cache is not None:
-                    # Store in paged cache
-                    # Key includes both prompt and output tokens for multi-turn chat caching
-                    if (
-                        hasattr(request, "_extracted_cache")
-                        and request._extracted_cache is not None
-                    ):
-                        try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(
-                                request.output_token_ids
-                            )
-                            self.block_aware_cache.store_cache(
-                                request_id,
-                                full_token_sequence,
-                                request._extracted_cache,
-                            )
-                            logger.info(
-                                f"[paged_cache] request={request_id[:12]} STORED "
-                                f"{len(full_token_sequence)} tokens "
-                                f"({len(request.prompt_token_ids)} prompt + "
-                                f"{len(request.output_token_ids)} output)"
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"[paged_cache] request={request_id[:12]} store failed: {e}"
-                            )
-                    # Release the request's block references so blocks can be
-                    # shared and eventually evicted. Blocks survive because
-                    # store_cache increments their ref beyond the base alloc ref.
+            if request is not None and request.prompt_token_ids and self._prefix_cache is not None:
+                _store_cache = getattr(request, "_extracted_cache", None)
+                _store_tokens = (
+                    list(request.prompt_token_ids) + list(request.output_token_ids)
+                )
+                if _store_cache is not None:
+                    request.store_tokens = _store_tokens
                     try:
-                        self.block_aware_cache.release_cache(request_id)
+                        self._prefix_cache.store(request, _store_cache)
                     except Exception as e:
-                        logger.debug(f"[paged_cache] release_cache failed for {request_id}: {e}")
-
-                elif self.memory_aware_cache is not None:
-                    # Keep mid-prefill entry as prefix cache for future
-                    # requests that share a common prefix (e.g. same system
-                    # prompt + tools but different user message).  LRU
-                    # eviction handles memory pressure.
-
-                    # Store in memory-aware prefix cache
-                    # Key includes both prompt and output tokens for multi-turn chat caching
-                    if (
-                        hasattr(request, "_extracted_cache")
-                        and request._extracted_cache is not None
-                    ):
-                        try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(
-                                request.output_token_ids
-                            )
-                            import time as _time
-
-                            self._log_cache_key("put", request_id, full_token_sequence)
-                            _store_t0 = _time.monotonic()
-                            stored = self.memory_aware_cache.store(
-                                full_token_sequence,
-                                request._extracted_cache,
-                                evict_prefixes=False,
-                            )
-                            _store_dt = _time.monotonic() - _store_t0
-                            # NOTE: We intentionally do NOT store a prompt-only
-                            # cache entry.  Hybrid Mamba+Transformer models
-                            # (like Qwen3-Coder-Next) have MambaCache layers
-                            # whose state is cumulative and cannot be trimmed
-                            # back to "prompt only".  Reusing such state causes
-                            # the model to immediately produce EOS.
-                            # The full prompt+output entry is stored above; a
-                            # future request with the same prompt will hit the
-                            # supersequence match path in the fetch, which is
-                            # now disabled for safety (see memory_cache.py).
-
-                            logger.info(
-                                f"[cache_store] request={request_id[:12]} "
-                                f"tokens={len(full_token_sequence)} "
-                                f"({len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output) "
-                                f"stored={stored} time={_store_dt:.3f}s "
-                                f"cache_entries={len(self.memory_aware_cache._entries)} "
-                                f"cache_mem={self.memory_aware_cache._current_memory / 1e6:.0f}MB"
-                            )
-                            # Release the original FP16 cache reference so
-                            # memory can be reclaimed (the quantized copy
-                            # lives inside the prefix cache now).
-                            request._extracted_cache = None
-                            request._sys_prompt_state = None
-                        except Exception as e:
-                            logger.debug(
-                                f"Failed to store memory-aware cache for {request_id}: {e}"
-                            )
-
-                elif self.turn_cache is not None:
-                    segments = self._messages_to_segments(request)
-                    path = getattr(request, "_turn_cache_path", None) or []
-                    matched_depth = len(path)
-                    parent = path[-1] if path else self.turn_cache.root
-                    new_segments = segments[matched_depth:]
-                    _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-                    _boundary_states = getattr(request, "_boundary_states", None) or {}
-
-                    if new_segments and request.output_token_ids:
-                        for i, segment in enumerate(new_segments[:-1]):
-                            abs_idx = matched_depth + i
-                            is_sys = segment.role == "system" and abs_idx == 0
-                            is_last = i == len(new_segments) - 1
-                            full_state = None if is_last else (
-                                _boundary_states.get(_turn_boundaries[abs_idx])
-                                if abs_idx < len(_turn_boundaries) else None
-                            )
-                            if full_state is not None:
-                                kv_slice, recur = self.turn_cache._split_cache_arrays(
-                                    full_state, parent.n_tokens
-                                )
-                            else:
-                                kv_slice, recur = [], None
-                            parent = self.turn_cache.insert(
-                                parent, segment, kv_slice, None, recur,
-                                is_system_prompt=is_sys,
-                            )
-
-                        # Store the assistant response as the final segment with
-                        # the full KV state so the next turn can skip prefilling it.
-                        response_tokens = list(segments[-1].token_ids + request.output_token_ids)
-                        ec = getattr(request, "_extracted_cache", None)
-                        resp_full_state = None
-                        if ec is not None:
-                            if ec and isinstance(ec[0], dict):
-                                resp_full_state = ec
-                            else:
-                                resp_full_state = self._extract_cache_states(ec) or None
-                        if resp_full_state is not None:
-                            resp_kv, resp_recur = self.turn_cache._split_cache_arrays(
-                                resp_full_state, parent.n_tokens
-                            )
-                        else:
-                            resp_kv, resp_recur = [], None
-                        parent = self.turn_cache.insert(
-                            parent,
-                            Segment(role="conversation", token_ids=response_tokens),
-                            resp_kv, None, resp_recur,
-                        )
-
-                        logger.info(
-                            f"[turn_cache] stored {len(new_segments) + 1} new segment(s) "
-                            f"({len(response_tokens)}t response, state={'yes' if resp_full_state else 'no'}) "
-                            f"for {request_id[:12]}"
-                        )
-
-                    if path:
-                        self.turn_cache.release(path)
-                    request._turn_cache_path = []
-
-                    logger.debug(f"[turn_cache] cache structure after store:\n{self.turn_cache.visualize(tokenizer=self._actual_tokenizer)}")
-
-                elif self.prefix_cache is not None:
-                    # Store in legacy prefix cache
-                    # Key includes both prompt and output tokens for multi-turn chat caching
-                    # The next turn's prompt will include the previous response
-                    if (
-                        hasattr(request, "_extracted_cache")
-                        and request._extracted_cache is not None
-                    ):
-                        try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(
-                                request.output_token_ids
-                            )
-                            self.prefix_cache.store_cache(
-                                full_token_sequence,
-                                request._extracted_cache,
-                            )
-                            logger.debug(
-                                f"Stored cache for request {request_id} "
-                                f"({len(full_token_sequence)} tokens: {len(request.prompt_token_ids)} prompt + {len(request.output_token_ids)} output)"
-                            )
-                        except Exception as e:
-                            logger.debug(f"Failed to store cache for {request_id}: {e}")
+                        logger.debug(f"[cache_store] store failed for {request_id}: {e}")
+                _handle = getattr(request, "_turn_cache_path", None)
+                try:
+                    self._prefix_cache.release(_handle)
+                except Exception as e:
+                    logger.debug(f"[cache_store] release failed for {request_id}: {e}")
+                request._turn_cache_path = []
 
             # Evaluate stored cache tensors incrementally (per-layer) to prevent
             # a deferred batch evaluation spike when all lazy ops resolve at once.
@@ -2830,12 +2559,8 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Clear caches
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear()
-        if self.memory_aware_cache is not None:
-            self.memory_aware_cache.clear()
-        if self.prefix_cache is not None:
-            self.prefix_cache.clear()
+        if self._prefix_cache is not None:
+            self._prefix_cache.clear()
 
         # Clear UID mappings
         self.request_id_to_uid.clear()
@@ -3131,22 +2856,14 @@ class Scheduler:
             pass
 
         # Include cache stats
-        if self.block_aware_cache is not None:
-            stats["paged_cache"] = self.block_aware_cache.get_stats()
-        elif self.memory_aware_cache is not None:
-            stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
-        elif self.prefix_cache is not None:
-            stats["prefix_cache"] = self.prefix_cache.get_stats()
+        if self._prefix_cache is not None:
+            stats["cache"] = self._prefix_cache.get_stats()
         return stats
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get cache statistics."""
-        if self.block_aware_cache is not None:
-            return self.block_aware_cache.get_stats()
-        elif self.memory_aware_cache is not None:
-            return self.memory_aware_cache.get_stats()
-        elif self.prefix_cache is not None:
-            return self.prefix_cache.get_stats()
+        if self._prefix_cache is not None:
+            return self._prefix_cache.get_stats()
         return None
 
     def clear_runtime_caches(self) -> Dict[str, bool]:
@@ -3467,45 +3184,8 @@ class Scheduler:
             logger.warning(f"[ssd_promote] reconstruction failed: {e}")
             return None
 
-    # TODO: Cache this?
-    def _messages_to_segments(self, request: "Request") -> list[Segment]:
-        """Split a request's token sequence into per-message Segment objects.
+    def _messages_to_segments(self, request):
+        """Delegates to TurnCacheAdapter.messages_to_segments (kept for existing tests)."""
+        from .prefix_cache_adapters import TurnCacheAdapter
+        return TurnCacheAdapter.messages_to_segments(request)
 
-        Uses _turn_boundaries = [B_sys, B_1, ..., B_{N-1}] computed by
-        _compute_turn_boundaries in batched.py.
-
-        Produces:
-          1. Segment(role="system",       token_ids=full[0      : B_sys ])
-          2. Segment(role="conversation", token_ids=full[B_sys  : B_1  ])  (if N >= 2)
-          ...
-          k. Segment(role="conversation", token_ids=full[B_{k-2}: B_{k-1}])
-          k+1. Segment(role="user",       token_ids=full[B_{N-1}:       ])
-        """
-        from .turn_prefix_cache import Segment
-
-        full_tokens = list(request.prompt_token_ids or [])
-        if not full_tokens:
-            return []
-
-        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-        if not _turn_boundaries:
-            return []
-
-        B_sys = _turn_boundaries[0]
-        if B_sys <= 0 or B_sys >= len(full_tokens):
-            return []
-
-        segments: list[Segment] = [
-            Segment(role="system", token_ids=full_tokens[:B_sys])
-        ]
-
-        prev = B_sys
-        for B_k in _turn_boundaries[1:]:
-            if B_k > prev and B_k < len(full_tokens):
-                segments.append(Segment(role="conversation", token_ids=full_tokens[prev:B_k]))
-                prev = B_k
-
-        if prev < len(full_tokens):
-            segments.append(Segment(role="user", token_ids=full_tokens[prev:]))
-
-        return segments if len(segments) > 1 else []
