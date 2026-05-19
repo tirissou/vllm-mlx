@@ -200,7 +200,7 @@ def _make_recurrent_layer():
 
 
 def test_extract_recurrent_state_returns_only_non_kv_layers():
-    from vllm_mlx.scheduler import _extract_recurrent_state
+    from vllm_mlx.kv_cache import extract_recurrent_state as _extract_recurrent_state
     kv = _make_kv_cache()
     recur = _make_recurrent_layer()
     result = _extract_recurrent_state([kv, recur, kv])
@@ -209,13 +209,13 @@ def test_extract_recurrent_state_returns_only_non_kv_layers():
 
 
 def test_extract_recurrent_state_empty_for_pure_kv():
-    from vllm_mlx.scheduler import _extract_recurrent_state
+    from vllm_mlx.kv_cache import extract_recurrent_state as _extract_recurrent_state
     result = _extract_recurrent_state([_make_kv_cache(), _make_kv_cache()])
     assert result == []
 
 
 def test_compose_n_minus_1_cache_trims_kv_offset():
-    from vllm_mlx.scheduler import _compose_n_minus_1_cache
+    from vllm_mlx.kv_cache import compose_n_minus_1_cache as _compose_n_minus_1_cache
 
     kv_dict = {
         "state": (mx.zeros((1, 8, 4, 64)), mx.zeros((1, 8, 4, 64))),
@@ -224,12 +224,12 @@ def test_compose_n_minus_1_cache_trims_kv_offset():
         "class_ref": None,
     }
     composed = _compose_n_minus_1_cache([kv_dict], prev_recurrent_extracted=[])
-    # offset should be reduced from 4 to 3
-    assert composed[0]["meta_state"][0] == 3
+    # offset should be reduced from 4 to 3 (stored as string in meta_state)
+    assert int(composed[0]["meta_state"][0]) == 3
 
 
 def test_compose_n_minus_1_cache_replaces_recurrent_with_snapshot():
-    from vllm_mlx.scheduler import _compose_n_minus_1_cache
+    from vllm_mlx.kv_cache import compose_n_minus_1_cache as _compose_n_minus_1_cache
 
     kv_dict = {
         "state": (mx.zeros((1, 8, 4, 64)), mx.zeros((1, 8, 4, 64))),
@@ -246,6 +246,73 @@ def test_compose_n_minus_1_cache_replaces_recurrent_with_snapshot():
     )
     assert composed[0]["class_name"] == "KVCache"
     assert composed[1]["state"] == "SNAPSHOT"   # replaced with N-1 snapshot
+
+
+class TestBuildPrefixCache:
+    """_build_prefix_cache selects the right adapter for each SchedulerConfig variant."""
+
+    def _config(self, **kwargs):
+        from vllm_mlx.scheduler import SchedulerConfig
+        # Disable all backends by default so tests opt-in explicitly
+        base = dict(use_paged_cache=False, use_memory_aware_cache=False, use_turn_cache=False)
+        base.update(kwargs)
+        return SchedulerConfig(**base)
+
+    def test_memory_aware_config_returns_memory_cache_adapter(self):
+        from unittest.mock import MagicMock, patch
+        from vllm_mlx.scheduler import _build_prefix_cache
+
+        mock_inner = MagicMock()
+        mock_inner.memory_limit_mb = 1000.0
+        with patch("vllm_mlx.scheduler.MemoryAwarePrefixCache", return_value=mock_inner):
+            bundle = _build_prefix_cache(self._config(use_memory_aware_cache=True), model=object())
+
+        assert isinstance(bundle.adapter, MemoryCacheAdapter)
+        assert bundle.memory_aware_cache is mock_inner
+        assert bundle.prefix_cache is None
+        assert bundle.turn_cache is None
+        assert bundle.ssd_tier is None
+
+    def test_legacy_config_returns_legacy_cache_adapter(self):
+        from unittest.mock import MagicMock, patch
+        from vllm_mlx.scheduler import _build_prefix_cache
+
+        mock_pm = MagicMock()
+        with patch("vllm_mlx.scheduler.PrefixCacheManager", return_value=mock_pm):
+            bundle = _build_prefix_cache(self._config(), model=object())
+
+        assert isinstance(bundle.adapter, LegacyCacheAdapter)
+        assert bundle.prefix_cache is mock_pm
+        assert bundle.memory_aware_cache is None
+        assert bundle.turn_cache is None
+
+    def test_turn_cache_config_returns_turn_cache_adapter(self):
+        from unittest.mock import MagicMock, patch
+        from vllm_mlx.scheduler import _build_prefix_cache
+
+        mock_tc = MagicMock()
+        with patch("vllm_mlx.turn_prefix_cache.TurnPrefixCache", return_value=mock_tc):
+            bundle = _build_prefix_cache(self._config(use_turn_cache=True), model=object())
+
+        assert isinstance(bundle.adapter, TurnCacheAdapter)
+        assert bundle.turn_cache is mock_tc
+        assert bundle.memory_aware_cache is None
+        assert bundle.prefix_cache is None
+
+    def test_paged_cache_config_returns_paged_cache_adapter(self):
+        from unittest.mock import MagicMock, patch
+        from vllm_mlx.scheduler import _build_prefix_cache
+
+        mock_pcm = MagicMock()
+        mock_bac = MagicMock()
+        with patch("vllm_mlx.scheduler.PagedCacheManager", return_value=mock_pcm), \
+             patch("vllm_mlx.scheduler.BlockAwarePrefixCache", return_value=mock_bac):
+            bundle = _build_prefix_cache(self._config(use_paged_cache=True), model=object())
+
+        assert isinstance(bundle.adapter, PagedCacheAdapter)
+        assert bundle.paged_cache_manager is mock_pcm
+        assert bundle.block_aware_cache is mock_bac
+        assert bundle.memory_aware_cache is None
 
 
 def test_request_cache_state_is_single_attribute():

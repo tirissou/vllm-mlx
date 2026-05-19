@@ -479,6 +479,60 @@ class TestSchedulerPrefixCacheIntegration:
 # Regression: _extract_recurrent_state must filter QuantizedKVCache (mlx_lm)
 # ---------------------------------------------------------------------------
 
+class TestExtractCacheStates:
+    """extract_cache_states converts live KV layer objects to serialisable dicts."""
+
+    def test_empty_input_returns_empty(self):
+        from vllm_mlx.kv_cache import extract_cache_states
+        assert extract_cache_states([]) == []
+
+    def test_kvcache_layer_produces_expected_dict_shape(self):
+        from vllm_mlx.kv_cache import extract_cache_states
+        kv = KVCache()
+        kv.keys = mx.zeros((1, 4, 8, 64))
+        kv.values = mx.zeros((1, 4, 8, 64))
+        kv.offset = 8
+        result = extract_cache_states([kv])
+        assert len(result) == 1
+        layer = result[0]
+        assert layer["class_name"] == "KVCache"
+        assert layer["class_ref"] is KVCache
+        # state holds the (keys, values) tensors
+        assert len(layer["state"]) == 2
+        # mlx-lm KVCache.meta_state returns "" — offset is recovered from key shape
+        assert "meta_state" in layer
+
+    def test_layer_missing_state_attr_causes_failure(self):
+        from vllm_mlx.kv_cache import extract_cache_states
+
+        class NoState:
+            pass
+
+        assert extract_cache_states([NoState()]) == []
+
+
+class TestReconstructCacheFromStates:
+    """reconstruct_cache_from_states is the inverse of extract_cache_states."""
+
+    def test_empty_input_returns_none(self):
+        from vllm_mlx.kv_cache import reconstruct_cache_from_states
+        assert reconstruct_cache_from_states([]) is None
+
+    def test_kvcache_round_trip(self):
+        from vllm_mlx.kv_cache import extract_cache_states, reconstruct_cache_from_states
+        kv = KVCache()
+        kv.keys = mx.zeros((1, 4, 8, 64))
+        kv.values = mx.zeros((1, 4, 8, 64))
+        kv.offset = 8
+        extracted = extract_cache_states([kv])
+        assert extracted, "extraction must succeed before round-trip"
+        reconstructed = reconstruct_cache_from_states(extracted)
+        assert reconstructed is not None
+        assert len(reconstructed) == 1
+        assert isinstance(reconstructed[0], KVCache)
+        assert reconstructed[0].offset == 8
+
+
 def test_extract_recurrent_state_filters_mlx_quantized_kv_cache():
     """mlx_lm.QuantizedKVCache must be treated as a KV layer, not recurrent.
 
@@ -489,7 +543,7 @@ def test_extract_recurrent_state_filters_mlx_quantized_kv_cache():
     IndexError: list index out of range at recurrent[i].
     """
     from mlx_lm.models.cache import QuantizedKVCache
-    from vllm_mlx.scheduler import _extract_recurrent_state
+    from vllm_mlx.kv_cache import extract_recurrent_state as _extract_recurrent_state
 
     layer = QuantizedKVCache()
     result = _extract_recurrent_state([layer])
@@ -500,7 +554,7 @@ def test_extract_recurrent_state_filters_mlx_quantized_kv_cache():
 
 def test_extract_recurrent_state_keeps_non_kv_layers():
     """Non-KV layers (e.g. plain objects) are returned as recurrent state."""
-    from vllm_mlx.scheduler import _extract_recurrent_state
+    from vllm_mlx.kv_cache import extract_recurrent_state as _extract_recurrent_state
 
     class FakeMambaLayer:
         pass

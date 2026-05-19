@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 
 class QuantizedArray(NamedTuple):
@@ -109,3 +112,185 @@ def extract_layer_state(layer) -> dict | None:
             "class_ref": type(layer),
         }
     return None
+
+
+def extract_recurrent_state(cache: list) -> list:
+    """Return only the non-KV layers from a live cache list.
+
+    KV layers have an `offset` attribute and a `keys` attribute.
+    Recurrent layers (Mamba, DeltaRNN) have neither.
+    """
+    from mlx_lm.models.cache import KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache
+    try:
+        from .batch_quantized_kv_cache import BatchQuantizedKVCache as _QuantizedCacheWrapper
+        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache, _QuantizedCacheWrapper)
+    except ImportError:
+        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache)
+    return [layer for layer in cache if not isinstance(layer, kv_types)]
+
+
+def _is_kv_extracted(layer: dict) -> bool:
+    """True if an extracted state dict represents a KV (not recurrent) layer."""
+    name = layer.get("class_name", "")
+    return "KV" in name or "Quantized" in name or name == "RotatingKVCache"
+
+
+def compose_n_minus_1_cache(
+    decoded_cache: list, prev_recurrent_extracted: list
+) -> list:
+    """Build the N-1 cache from extracted state dicts.
+
+    KV layers: offset (meta_state[0]) trimmed by 1.
+    Recurrent layers: replaced with prev_recurrent_extracted snapshot.
+
+    decoded_cache: extracted state dicts at offset N (from extract_cache_states).
+    prev_recurrent_extracted: extracted recurrent-only state dicts at offset N-1.
+    """
+    if not decoded_cache:
+        return []
+
+    result = []
+    recurrent_idx = 0
+    for layer in decoded_cache:
+        if not isinstance(layer, dict):
+            result.append(layer)
+            continue
+
+        if _is_kv_extracted(layer):
+            meta = layer.get("meta_state")
+            if meta and len(meta) > 0:
+                new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
+                result.append({**layer, "meta_state": new_meta})
+            else:
+                result.append(layer)
+        else:
+            if recurrent_idx < len(prev_recurrent_extracted):
+                result.append(prev_recurrent_extracted[recurrent_idx])
+                recurrent_idx += 1
+            else:
+                result.append(layer)
+
+    return result
+
+
+def extract_cache_states(raw_cache: list) -> list:
+    """Extract actual tensor state from each layer cache.
+
+    This extracts the real KV data using mlx-lm's cache.state property,
+    allowing the data to be stored and reconstructed later even after
+    the BatchGenerator is recreated.
+
+    Returns:
+        List of dicts with {state, meta_state, class_name, class_ref}, or []
+        if any layer fails extraction.
+    """
+    if not raw_cache:
+        return []
+
+    extracted = []
+    for i, layer_cache in enumerate(raw_cache):
+        try:
+            d = extract_layer_state(layer_cache)
+            if d is not None:
+                extracted.append(d)
+        except Exception as e:
+            logger.warning(
+                f"Failed to extract state from cache layer {i}/{len(raw_cache)} "
+                f"(type={type(layer_cache).__name__}): {e}"
+            )
+
+    if len(extracted) != len(raw_cache):
+        logger.warning(
+            f"extract_cache_states partial: {len(extracted)}/{len(raw_cache)} layers succeeded"
+        )
+        return []
+    return extracted
+
+
+def reconstruct_cache_from_states(extracted_states: list) -> list | None:
+    """Reconstruct cache objects from extracted cache states.
+
+    Inverse of extract_cache_states(). Uses mlx-lm's _BaseCache.from_state()
+    to reconstruct any cache type (KVCache, MambaCache, etc.).
+
+    Returns:
+        List of cache objects, or None if reconstruction fails.
+    """
+    if not extracted_states:
+        return None
+
+    try:
+        caches = []
+        for layer_state in extracted_states:
+            state = layer_state.get("state")
+            meta_state = layer_state.get("meta_state")
+            cache_cls = layer_state.get("class_ref")
+            if state is None:
+                return None
+
+            if cache_cls is not None and hasattr(cache_cls, "from_state"):
+                from mlx_lm.models.cache import (
+                    BatchKVCache as _BatchKVCache,
+                    KVCache as _KVCache,
+                )
+                if cache_cls is _BatchKVCache:
+                    keys, values = state[0], state[1]
+                    cache = _KVCache()
+                    cache.keys = keys
+                    cache.values = values
+                    cache.offset = keys.shape[2]
+                else:
+                    cache = cache_cls.from_state(state, meta_state)
+            else:
+                from mlx_lm.models.cache import KVCache
+
+                if len(state) != 2:
+                    return None
+                cache = KVCache()
+                cache.keys, cache.values = state
+                cache.offset = (
+                    int(meta_state[0]) if meta_state else cache.keys.shape[2]
+                )
+
+            caches.append(cache)
+
+        return caches
+
+    except Exception as e:
+        logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
+        return None
+
+
+def reconstruct_ssd_layers(layer_dicts: list) -> list | None:
+    """Reconstruct cache objects from deserialized SSD layer dicts.
+
+    Converts numpy arrays back to MLX arrays and creates KVCache objects.
+    """
+    try:
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        result = []
+        for ld in layer_dicts:
+            if "keys" in ld and "values" in ld:
+                kv = KVCache()
+                kv.keys = mx.array(ld["keys"])
+                kv.values = mx.array(ld["values"])
+                kv.offset = ld["offset"]
+                for attr in ("max_size", "keep", "step", "_idx"):
+                    if attr in ld:
+                        setattr(kv, attr, ld[attr])
+                result.append(kv)
+            elif "state" in ld:
+                state_arrays = [mx.array(a) for a in ld["state"]]
+                layer_obj = ArraysCache(len(state_arrays))
+                layer_obj.state = state_arrays
+                result.append(layer_obj)
+            else:
+                logger.warning(
+                    f"[ssd_promote] unknown layer dict format: {list(ld.keys())}"
+                )
+                return None
+        return result
+    except Exception as e:
+        logger.warning(f"[ssd_promote] reconstruction failed: {e}")
+        return None

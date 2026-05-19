@@ -32,7 +32,14 @@ from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .kv_cache import RequestCacheState
+from .kv_cache import (
+    RequestCacheState,
+    compose_n_minus_1_cache,
+    extract_cache_states,
+    extract_recurrent_state,
+    reconstruct_cache_from_states,
+    reconstruct_ssd_layers,
+)
 from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
 from .patches.mlx_lm_quantized_sdpa import patch_quantized_sdpa
@@ -57,66 +64,7 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
-def _extract_recurrent_state(cache: list) -> list:
-    """Return only the non-KV layers from a live cache list.
-
-    KV layers have an `offset` attribute and a `keys` attribute.
-    Recurrent layers (Mamba, DeltaRNN) have neither.
-    """
-    from mlx_lm.models.cache import KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache
-    try:
-        from .batch_quantized_kv_cache import BatchQuantizedKVCache as _QuantizedCacheWrapper
-        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache, _QuantizedCacheWrapper)
-    except ImportError:
-        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache)
-    return [layer for layer in cache if not isinstance(layer, kv_types)]
-
-
-def _is_kv_extracted(layer: dict) -> bool:
-    """True if an extracted state dict represents a KV (not recurrent) layer."""
-    name = layer.get("class_name", "")
-    return "KV" in name or "Quantized" in name or name == "RotatingKVCache"
-
-
-def _compose_n_minus_1_cache(
-    decoded_cache: list, prev_recurrent_extracted: list
-) -> list:
-    """Build the N-1 cache from extracted state dicts.
-
-    KV layers: offset (meta_state[0]) trimmed by 1.
-    Recurrent layers: replaced with prev_recurrent_extracted snapshot.
-
-    decoded_cache: extracted state dicts at offset N (from _extract_cache_states).
-    prev_recurrent_extracted: extracted recurrent-only state dicts at offset N-1.
-    """
-    if not decoded_cache:
-        return []
-
-    # Trim KV offsets by 1 and replace recurrent with snapshot
-    result = []
-    recurrent_idx = 0
-    for layer in decoded_cache:
-        if not isinstance(layer, dict):
-            result.append(layer)
-            continue
-
-        if _is_kv_extracted(layer):
-            # Trim offset by 1 for KV layers (meta_state is a tuple)
-            meta = layer.get("meta_state")
-            if meta and len(meta) > 0:
-                new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
-                result.append({**layer, "meta_state": new_meta})
-            else:
-                result.append(layer)
-        else:
-            # Recurrent layer: replace with N-1 snapshot if available
-            if recurrent_idx < len(prev_recurrent_extracted):
-                result.append(prev_recurrent_extracted[recurrent_idx])
-                recurrent_idx += 1
-            else:
-                result.append(layer)
-
-    return result
+# extract_recurrent_state, compose_n_minus_1_cache and related helpers live in kv_cache.py
 
 
 class SchedulingPolicy(Enum):
@@ -1217,6 +1165,113 @@ def _install_mtp(
     )
 
 
+@dataclass
+class _PrefixCacheBundle:
+    """All prefix-cache objects produced by _build_prefix_cache."""
+    adapter: Any = None            # PrefixCache protocol adapter
+    memory_aware_cache: Any = None
+    prefix_cache: Any = None       # legacy PrefixCacheManager
+    paged_cache_manager: Any = None
+    block_aware_cache: Any = None
+    ssd_tier: Any = None
+    turn_cache: Any = None
+
+
+def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBundle:
+    """Construct the appropriate prefix-cache adapter from SchedulerConfig.
+
+    Encapsulates the four-way selection (paged / memory-aware / turn / legacy)
+    so that Scheduler.__init__ is not responsible for cache-backend wiring.
+    """
+    from .prefix_cache_adapters import (
+        LegacyCacheAdapter,
+        MemoryCacheAdapter,
+        PagedCacheAdapter,
+        TurnCacheAdapter,
+    )
+
+    bundle = _PrefixCacheBundle()
+
+    if config.use_paged_cache:
+        paged_cache_manager = PagedCacheManager(
+            block_size=config.paged_cache_block_size,
+            max_blocks=config.max_cache_blocks,
+        )
+        block_aware_cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache_manager,
+        )
+        bundle.paged_cache_manager = paged_cache_manager
+        bundle.block_aware_cache = block_aware_cache
+        bundle.adapter = PagedCacheAdapter(block_aware_cache)
+        logger.info(
+            f"Paged cache enabled: block_size={config.paged_cache_block_size}, "
+            f"max_blocks={config.max_cache_blocks}"
+        )
+
+    elif config.use_memory_aware_cache and not config.use_turn_cache:
+        cache_config = MemoryCacheConfig(
+            max_memory_mb=config.cache_memory_mb,
+            max_memory_percent=config.cache_memory_percent,
+            kv_quantize=config.kv_cache_quantization,
+            kv_bits=config.kv_cache_quantization_bits,
+            kv_group_size=config.kv_cache_quantization_group_size,
+            kv_min_quantize_tokens=config.kv_cache_min_quantize_tokens,
+        )
+        memory_aware_cache = MemoryAwarePrefixCache(model=model, config=cache_config)
+        bundle.memory_aware_cache = memory_aware_cache
+        bundle.adapter = MemoryCacheAdapter(
+            memory_aware_cache,
+            mid_prefill_save_interval=config.mid_prefill_save_interval,
+        )
+        logger.info(
+            f"Memory-aware cache enabled: "
+            f"limit={memory_aware_cache.memory_limit_mb:.1f}MB"
+        )
+
+        if config.ssd_cache_dir is not None:
+            ssd_config = SSDCacheConfig(
+                cache_dir=config.ssd_cache_dir,
+                max_size_gb=config.ssd_cache_max_gb,
+            )
+            ssd_tier = SSDCacheTier(ssd_config)
+            ssd_tier.start_writer()
+            ssd_tier.reconcile()
+            memory_aware_cache.set_ssd_tier(ssd_tier)
+            bundle.ssd_tier = ssd_tier
+            logger.info(
+                f"SSD cache tier enabled: dir={config.ssd_cache_dir}, "
+                f"max={config.ssd_cache_max_gb}GB"
+            )
+
+    elif config.use_turn_cache:
+        from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+        turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(
+            checkpoint_stride=config.turn_cache_stride,
+            max_memory_gb=config.turn_cache_memory_gb,
+            ssd_max_gb=config.turn_cache_ssd_gb,
+        ))
+        bundle.turn_cache = turn_cache
+        bundle.adapter = TurnCacheAdapter(turn_cache)
+        logger.info(
+            f"TurnPrefixCache enabled: stride={config.turn_cache_stride} "
+            f"memory={config.turn_cache_memory_gb}GB"
+        )
+
+    else:
+        prefix_cache = PrefixCacheManager(
+            model=model,
+            max_entries=config.prefix_cache_size,
+        )
+        bundle.prefix_cache = prefix_cache
+        bundle.adapter = LegacyCacheAdapter(prefix_cache)
+        logger.info(
+            f"Prefix cache enabled with max_entries={config.prefix_cache_size}"
+        )
+
+    return bundle
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -1280,7 +1335,7 @@ class Scheduler:
         self._cache_key_log_path: Optional[str] = self.config.cache_key_log_path
 
         # Prefix cache for KV state reuse
-        self._prefix_cache = None  # PrefixCache protocol adapter (new unified path)
+        self._prefix_cache = None
         self.prefix_cache: Optional[PrefixCacheManager] = None
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
@@ -1289,87 +1344,14 @@ class Scheduler:
         self.turn_cache: Optional[TurnPrefixCache] = None
 
         if self.config.enable_prefix_cache:
-            from .prefix_cache_adapters import (
-                LegacyCacheAdapter,
-                MemoryCacheAdapter,
-                PagedCacheAdapter,
-                TurnCacheAdapter,
-            )
-
-            if self.config.use_paged_cache:
-                # Use paged cache for memory efficiency
-                self.paged_cache_manager = PagedCacheManager(
-                    block_size=self.config.paged_cache_block_size,
-                    max_blocks=self.config.max_cache_blocks,
-                )
-                self.block_aware_cache = BlockAwarePrefixCache(
-                    model=model,
-                    paged_cache_manager=self.paged_cache_manager,
-                )
-                self._prefix_cache = PagedCacheAdapter(self.block_aware_cache)
-                logger.info(
-                    f"Paged cache enabled: block_size={self.config.paged_cache_block_size}, "
-                    f"max_blocks={self.config.max_cache_blocks}"
-                )
-            elif self.config.use_memory_aware_cache and not self.config.use_turn_cache:
-                # Use memory-aware cache (recommended for large models)
-                cache_config = MemoryCacheConfig(
-                    max_memory_mb=self.config.cache_memory_mb,
-                    max_memory_percent=self.config.cache_memory_percent,
-                    kv_quantize=self.config.kv_cache_quantization,
-                    kv_bits=self.config.kv_cache_quantization_bits,
-                    kv_group_size=self.config.kv_cache_quantization_group_size,
-                    kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
-                )
-                self.memory_aware_cache = MemoryAwarePrefixCache(
-                    model=model,
-                    config=cache_config,
-                )
-                self._prefix_cache = MemoryCacheAdapter(
-                    self.memory_aware_cache,
-                    mid_prefill_save_interval=self.config.mid_prefill_save_interval,
-                )
-                logger.info(
-                    f"Memory-aware cache enabled: "
-                    f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
-                )
-
-                if self.config.ssd_cache_dir is not None:
-                    ssd_config = SSDCacheConfig(
-                        cache_dir=self.config.ssd_cache_dir,
-                        max_size_gb=self.config.ssd_cache_max_gb,
-                    )
-                    self._ssd_tier = SSDCacheTier(ssd_config)
-                    self._ssd_tier.start_writer()
-                    self._ssd_tier.reconcile()
-                    self.memory_aware_cache.set_ssd_tier(self._ssd_tier)
-                    logger.info(
-                        f"SSD cache tier enabled: dir={self.config.ssd_cache_dir}, "
-                        f"max={self.config.ssd_cache_max_gb}GB"
-                    )
-
-            elif self.config.use_turn_cache:
-                from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
-                self.turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(
-                    checkpoint_stride=self.config.turn_cache_stride,
-                    max_memory_gb=self.config.turn_cache_memory_gb,
-                    ssd_max_gb=self.config.turn_cache_ssd_gb,
-                ))
-                self._prefix_cache = TurnCacheAdapter(self.turn_cache)
-                logger.info(
-                    f"TurnPrefixCache enabled: stride={self.config.turn_cache_stride} "
-                    f"memory={self.config.turn_cache_memory_gb}GB"
-                )
-            else:
-                # Use legacy entry-count based prefix cache
-                self.prefix_cache = PrefixCacheManager(
-                    model=model,
-                    max_entries=self.config.prefix_cache_size,
-                )
-                self._prefix_cache = LegacyCacheAdapter(self.prefix_cache)
-                logger.info(
-                    f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
-                )
+            _bundle = _build_prefix_cache(self.config, self.model)
+            self._prefix_cache = _bundle.adapter
+            self.memory_aware_cache = _bundle.memory_aware_cache
+            self.prefix_cache = _bundle.prefix_cache
+            self.paged_cache_manager = _bundle.paged_cache_manager
+            self.block_aware_cache = _bundle.block_aware_cache
+            self._ssd_tier = _bundle.ssd_tier
+            self.turn_cache = _bundle.turn_cache
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -1692,113 +1674,14 @@ class Scheduler:
         return True
 
     def _extract_cache_states(self, raw_cache: List[KVCache]) -> List[Dict[str, Any]]:
-        """
-        Extract actual tensor state from each layer cache.
-
-        This extracts the real KV data using mlx-lm's cache.state property,
-        allowing the data to be stored and reconstructed later even after
-        the BatchGenerator is recreated.
-
-        Args:
-            raw_cache: List of KVCache objects from mlx-lm
-
-        Returns:
-            List of dicts with {state: (keys, values), meta_state: (offset,), class_name: str}
-        """
-        if not raw_cache:
-            return []
-
-        extracted = []
-        for layer_cache in raw_cache:
-            try:
-                if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
-                    state = layer_cache.state  # (keys, values) or more for Mamba
-                    meta = layer_cache.meta_state  # (offset,) as strings
-                    extracted.append(
-                        {
-                            "state": state,
-                            "meta_state": meta,
-                            "class_name": type(layer_cache).__name__,
-                            "class_ref": type(layer_cache),
-                        }
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to extract state from cache layer {len(extracted)}/{len(raw_cache)} "
-                               f"(type={type(layer_cache).__name__}): {e}")
-                continue
-
-        if len(extracted) != len(raw_cache):
-            logger.warning(
-                f"_extract_cache_states partial: {len(extracted)}/{len(raw_cache)} layers succeeded"
-            )
-            return []
-        return extracted
+        """Thin wrapper — logic lives in kv_cache.extract_cache_states."""
+        return extract_cache_states(raw_cache)
 
     def _reconstruct_cache_from_states(
         self, extracted_states: List[Dict[str, Any]]
     ) -> Optional[List[Any]]:
-        """
-        Reconstruct cache objects from extracted cache states.
-
-        This is the inverse of _extract_cache_states(). Uses mlx-lm's
-        _BaseCache.from_state() to reconstruct any cache type (KVCache,
-        MambaCache, etc.) from its state/meta_state.
-
-        Args:
-            extracted_states: List of dicts from _extract_cache_states()
-
-        Returns:
-            List of cache objects, or None if reconstruction fails
-        """
-        if not extracted_states:
-            return None
-
-        try:
-            caches = []
-            for layer_state in extracted_states:
-                state = layer_state.get("state")
-                meta_state = layer_state.get("meta_state")
-                cache_cls = layer_state.get("class_ref")
-                if state is None:
-                    return None
-
-                if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    # BatchKVCache doesn't inherit from KVCache, so
-                    # _merge_caches can't handle it. Convert to KVCache
-                    # (safe because mid-prefill save is always batch_size=1).
-                    from mlx_lm.models.cache import (
-                        BatchKVCache as _BatchKVCache,
-                        KVCache as _KVCache,
-                    )
-
-                    if cache_cls is _BatchKVCache:
-                        # BatchKVCache.state = (keys, values, offset, left_padding)
-                        keys, values = state[0], state[1]
-                        cache = _KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
-                    else:
-                        cache = cache_cls.from_state(state, meta_state)
-                else:
-                    # Fallback: try KVCache manual reconstruction
-                    from mlx_lm.models.cache import KVCache
-
-                    if len(state) != 2:
-                        return None
-                    cache = KVCache()
-                    cache.keys, cache.values = state
-                    cache.offset = (
-                        int(meta_state[0]) if meta_state else cache.keys.shape[2]
-                    )
-
-                caches.append(cache)
-
-            return caches
-
-        except Exception as e:
-            logger.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
-            return None
+        """Thin wrapper — logic lives in kv_cache.reconstruct_cache_from_states."""
+        return reconstruct_cache_from_states(extracted_states)
 
     def add_request(self, request: Request) -> None:
         """
@@ -2336,7 +2219,7 @@ class Scheduler:
                     # Compose N-1 cache (trim KV by 1, replace recurrent with snapshot)
                     if request._cache_state.decoded_cache:
                         _prev_recur = request._cache_state.prev_recurrent or []
-                        request._cache_state.decoded_cache = _compose_n_minus_1_cache(
+                        request._cache_state.decoded_cache = compose_n_minus_1_cache(
                             request._cache_state.decoded_cache, _prev_recur
                         )
                         _full_tokens = (
@@ -2566,9 +2449,9 @@ class Scheduler:
                             if _req is not None:
                                 _live_cache = _ab.extract_cache(_e)
                                 if _live_cache:
-                                    _req_recur = _extract_recurrent_state(_live_cache)
+                                    _req_recur = extract_recurrent_state(_live_cache)
                                     _req._cache_state.prev_recurrent = (
-                                        self._extract_cache_states(_req_recur)
+                                        extract_cache_states(_req_recur)
                                         if _req_recur else []
                                     )
                     result = self.batch_generator.next()
@@ -2783,21 +2666,10 @@ class Scheduler:
 
     def clear_runtime_caches(self) -> Dict[str, bool]:
         """Clear prefix-cache state without resetting scheduler/request state."""
-        cleared = {
-            "paged_cache": False,
-            "memory_aware_cache": False,
-            "prefix_cache": False,
-        }
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear()
-            cleared["paged_cache"] = True
-        if self.memory_aware_cache is not None:
-            self.memory_aware_cache.clear()
-            cleared["memory_aware_cache"] = True
-        if self.prefix_cache is not None:
-            self.prefix_cache.clear()
-            cleared["prefix_cache"] = True
-        return cleared
+        if self._prefix_cache is not None:
+            self._prefix_cache.clear()
+            return {"cache": True}
+        return {}
 
     def reset(self) -> None:
         """Reset the scheduler state."""
@@ -3066,38 +2938,8 @@ class Scheduler:
         return True
 
     def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:
-        """Reconstruct cache objects from deserialized layer dicts.
-
-        Converts numpy arrays back to MLX arrays and creates KVCache objects.
-        """
-        try:
-            from mlx_lm.models.cache import ArraysCache, KVCache
-
-            result = []
-            for ld in layer_dicts:
-                if "keys" in ld and "values" in ld:
-                    kv = KVCache()
-                    kv.keys = mx.array(ld["keys"])
-                    kv.values = mx.array(ld["values"])
-                    kv.offset = ld["offset"]
-                    for attr in ("max_size", "keep", "step", "_idx"):
-                        if attr in ld:
-                            setattr(kv, attr, ld[attr])
-                    result.append(kv)
-                elif "state" in ld:
-                    state_arrays = [mx.array(a) for a in ld["state"]]
-                    layer_obj = ArraysCache(len(state_arrays))
-                    layer_obj.state = state_arrays
-                    result.append(layer_obj)
-                else:
-                    logger.warning(
-                        f"[ssd_promote] unknown layer dict format: {list(ld.keys())}"
-                    )
-                    return None
-            return result
-        except Exception as e:
-            logger.warning(f"[ssd_promote] reconstruction failed: {e}")
-            return None
+        """Thin wrapper — logic lives in kv_cache.reconstruct_ssd_layers."""
+        return reconstruct_ssd_layers(layer_dicts)
 
     def _messages_to_segments(self, request):
         """Delegates to TurnCacheAdapter.messages_to_segments (kept for existing tests)."""
