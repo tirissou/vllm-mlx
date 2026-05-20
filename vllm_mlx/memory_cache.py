@@ -29,6 +29,7 @@ import logging
 import math
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -1032,8 +1033,9 @@ class MemoryAwarePrefixCache:
     def _evict_lru(self) -> None:
         """Evict the least recently used entry.
 
-        If an SSD tier is attached, the entry is spilled to disk instead
-        of being discarded.
+        If a spill delegate is set, the entry is passed to the delegate for storage.
+        Otherwise, if an SSD tier is attached, the entry is spilled to disk.
+        If neither is configured, the entry is discarded.
         """
         with self._memory_lock:
             if not self._entries:
@@ -1149,7 +1151,11 @@ class MemoryAwarePrefixCache:
         if ssd_tier is not None:
             logger.info("[memory_cache] SSD tier attached for eviction spilling")
 
-    def set_spill_delegate(self, on_spill, on_promote) -> None:
+    def set_spill_delegate(
+        self,
+        on_spill: Callable[[tuple[int, ...], list], Any],
+        on_promote: Callable[[Any], list | None],
+    ) -> None:
         """Register a spill/promote delegate.
 
         When set, evicted entries call ``on_spill(tokens_key, layers)`` instead

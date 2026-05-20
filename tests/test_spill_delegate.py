@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Integration tests: SpillableCache.set_spill_delegate wired correctly."""
 
-import pytest
 from unittest.mock import MagicMock, call
 
 from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
@@ -66,4 +65,4 @@ class TestMemoryAwarePrefixCacheSpillDelegate:
         on_promote = MagicMock(return_value=None)
         cache.set_spill_delegate(on_spill, on_promote)
         # _ssd_tier should be None (not set externally)
-        assert cache._ssd_tier is None or cache._ssd_tier == cache._ssd_tier  # still present but unused
+        assert cache._ssd_tier is None  # not set externally
