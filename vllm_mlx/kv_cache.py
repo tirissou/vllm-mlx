@@ -50,9 +50,6 @@ class RequestCacheState:
     mid_prefill_last_save: int = 0
     mid_prefill_cache_key: tuple | None = None
 
-    # Written by _fetch_cache_for_request for SSD promotion (memory_aware only)
-    ssd_candidate: dict | None = None
-
     # Opaque per-adapter slot (e.g. turn_cache_path for TurnCacheAdapter)
     adapter_state: Any = None
 
@@ -165,11 +162,19 @@ def validate_cache(cache: Any) -> bool:
                     else layer_cache.keys
                 )
                 if keys_arr.shape[0] != 1:
+                    logger.debug(
+                        "validate_cache: batch dim mismatch on keys layer, shape=%s",
+                        keys_arr.shape,
+                    )
                     return False
             # Validate batch dimension for MambaCache layers
             if hasattr(layer_cache, "cache") and isinstance(layer_cache.cache, list):
                 for arr in layer_cache.cache:
                     if arr is not None and arr.shape[0] != 1:
+                        logger.debug(
+                            "validate_cache: batch dim mismatch on mamba layer, shape=%s",
+                            arr.shape,
+                        )
                         return False
 
     # Check BatchKVCache structure

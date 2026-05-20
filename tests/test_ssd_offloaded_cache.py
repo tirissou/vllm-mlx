@@ -82,7 +82,8 @@ class TestSSDOffloadedCacheFetch:
     def test_enqueues_promotion_when_entry_is_on_disk(self):
         inner = _make_inner()
         store = _make_store()
-        store.has.return_value = True
+        # Disk key (10, 20) is an exact prefix match for the request prompt.
+        store.all_keys.return_value = iter([(10, 20)])
         layers = [{"keys": [1]}]
         store.read.return_value = layers
         cache = SSDOffloadedCache(inner, store)
@@ -91,6 +92,8 @@ class TestSSDOffloadedCacheFetch:
             cache.fetch(_make_request([10, 20]))
             # Give the background thread time to promote
             time.sleep(0.1)
+            # all_keys must be re-iterable across fetch calls
+            store.all_keys.return_value = iter([(10, 20)])
             # Second fetch should return promoted entry
             result = cache.fetch(_make_request([10, 20]))
             assert result is not None
@@ -102,7 +105,8 @@ class TestSSDOffloadedCacheFetch:
     def test_does_not_double_enqueue_same_tokens(self):
         inner = _make_inner()
         store = _make_store()
-        store.has.return_value = True
+        # Disk key (1, 2) is an exact prefix match for the request prompt.
+        store.all_keys.side_effect = lambda: iter([(1, 2)])
         store.read.return_value = [{"keys": [1]}]
         cache = SSDOffloadedCache(inner, store)
         cache.start()
@@ -114,6 +118,27 @@ class TestSSDOffloadedCacheFetch:
             cache.close()
         # read should have been called at most once per distinct token key
         assert store.read.call_count <= 1
+
+    def test_partial_prefix_match_returns_ssd_hit_with_remaining_tokens(self):
+        """Disk key (1, 2) should match a longer prompt (1, 2, 3, 4)."""
+        inner = _make_inner()
+        store = _make_store()
+        layers = [{"keys": [1]}]
+        store.all_keys.side_effect = lambda: iter([(1, 2)])
+        store.read.return_value = layers
+        cache = SSDOffloadedCache(inner, store)
+        cache.start()
+        try:
+            cache.fetch(_make_request([1, 2, 3, 4]))
+            time.sleep(0.1)
+            store.all_keys.side_effect = lambda: iter([(1, 2)])
+            result = cache.fetch(_make_request([1, 2, 3, 4]))
+            assert result is not None
+            assert result.hit_type == "ssd_hit"
+            assert result.cached_tokens == 2
+            assert result.remaining_tokens == [3, 4]
+        finally:
+            cache.close()
 
 
 class TestSSDOffloadedCacheDelegation:
@@ -193,7 +218,7 @@ class TestSSDOffloadedCachePersistence:
     def test_failed_promotion_clears_in_flight(self):
         inner = _make_inner()
         store = _make_store()
-        store.has.return_value = True
+        store.all_keys.side_effect = lambda: iter([(1, 2, 3)])
         store.read.return_value = None  # read fails
         cache = SSDOffloadedCache(inner, store)
         cache.start()

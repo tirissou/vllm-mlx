@@ -17,7 +17,6 @@ def test_request_cache_state_defaults():
     assert cs.prev_recurrent is None
     assert cs.mid_prefill_last_save == 0
     assert cs.mid_prefill_cache_key is None
-    assert cs.ssd_candidate is None
     assert cs.adapter_state is None
 
 

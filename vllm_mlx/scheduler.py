@@ -1251,11 +1251,13 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             bundle.adapter = SSDOffloadedCache(bundle.adapter, disk_store)
             bundle.adapter.start()
             bundle.ssd_offloaded_cache = bundle.adapter
-            # Clear ssd_tier so the old scheduler SSD paths don't try to read from it
-            # (Task 7 will remove those paths entirely; until then, they're safely no-ops)
+            # SSDOffloadedCache owns SSD I/O via FilesystemCacheDiskStore.
+            # Close the SSDCacheTier (stops its writer thread, closes SQLite) and
+            # clear the reference so the scheduler's close_ssd_tier path stays clean.
+            ssd_tier.close()
             bundle.ssd_tier = None
             # Clear _ssd_tier on the inner MemoryAwarePrefixCache — evictions now go
-            # through the SSDOffloadedCache delegate, not the old SSDCacheTier path
+            # through the SSDOffloadedCache delegate, not the old SSDCacheTier path.
             if hasattr(memory_aware_cache, '_ssd_tier'):
                 memory_aware_cache._ssd_tier = None
 

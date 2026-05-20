@@ -50,26 +50,42 @@ class SSDOffloadedCache:
         if hit is not None:
             return hit
 
-        tokens = tuple(request.prompt_token_ids)
+        prompt = tuple(request.prompt_token_ids)
+
+        # Disk entries are stored with the evicted prefix key (shorter than the full
+        # prompt).  Find the longest prefix of prompt that has a disk entry.
+        disk_key = self._longest_prefix_key(prompt)
+        if disk_key is None:
+            return None
 
         # Return a completed background promotion if available;
         # also guard the dedup check-then-add under the same lock.
         with self._promoted_lock:
-            if tokens in self._promoted:
-                layers = self._promoted.pop(tokens)
-                self._in_flight.discard(tokens)
+            if disk_key in self._promoted:
+                layers = self._promoted.pop(disk_key)
+                self._in_flight.discard(disk_key)
                 return CacheHit(
                     cache=layers,
-                    cached_tokens=len(tokens),
-                    remaining_tokens=[],
+                    cached_tokens=len(disk_key),
+                    remaining_tokens=list(prompt[len(disk_key):]),
                     hit_type="ssd_hit",
                 )
             # Enqueue for background promotion (dedup).
-            if tokens not in self._in_flight and self._store.has(tokens):
-                self._in_flight.add(tokens)
-                self._queue.put_nowait(tokens)
+            if disk_key not in self._in_flight:
+                self._in_flight.add(disk_key)
+                self._queue.put_nowait(disk_key)
 
         return None
+
+    def _longest_prefix_key(self, prompt: tuple[int, ...]) -> tuple[int, ...] | None:
+        """Return the longest key in the disk store that is a prefix of prompt."""
+        best: tuple[int, ...] | None = None
+        for key in self._store.all_keys():
+            n = len(key)
+            if n <= len(prompt) and prompt[:n] == key:
+                if best is None or n > len(best):
+                    best = key
+        return best
 
     def store(self, request, cache: list) -> bool:
         return self._inner.store(request, cache)
