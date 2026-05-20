@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -95,6 +96,70 @@ class PersistableCache(PrefixCache, Protocol):
 
     def save(self, cache_dir: str) -> bool: ...
     def load(self, cache_dir: str) -> int: ...
+
+
+@runtime_checkable
+class CacheDiskStore(Protocol):
+    """Shared durable store for SSD tiering and save/load persistence.
+
+    Used by SSDOffloadedCache for both runtime spill/promote and
+    startup/shutdown save/load. See CONTEXT.md for design rationale.
+    """
+
+    def write(self, tokens: tuple[int, ...], layers: list) -> None: ...
+    def read(self, tokens: tuple[int, ...]) -> list | None: ...
+    def has(self, tokens: tuple[int, ...]) -> bool: ...
+    def all_keys(self) -> Iterable[tuple[int, ...]]: ...
+
+
+@runtime_checkable
+class SpillableCache(PrefixCache, Protocol):
+    """PrefixCache that can delegate array storage to an external durable store.
+
+    Implemented by MemoryAwarePrefixCache (full eviction) and TurnPrefixCache
+    (intra-cache spilling). See CONTEXT.md for the distinction.
+    """
+
+    def set_spill_delegate(
+        self,
+        on_spill: Callable[[tuple[int, ...], list], Any],
+        on_promote: Callable[[Any], list | None],
+    ) -> None: ...
+
+
+def validate_cache(cache: Any) -> bool:
+    """Return True if cache is structurally valid for use in BatchGenerator."""
+    if cache is None:
+        return False
+    if isinstance(cache, list):
+        if len(cache) == 0:
+            return False
+        for layer_cache in cache:
+            if layer_cache is None:
+                return False
+            if hasattr(layer_cache, "keys") and layer_cache.keys is None:
+                return False
+            if hasattr(layer_cache, "values") and layer_cache.values is None:
+                return False
+            if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
+                keys_arr = (
+                    layer_cache.keys[0]
+                    if isinstance(layer_cache.keys, (tuple, list))
+                    else layer_cache.keys
+                )
+                if keys_arr.shape[0] != 1:
+                    return False
+            if hasattr(layer_cache, "cache") and isinstance(layer_cache.cache, list):
+                for arr in layer_cache.cache:
+                    if arr is not None and arr.shape[0] != 1:
+                        return False
+    if hasattr(cache, "caches"):
+        if cache.caches is None:
+            return False
+        for c in cache.caches:
+            if c is None:
+                return False
+    return True
 
 
 def extract_layer_state(layer) -> dict | None:

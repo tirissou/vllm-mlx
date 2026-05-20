@@ -562,3 +562,80 @@ def test_extract_recurrent_state_keeps_non_kv_layers():
     layer = FakeMambaLayer()
     result = _extract_recurrent_state([layer])
     assert result == [layer]
+
+
+# ------------------------------------------------------------------
+# CacheDiskStore, SpillableCache protocols and validate_cache
+# ------------------------------------------------------------------
+
+from vllm_mlx.kv_cache import CacheDiskStore, SpillableCache, validate_cache
+from typing import runtime_checkable
+
+
+class TestValidateCache:
+    def test_none_is_invalid(self):
+        assert validate_cache(None) is False
+
+    def test_empty_list_is_invalid(self):
+        assert validate_cache([]) is False
+
+    def test_list_with_none_layer_is_invalid(self):
+        assert validate_cache([None]) is False
+
+    def test_valid_list_with_mock_layers(self):
+        layer = MagicMock()
+        layer.keys = MagicMock()
+        layer.keys.__class__ = object  # not a tuple/list
+        layer.keys.shape = (1, 4, 128)
+        layer.values = MagicMock()
+        assert validate_cache([layer]) is True
+
+    def test_layer_with_batch_dim_not_1_is_invalid(self):
+        layer = MagicMock()
+        layer.keys = MagicMock()
+        layer.keys.__class__ = object
+        layer.keys.shape = (2, 4, 128)  # batch=2, not 1
+        assert validate_cache([layer]) is False
+
+
+class TestCacheDiskStoreProtocol:
+    def test_protocol_is_runtime_checkable(self):
+        # Any concrete class with write/read/has/all_keys satisfies the protocol.
+        # MagicMock(spec=[...]) is intentionally avoided: Python 3.12+ protocol
+        # isinstance checks use MRO lookup, not __getattr__, so MagicMock fails
+        # even when hasattr returns True for all required attrs.
+        from vllm_mlx.kv_cache import CacheDiskStore
+
+        class MinimalStore:
+            def write(self, tokens, layers): ...
+            def read(self, tokens): ...
+            def has(self, tokens): ...
+            def all_keys(self): ...
+
+        assert isinstance(MinimalStore(), CacheDiskStore)
+
+    def test_missing_method_fails_check(self):
+        from vllm_mlx.kv_cache import CacheDiskStore
+
+        class IncompleteStore:
+            def write(self, tokens, layers): ...
+            def read(self, tokens): ...
+            # missing has and all_keys
+
+        assert not isinstance(IncompleteStore(), CacheDiskStore)
+
+
+class TestSpillableCacheProtocol:
+    def test_protocol_is_runtime_checkable(self):
+        from vllm_mlx.kv_cache import SpillableCache
+
+        class MinimalSpillable:
+            def fetch(self, request): ...
+            def store(self, request, cache): ...
+            def release(self, handle): ...
+            def get_stats(self): ...
+            def clear(self): ...
+            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def set_spill_delegate(self, on_spill, on_promote): ...
+
+        assert isinstance(MinimalSpillable(), SpillableCache)
