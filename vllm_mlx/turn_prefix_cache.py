@@ -361,7 +361,7 @@ class TurnPrefixCache:
         """
         self._on_spill = on_spill
         self._on_promote = on_promote
-    
+
     def _split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
         """
         Process the output from Scheduler._extract_cache_states.
@@ -1069,6 +1069,65 @@ class TurnPrefixCache:
                 handle = self._on_spill(tokens, node.kv_arrays)
                 node.kv_arrays = handle
                 node.kv_scales = None
+            # Legacy path still handles recurrent state even when delegate is set.
+            if (
+                node.recurrent_state is not None
+                and not isinstance(node.recurrent_state, SSDRef)
+            ):
+                from safetensors.numpy import save_file as st_save
+                path = self._ssd_path(node, "rec")
+                tensors: dict[str, np.ndarray] = {}
+                state = node.recurrent_state
+                has_scales = node.recurrent_scales is not None
+
+                if isinstance(state, list) and state and isinstance(state[0], dict):
+                    # Dict format (_extract_cache_states output)
+                    for li, layer_dict in enumerate(state):
+                        for j, arr in enumerate(layer_dict.get("state", ())):
+                            if arr.dtype == mx.int8 and has_scales and li < len(node.recurrent_scales):
+                                tensors[f"ext_{li}_state_{j}"] = np.array(arr, dtype=np.int32)
+                                if j < len(node.recurrent_scales[li]):
+                                    tensors[f"ext_{li}_scale_{j}"] = np.array(
+                                        node.recurrent_scales[li][j], dtype=np.float32
+                                    )
+                            elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
+                                tensors[f"ext_{li}_state_{j}"] = np.array(arr.astype(mx.float32))
+                            else:
+                                tensors[f"ext_{li}_state_{j}"] = np.array(arr)
+                        meta = layer_dict.get("meta_state", ())
+                        if isinstance(meta, (list, tuple)):
+                            for j, s in enumerate(meta):
+                                tensors[f"ext_{li}_meta_{j}"] = np.frombuffer(
+                                    str(s).encode(), dtype=np.uint8
+                                )
+                        cn = layer_dict.get("class_name", "")
+                        tensors[f"ext_{li}_class"] = np.frombuffer(
+                            cn.encode(), dtype=np.uint8
+                        )
+                else:
+                    # Legacy SSM raw-tensor format
+                    items = state if isinstance(state, (list, tuple)) else [state]
+                    for k, item in enumerate(items):
+                        sub = item if isinstance(item, (list, tuple)) else [item]
+                        for m, arr in enumerate(sub):
+                            if hasattr(arr, "dtype") and arr.dtype == mx.int8 and has_scales and k < len(node.recurrent_scales):
+                                tensors[f"r_{k}_{m}"] = np.array(arr, dtype=np.int32)
+                                if m < len(node.recurrent_scales[k]):
+                                    tensors[f"r_{k}_scale_{m}"] = np.array(
+                                        node.recurrent_scales[k][m], dtype=np.float32
+                                    )
+                            elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
+                                tensors[f"r_{k}_{m}"] = np.array(arr.astype(mx.float32))
+                            else:
+                                tensors[f"r_{k}_{m}"] = np.array(arr)
+
+                if tensors:
+                    tmp = path + ".tmp"
+                    st_save(tensors, tmp)
+                    os.replace(tmp, path)
+                    size = os.path.getsize(path)
+                    node.recurrent_state = SSDRef(file_path=path, size_bytes=size)
+                    node.recurrent_scales = None
             return
 
         # Legacy path: direct SSD write via safetensors.
@@ -1159,6 +1218,10 @@ class TurnPrefixCache:
         """
         # Delegate path: the handle stored during spill is passed to on_promote.
         if self._on_promote is not None:
+            # Only promote if the node was actually spilled via the delegate
+            # (kv_arrays is an opaque handle — not a live list and not None).
+            if node.kv_arrays is None or isinstance(node.kv_arrays, list):
+                return True  # nothing to promote (or already in memory)
             handle = node.kv_arrays
             result = self._on_promote(handle)
             if result is None:

@@ -82,13 +82,6 @@ def _seg(token_ids, role="user"):
     return Segment(role=role, token_ids=token_ids)
 
 
-def _make_turn_layers(n_layers=2):
-    return [
-        {"state": (mx.zeros((1, 4, 8)), mx.zeros((1, 4, 8)))}
-        for _ in range(n_layers)
-    ]
-
-
 def _make_turn_cache(tmp_path=None):
     """Create a TurnPrefixCache with SSD dir (needed for legacy spill path tests)."""
     import tempfile, os
