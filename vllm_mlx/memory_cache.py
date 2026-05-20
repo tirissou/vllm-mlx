@@ -685,6 +685,10 @@ class MemoryAwarePrefixCache:
         # Optional SSD cold tier (set via set_ssd_tier())
         self._ssd_tier = None
 
+        # Spill delegate (set via set_spill_delegate())
+        self._on_spill = None   # Callable[[tuple[int,...], list], Any] | None
+        self._on_promote = None  # Callable[[Any], list | None] | None
+
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
@@ -1043,14 +1047,18 @@ class MemoryAwarePrefixCache:
             self._stats.entry_count = len(self._entries)
             self._stats.current_memory_bytes = self._current_memory
 
-        # Spill to SSD tier if available
-        if self._ssd_tier is not None:
+        # Spill to delegate or legacy SSD tier if available
+        if self._on_spill is not None:
+            self._on_spill(tokens_key, entry.cache)
+        elif self._ssd_tier is not None:
+            # legacy path: direct SSD write (used when not wrapped by SSDOffloadedCache)
             self._ssd_tier.enqueue_spill(tokens_key, entry.cache, entry.memory_bytes)
 
         logger.debug(
             f"[lru_evict] removed {len(tokens_key)} tokens, "
             f"freed {entry.memory_bytes / _BYTES_PER_MB:.2f}MB"
-            f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
+            f"{'  (spilled via delegate)' if self._on_spill is not None else ''}"
+            f"{'  (spilled to SSD)' if self._ssd_tier is not None and self._on_spill is None else ''}"
         )
 
     def remove(self, tokens: list[int]) -> bool:
@@ -1140,6 +1148,28 @@ class MemoryAwarePrefixCache:
         self._ssd_tier = ssd_tier
         if ssd_tier is not None:
             logger.info("[memory_cache] SSD tier attached for eviction spilling")
+
+    def set_spill_delegate(self, on_spill, on_promote) -> None:
+        """Register a spill/promote delegate.
+
+        When set, evicted entries call ``on_spill(tokens_key, layers)`` instead
+        of writing directly to ``_ssd_tier``.  The ``on_promote`` callback is
+        stored for use by higher-level wrappers (e.g. SSDOffloadedCache).
+
+        Args:
+            on_spill: Callable[[tuple[int,...], list], Any] called on eviction.
+            on_promote: Callable[[Any], list | None] called on cache promotion.
+        """
+        self._on_spill = on_spill
+        self._on_promote = on_promote
+
+    def release(self, handle: Any) -> None:
+        """No-op: MemoryAwarePrefixCache has no handle lifecycle."""
+
+    def on_prefill_checkpoint(
+        self, request: Any, processed_tokens: int, extracted_cache: list
+    ) -> None:
+        """No-op: mid-prefill checkpointing is handled by MemoryCacheAdapter."""
 
     def check_ssd(self, tokens: list[int]) -> dict | None:
         """Check if tokens have an SSD cache hit (without reading data).
