@@ -99,8 +99,9 @@ def serve_command(args):
     server._max_tts_input_chars = max_tts_input_chars
 
     # Configure thinking token budget
-    if args.default_thinking_token_budget is not None:
-        server._default_thinking_token_budget = args.default_thinking_token_budget
+    default_thinking_token_budget = getattr(args, "default_thinking_token_budget", None)
+    if default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -160,8 +161,8 @@ def serve_command(args):
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
         print("  Reasoning: Use --reasoning-parser to enable")
-    if args.default_thinking_token_budget is not None:
-        print(f"  Thinking budget: {args.default_thinking_token_budget} tokens")
+    if default_thinking_token_budget is not None:
+        print(f"  Thinking budget: {default_thinking_token_budget} tokens")
     print(
         f"  Audio upload limit: {max_audio_upload_mb} MiB, "
         f"TTS input limit: {max_tts_input_chars} chars"
@@ -192,8 +193,9 @@ def serve_command(args):
         print(f"Loading models config: {args.models_config}")
     print(f"Default max tokens: {args.max_tokens}")
     print(f"Max request tokens: {max_request_tokens}")
-    if args.max_kv_size is not None:
-        print(f"Max KV size: {args.max_kv_size} (RotatingKVCache)")
+    max_kv_size = getattr(args, "max_kv_size", None)
+    if max_kv_size is not None:
+        print(f"Max KV size: {max_kv_size} (RotatingKVCache)")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -237,10 +239,10 @@ def serve_command(args):
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
             # Turn cache options
-            use_turn_cache=args.use_turn_cache,
-            turn_cache_stride=args.turn_cache_stride,
-            turn_cache_memory_gb=args.turn_cache_memory_gb,
-            turn_cache_ssd_gb=args.turn_cache_ssd_gb,
+            use_turn_cache=getattr(args, "use_turn_cache", False),
+            turn_cache_stride=getattr(args, "turn_cache_stride", 512),
+            turn_cache_memory_gb=getattr(args, "turn_cache_memory_gb", 20.0),
+            turn_cache_ssd_gb=getattr(args, "turn_cache_ssd_gb", 50.0),
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
             # MTP
@@ -259,7 +261,7 @@ def serve_command(args):
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
             # KV cache size limit
-            max_kv_size=args.max_kv_size or 0,
+            max_kv_size=getattr(args, "max_kv_size", None) or 0,
             # Debug
             cache_key_log_path=getattr(args, "cache_key_log", None),
         )
@@ -288,11 +290,11 @@ def serve_command(args):
                 )
         elif enable_prefix_cache:
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
-        if args.use_turn_cache:
+        if getattr(args, "use_turn_cache", False):
             print(
-                f"Turn cache: stride={args.turn_cache_stride} tokens, "
-                f"memory={args.turn_cache_memory_gb}GB"
-                + (f", SSD={args.turn_cache_ssd_gb}GB" if args.turn_cache_ssd_gb > 0 else "")
+                f"Turn cache: stride={getattr(args, 'turn_cache_stride', 512)} tokens, "
+                f"memory={getattr(args, 'turn_cache_memory_gb', 20.0)}GB"
+                + (f", SSD={getattr(args, 'turn_cache_ssd_gb', 50.0)}GB" if getattr(args, "turn_cache_ssd_gb", 50.0) > 0 else "")
             )
     else:
         print("Mode: Simple (maximum throughput)")
@@ -500,10 +502,10 @@ def bench_command(args):
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
             # Turn cache options
-            use_turn_cache=args.use_turn_cache,
-            turn_cache_stride=args.turn_cache_stride,
-            turn_cache_memory_gb=args.turn_cache_memory_gb,
-            turn_cache_ssd_gb=args.turn_cache_ssd_gb,
+            use_turn_cache=getattr(args, "use_turn_cache", False),
+            turn_cache_stride=getattr(args, "turn_cache_stride", 512),
+            turn_cache_memory_gb=getattr(args, "turn_cache_memory_gb", 20.0),
+            turn_cache_ssd_gb=getattr(args, "turn_cache_ssd_gb", 50.0),
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,

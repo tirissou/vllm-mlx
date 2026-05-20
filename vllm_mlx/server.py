@@ -4241,7 +4241,9 @@ async def _acquire_default_engine_for_request(
     )
 
 
-async def _release_engine_for_request(raw_request: Request | None) -> None:
+async def _release_engine_for_request(
+    raw_request: Request | None, *, count_activity: bool = True
+) -> None:
     """Release the engine acquired for this request.
 
     In registry mode, releases the model lease stashed by
@@ -4253,7 +4255,7 @@ async def _release_engine_for_request(raw_request: Request | None) -> None:
         if ctx is not None:
             await ctx.release()
             return
-    await _release_default_engine()
+    await _release_default_engine(count_activity=count_activity)
 
 
 def _make_release_cleanup(raw_request: Request | None):
@@ -5147,7 +5149,7 @@ async def count_anthropic_tokens(request: Request):
 
         return {"input_tokens": total_tokens}
     finally:
-        await _release_engine_for_request(request)
+        await _release_engine_for_request(request, count_activity=False)
 
 
 def _emit_content_pieces(

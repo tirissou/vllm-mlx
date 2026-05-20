@@ -67,7 +67,6 @@ CACHE_CORRUPTION_PATTERNS = [
 
 # extract_recurrent_state, compose_n_minus_1_cache and related helpers live in kv_cache.py
 
-
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 

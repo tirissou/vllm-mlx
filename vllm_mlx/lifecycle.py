@@ -280,8 +280,10 @@ class ResidencyManager:
                         unloading_task = resident._unloading_task
 
                 if loading_task is not None:
-                    with suppress(asyncio.CancelledError):
+                    try:
                         await loading_task
+                    except asyncio.CancelledError:
+                        pass
                     continue
 
                 if unloading_task is not None:
@@ -437,6 +439,8 @@ class ResidencyManager:
                         continue
                     except Exception:
                         break
+                if prepare_task.done() and not prepare_task.cancelled():
+                    prepare_task.exception()
             raise
         finally:
             async with self._lock:

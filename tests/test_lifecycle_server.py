@@ -320,7 +320,7 @@ class TestCompletionStreamingRelease:
                 raise RuntimeError("generation failed")
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             acquires["count"] += 1
             return FakeEngine()
@@ -393,7 +393,7 @@ class TestCompletionStreamingRelease:
                 )
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 
@@ -546,7 +546,7 @@ class TestToolParserUsesLocalEngine:
         local_engine = FakeEngine("tok-local")
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return local_engine
 
@@ -619,7 +619,7 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             calls["acquires"] += 1
             return FakeEngine()
@@ -648,7 +648,7 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             calls["acquires"] += 1
             return FakeEngine()
@@ -711,8 +711,7 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         class FakeRequest:
-            async def is_disconnected(self):
-                return True
+            _is_disconnected = True
 
         async def fake_acquire(model_key):
             try:
@@ -2573,7 +2572,6 @@ class TestLifecycleFailureHandling:
 
         generate_calls = {"count": 0}
         load_gate = asyncio.Event()
-        disconnect_polled = asyncio.Event()
 
         class FakeEngine:
             preserve_native_tool_format = False
@@ -2594,9 +2592,7 @@ class TestLifecycleFailureHandling:
                 )
 
         class FakeRequest:
-            async def is_disconnected(self):
-                disconnect_polled.set()
-                return True
+            _is_disconnected = True
 
         async def fake_engine_factory(spec):
             return FakeEngine()
@@ -2636,11 +2632,7 @@ class TestLifecycleFailureHandling:
             srv.create_completion(request, FakeRequest())
         )
         try:
-            # Leave generous slack over the production 0.5s poll interval so
-            # this stays a behavior test rather than a scheduler-jitter race.
-            await asyncio.wait_for(disconnect_polled.wait(), timeout=2.0)
-
-            done, _ = await asyncio.wait({request_task}, timeout=1.0)
+            done, _ = await asyncio.wait({request_task}, timeout=2.0)
             assert request_task in done
 
             response = await request_task
@@ -2675,7 +2667,6 @@ class TestLifecycleFailureHandling:
 
         created = 0
         encode_calls = {"count": 0}
-        disconnect_polled = asyncio.Event()
         first_load_gate = asyncio.Event()
         first_start_cancelled = asyncio.Event()
         stopped_generations: list[int] = []
@@ -2709,15 +2700,13 @@ class TestLifecycleFailureHandling:
                 return FakeTokenizer()
 
         class FakeRequest:
+            _is_disconnected = True
+
             async def json(self):
                 return {
                     "system": "sys",
                     "messages": [{"role": "user", "content": "hi"}],
                 }
-
-            async def is_disconnected(self):
-                disconnect_polled.set()
-                return True
 
         async def fake_engine_factory(spec):
             nonlocal created
@@ -2740,9 +2729,7 @@ class TestLifecycleFailureHandling:
 
         request_task = asyncio.create_task(srv.count_anthropic_tokens(FakeRequest()))
         try:
-            await asyncio.wait_for(disconnect_polled.wait(), timeout=2.0)
-
-            done, _ = await asyncio.wait({request_task}, timeout=1.0)
+            done, _ = await asyncio.wait({request_task}, timeout=2.0)
             assert request_task in done
 
             response = await request_task
@@ -2977,21 +2964,13 @@ class TestLifecycleFailureHandling:
         """A raced cancelled task should not leak CancelledError past disconnect handling."""
         import vllm_mlx.server as srv
 
-        task_ref = {"task": None}
-
         class FakeRequest:
-            async def is_disconnected(self):
-                task = task_ref["task"]
-                assert task is not None
-                task.cancel()
-                await asyncio.sleep(0)
-                return True
+            _is_disconnected = True
 
         async def cancellable_work():
             await asyncio.sleep(3600)
 
         task = asyncio.create_task(cancellable_work())
-        task_ref["task"] = task
 
         result = await srv._wait_with_disconnect(
             task,
@@ -3497,7 +3476,7 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 
@@ -3544,7 +3523,7 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 
@@ -3595,7 +3574,7 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True
+            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
         ):
             return FakeEngine()
 

@@ -1027,7 +1027,10 @@ class BatchedEngine(BaseEngine):
                 boundaries = []
                 for i, tok in enumerate(full_tokens):
                     if tok == im_end_id:
-                        boundaries.append(i + 1)
+                        if nl_id is not None and i + 1 < len(full_tokens) and full_tokens[i + 1] == nl_id:
+                            boundaries.append(i + 2)
+                        else:
+                            boundaries.append(i + 1)
 
                 logger.info(
                     f"[turn_cache] _compute_turn_boundaries: "
