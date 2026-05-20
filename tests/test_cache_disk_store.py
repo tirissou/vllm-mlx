@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for FilesystemCacheDiskStore."""
 
-import tempfile
 import numpy as np
 import pytest
 
@@ -57,3 +56,15 @@ class TestFilesystemCacheDiskStore:
         result_b = store.read((2,))
         np.testing.assert_array_equal(result_a[0]["keys"], np.zeros((1, 1, 4)))
         np.testing.assert_array_equal(result_b[0]["keys"], np.ones((1, 1, 4)))
+
+    def test_persistence_across_instances(self, tmp_path):
+        """Entries written by one instance are readable by a new instance (models restart)."""
+        layers = [{"keys": np.zeros((1, 2, 4)), "values": np.zeros((1, 2, 4))}]
+        store1 = FilesystemCacheDiskStore(cache_dir=str(tmp_path))
+        store1.write((5, 6, 7), layers)
+        # Construct a fresh instance pointing to the same dir
+        store2 = FilesystemCacheDiskStore(cache_dir=str(tmp_path))
+        assert store2.has((5, 6, 7))
+        result = store2.read((5, 6, 7))
+        assert result is not None
+        np.testing.assert_array_equal(result[0]["keys"], np.zeros((1, 2, 4)))

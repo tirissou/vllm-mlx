@@ -28,7 +28,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -1082,9 +1082,8 @@ class FilesystemCacheDiskStore:
         for fname in os.listdir(self._dir):
             if not fname.endswith(".safetensors"):
                 continue
-            meta_path = os.path.join(
-                self._dir, fname.replace(".safetensors", ".tokens.json")
-            )
+            stem = fname[: -len(".safetensors")]
+            meta_path = os.path.join(self._dir, stem + ".tokens.json")
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
                     tokens = tuple(json.load(f))
@@ -1097,10 +1096,11 @@ class FilesystemCacheDiskStore:
         # Flatten all layer arrays into a single dict keyed by "l{i}_{key}"
         tensors: dict[str, np.ndarray] = {}
         for i, layer in enumerate(layers):
-            if isinstance(layer, dict):
-                for k, v in layer.items():
-                    arr = v if isinstance(v, np.ndarray) else np.array(v)
-                    tensors[f"l{i}_{k}"] = arr
+            if not isinstance(layer, dict):
+                raise TypeError(f"Layer {i} must be a dict, got {type(layer).__name__}")
+            for k, v in layer.items():
+                arr = np.array(v) if not isinstance(v, np.ndarray) else v
+                tensors[f"l{i}_{k}"] = arr
         save_file(tensors, path)
         # Write token sidecar
         meta_path = path.replace(".safetensors", ".tokens.json")
@@ -1127,5 +1127,5 @@ class FilesystemCacheDiskStore:
     def has(self, tokens: tuple[int, ...]) -> bool:
         return tokens in self._index
 
-    def all_keys(self):
-        return iter(list(self._index.keys()))
+    def all_keys(self) -> Iterable[tuple[int, ...]]:
+        return iter(self._index)
