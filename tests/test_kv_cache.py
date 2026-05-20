@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import MagicMock
 from mlx_lm.models.cache import KVCache
 
-from vllm_mlx.kv_cache import CacheHit, QuantizedArray
+from vllm_mlx.kv_cache import CacheHit, CacheDiskStore, QuantizedArray, SpillableCache, validate_cache
 from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
 
 
@@ -568,10 +568,6 @@ def test_extract_recurrent_state_keeps_non_kv_layers():
 # CacheDiskStore, SpillableCache protocols and validate_cache
 # ------------------------------------------------------------------
 
-from vllm_mlx.kv_cache import CacheDiskStore, SpillableCache, validate_cache
-from typing import runtime_checkable
-
-
 class TestValidateCache:
     def test_none_is_invalid(self):
         assert validate_cache(None) is False
@@ -639,3 +635,15 @@ class TestSpillableCacheProtocol:
             def set_spill_delegate(self, on_spill, on_promote): ...
 
         assert isinstance(MinimalSpillable(), SpillableCache)
+
+    def test_missing_set_spill_delegate_fails_check(self):
+        """A class with all PrefixCache methods but missing set_spill_delegate should not satisfy SpillableCache."""
+        class NoDelegate:
+            def fetch(self, request): ...
+            def store(self, request, cache): ...
+            def release(self, handle): ...
+            def get_stats(self): ...
+            def clear(self): ...
+            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            # No set_spill_delegate
+        assert not isinstance(NoDelegate(), SpillableCache)

@@ -39,6 +39,7 @@ from .kv_cache import (
     extract_recurrent_state,
     reconstruct_cache_from_states,
     reconstruct_ssd_layers,
+    validate_cache,
 )
 from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
@@ -1612,66 +1613,11 @@ class Scheduler:
             self._current_sampler_params = sampler_params
 
     def _validate_cache(self, cache: Any) -> bool:
-        """
-        Validate that a cache object is usable.
-
-        Checks for None references AND shape compatibility.  Restored
-        cache entries must have batch_size == 1 (single sequence) so
-        they can be merged into the running batch by _merge_caches.
-        A shape mismatch here (e.g. batch=2 from a stale entry) would
-        cause a concatenation crash inside _merge_caches.
-
-        Args:
-            cache: The cache object to validate
-
-        Returns:
-            True if cache is valid and usable
-        """
-        if cache is None:
-            return False
-
-        # Check if it's a list of cache layers
-        if isinstance(cache, list):
-            if len(cache) == 0:
-                return False
-            # Check each layer
-            for layer_cache in cache:
-                if layer_cache is None:
-                    return False
-                # Check if layer has expected structure
-                if hasattr(layer_cache, "keys") and layer_cache.keys is None:
-                    return False
-                if hasattr(layer_cache, "values") and layer_cache.values is None:
-                    return False
-                # Validate batch dimension == 1 for KVCache layers
-                if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
-                    # QuantizedKVCache.keys is a (packed, scales, biases) tuple
-                    keys_arr = layer_cache.keys[0] if isinstance(layer_cache.keys, (tuple, list)) else layer_cache.keys
-                    if keys_arr.shape[0] != 1:
-                        logger.debug(
-                            f"Cache layer invalid: keys batch={keys_arr.shape[0]}, expected 1"
-                        )
-                        return False
-                # Validate batch dimension for MambaCache layers
-                if hasattr(layer_cache, "cache") and isinstance(
-                    layer_cache.cache, list
-                ):
-                    for arr in layer_cache.cache:
-                        if arr is not None and arr.shape[0] != 1:
-                            logger.debug(
-                                f"Cache layer invalid: mamba batch={arr.shape[0]}, expected 1"
-                            )
-                            return False
-
-        # Check BatchKVCache structure
-        if hasattr(cache, "caches"):
-            if cache.caches is None:
-                return False
-            for c in cache.caches:
-                if c is None:
-                    return False
-
-        return True
+        """Thin wrapper around kv_cache.validate_cache with debug logging on failure."""
+        result = validate_cache(cache)
+        if not result:
+            logger.debug("Cache validation failed for batch — discarding cache entry")
+        return result
 
     def _extract_cache_states(self, raw_cache: List[KVCache]) -> List[Dict[str, Any]]:
         """Thin wrapper — logic lives in kv_cache.extract_cache_states."""
