@@ -1821,6 +1821,10 @@ class Scheduler:
                     request._cache_state.hit_type = "miss"
                     request._cache_state.remaining_tokens = request.prompt_token_ids
                     self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
+                    logger.info(
+                        f"[cache_fetch] request={request.request_id[:12]} MISS "
+                        f"prompt_tokens={len(request.prompt_token_ids)}"
+                    )
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
