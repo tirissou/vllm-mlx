@@ -964,13 +964,14 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
     raw_state = ancestor.recurrent_state
 
     # Apply the reconstruction logic
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
     if (
         raw_state is not None
         and isinstance(raw_state, list)
         and raw_state
         and isinstance(raw_state[0], dict)
     ):
-        prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+        prompt_cache = reconstruct_cache_from_states(raw_state)
     else:
         prompt_cache = raw_state
 
@@ -987,7 +988,6 @@ def test_save_load_dict_format_recurrent_state():
     """TurnNode with dict-format recurrent_state survives a save/load round-trip."""
     import tempfile
     from mlx_lm.models.cache import KVCache
-    from vllm_mlx.scheduler import Scheduler
 
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
 
@@ -1026,8 +1026,8 @@ def test_save_load_dict_format_recurrent_state():
     assert loaded_node.recurrent_state[0]["class_ref"] is not None
 
     # Verify reconstruction works on loaded state
-    sched = object.__new__(Scheduler)
-    reconstructed = sched._reconstruct_cache_from_states(loaded_node.recurrent_state)
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
+    reconstructed = reconstruct_cache_from_states(loaded_node.recurrent_state)
     assert reconstructed is not None
     assert len(reconstructed) == 2
     assert reconstructed[0].offset == 10
@@ -1109,7 +1109,8 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     raw_state = ancestor.recurrent_state
     assert isinstance(raw_state, list) and isinstance(raw_state[0], dict)
 
-    reconstructed = sched._reconstruct_cache_from_states(raw_state)
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
+    reconstructed = reconstruct_cache_from_states(raw_state)
     assert reconstructed is not None
 
     req2.prompt_cache = reconstructed
@@ -1687,9 +1688,9 @@ def test_mid_prefill_saves_boundary_state():
     sched.requests["test-1"] = req
     sched.uid_to_request_id[123] = "test-1"
 
-    # Mock _extract_cache_states
+    # Mock extract_cache_states (free function imported in scheduler module)
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
-    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted):
+    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
         # Split-chunk convention: fire at processed=49 so total_cached=49, 49+1=50 in [50]
         prompt_cache = MagicMock()
         callback(123, 49, prompt_cache)
@@ -1723,7 +1724,7 @@ def test_mid_prefill_does_not_save_away_from_boundary():
     sched.uid_to_request_id[124] = "test-2"
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
-    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted):
+    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
         # processed=29 → total=29, 29+1=30 not in [50] → no save
         prompt_cache = MagicMock()
         callback(124, 29, prompt_cache)
@@ -1758,17 +1759,17 @@ def test_mid_prefill_saves_multiple_boundaries():
 
     # Save at first boundary (fire at B-1=49)
     mock_extracted_50 = _make_extracted_state(n_layers=2, n_tokens=50)
-    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_50):
+    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_50):
         callback(125, 49, MagicMock())
 
     # Save at second boundary (fire at B-1=99)
     mock_extracted_100 = _make_extracted_state(n_layers=2, n_tokens=100)
-    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_100):
+    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_100):
         callback(125, 99, MagicMock())
 
     # Save at third boundary (fire at B-1=149)
     mock_extracted_150 = _make_extracted_state(n_layers=2, n_tokens=150)
-    with patch.object(sched, '_extract_cache_states', return_value=mock_extracted_150):
+    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_150):
         callback(125, 149, MagicMock())
 
     # Verify all boundaries were saved (keyed by boundary position)
@@ -2013,17 +2014,16 @@ def test_split_cache_arrays_uses_quantized_kvcache_class_ref():
 
 
 def test_reconstruct_cache_from_quantized_state_gives_quantized_kvcache():
-    """_reconstruct_cache_from_states on quantized trie state produces QuantizedKVCache objects."""
+    """reconstruct_cache_from_states on quantized trie state produces QuantizedKVCache objects."""
     from mlx_lm.models.cache import QuantizedKVCache
-    from vllm_mlx.scheduler import Scheduler
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
 
-    sched = object.__new__(Scheduler)
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
     kv, recurrent = cache._split_cache_arrays(extracted, offset=0)
     raw_state = cache._reassemble_cache_fn(kv, recurrent)
 
-    prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+    prompt_cache = reconstruct_cache_from_states(raw_state)
 
     assert prompt_cache is not None
     assert len(prompt_cache) == 2
@@ -2057,9 +2057,9 @@ def test_node_data_bytes_handles_quantized_tuples():
 
 
 def test_retrieve_full_cache_produces_quantized_kvcache():
-    """Full path: insert with bf16 → _retrieve_full_cache → _reconstruct → QuantizedKVCache."""
+    """Full path: insert with bf16 → _retrieve_full_cache → reconstruct → QuantizedKVCache."""
     from mlx_lm.models.cache import QuantizedKVCache
-    from vllm_mlx.scheduler import Scheduler
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
 
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     sys_extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
@@ -2069,8 +2069,7 @@ def test_retrieve_full_cache_produces_quantized_kvcache():
     raw_state = trie._retrieve_full_cache(sys_node)
     assert raw_state is not None
 
-    sched = object.__new__(Scheduler)
-    prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+    prompt_cache = reconstruct_cache_from_states(raw_state)
     assert prompt_cache is not None
     for layer in prompt_cache:
         assert isinstance(layer, QuantizedKVCache), f"Expected QuantizedKVCache, got {type(layer)}"
@@ -2080,7 +2079,6 @@ def test_retrieve_full_cache_produces_quantized_kvcache():
 def test_retrieve_full_cache_concatenates_two_nodes():
     """_retrieve_full_cache across two nodes concatenates quantized arrays correctly."""
     from mlx_lm.models.cache import QuantizedKVCache
-    from vllm_mlx.scheduler import Scheduler
 
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     # Node 1: 10 tokens
@@ -2092,8 +2090,8 @@ def test_retrieve_full_cache_concatenates_two_nodes():
                           Segment(role="user", token_ids=list(range(10, 15)))], ext2)
 
     raw_state = trie._retrieve_full_cache(node2)
-    sched = object.__new__(Scheduler)
-    prompt_cache = sched._reconstruct_cache_from_states(raw_state)
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
+    prompt_cache = reconstruct_cache_from_states(raw_state)
 
     for layer in prompt_cache:
         assert isinstance(layer, QuantizedKVCache)

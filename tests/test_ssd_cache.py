@@ -1008,11 +1008,9 @@ class TestIntegrationSpillAndFetch:
     def test_scheduler_reconstructs_real_arrays_cache(self):
         cache_mod = pytest.importorskip("mlx_lm.models.cache")
         mx = pytest.importorskip("mlx.core")
-        from vllm_mlx.scheduler import Scheduler
+        from vllm_mlx.kv_cache import reconstruct_ssd_layers
 
-        scheduler = object.__new__(Scheduler)
-        reconstructed = Scheduler._reconstruct_ssd_layers(
-            scheduler,
+        reconstructed = reconstruct_ssd_layers(
             [{"state": [np.array([1, 2], dtype=np.float32)]}],
         )
 

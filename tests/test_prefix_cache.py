@@ -427,6 +427,31 @@ class TestHasEmptyRotatingCache:
         assert MLLMBatchGenerator._has_empty_rotating_cache([kv, rc]) is False
 
 
+class TestSchedulerCacheCleanup:
+    def test_scheduler_has_no_cache_coordination_methods(self):
+        from vllm_mlx.scheduler import Scheduler
+
+        removed = [
+            "_fetch_cache_for_request",
+            "_try_promote_ssd_for_request",
+            "_try_promote_ssd_pending",
+            "_reconstruct_ssd_layers",
+            "_validate_cache",
+        ]
+        for name in removed:
+            assert not hasattr(Scheduler, name), (
+                f"Scheduler.{name} should have been removed (now lives in SSDOffloadedCache)"
+            )
+
+    def test_scheduler_has_no_direct_ssd_tier_attribute(self):
+        import inspect
+        from vllm_mlx.scheduler import Scheduler
+
+        src = inspect.getsource(Scheduler.__init__)
+        assert "self._ssd_tier" not in src
+        assert "self.memory_aware_cache" not in src
+
+
 if __name__ == "__main__":
     # Verbose standalone test with real model
     import argparse

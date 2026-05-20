@@ -440,22 +440,7 @@ class TestPagedCacheAdapter:
 # ------------------------------------------------------------------
 
 class TestSchedulerPrefixCacheIntegration:
-    """Scheduler._fetch_cache_for_request uses _prefix_cache when set."""
-
-    def _make_scheduler_with_adapter(self, adapter):
-        from vllm_mlx.scheduler import Scheduler, SchedulerConfig
-
-        sched = object.__new__(Scheduler)
-        sched.config = SchedulerConfig()
-        sched.block_aware_cache = None
-        sched.memory_aware_cache = None
-        sched.turn_cache = None
-        sched.prefix_cache = None
-        sched._prefix_cache = adapter
-        sched._ssd_tier = None
-        sched.tokenizer = None
-        sched._cache_key_log_path = None
-        return sched
+    """PrefixCache adapter fetch() populates request cache state fields."""
 
     def _make_stored_adapter(self):
         from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
@@ -473,14 +458,18 @@ class TestSchedulerPrefixCacheIntegration:
     def test_cache_hit_populates_request_fields(self):
         from vllm_mlx.kv_cache import RequestCacheState
         adapter, tokens = self._make_stored_adapter()
-        sched = self._make_scheduler_with_adapter(adapter)
 
         req = MagicMock()
         req.prompt_token_ids = tokens
         req.request_id = "req-integration"
         req._cache_state = RequestCacheState()
 
-        sched._fetch_cache_for_request(req)
+        hit = adapter.fetch(req)
+        assert hit is not None
+        req._cache_state.hit_type = hit.hit_type
+        req._cache_state.cache = hit.cache
+        req._cache_state.cached_tokens = hit.cached_tokens
+        req._cache_state.remaining_tokens = hit.remaining_tokens
 
         assert req._cache_state.cache is not None
         assert req._cache_state.cached_tokens == 50
@@ -490,14 +479,16 @@ class TestSchedulerPrefixCacheIntegration:
     def test_cache_miss_sets_remaining_tokens(self):
         from vllm_mlx.kv_cache import RequestCacheState
         adapter, _ = self._make_stored_adapter()
-        sched = self._make_scheduler_with_adapter(adapter)
 
         req = MagicMock()
         req.prompt_token_ids = list(range(999, 1050))  # tokens not in cache
         req.request_id = "req-miss"
         req._cache_state = RequestCacheState()
 
-        sched._fetch_cache_for_request(req)
+        hit = adapter.fetch(req)
+        if hit is None:
+            req._cache_state.hit_type = "miss"
+            req._cache_state.remaining_tokens = req.prompt_token_ids
 
         assert req._cache_state.hit_type == "miss"
         assert req._cache_state.remaining_tokens == req.prompt_token_ids
