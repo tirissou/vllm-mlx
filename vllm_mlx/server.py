@@ -870,13 +870,14 @@ def _build_tool_parser(engine: BaseEngine | None):
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return None
 
+    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
     if _tool_parser_instance is not None:
-        if hasattr(_tool_parser_instance, "reset"):
-            _tool_parser_instance.reset()
-        return _tool_parser_instance
+        try:
+            return type(_tool_parser_instance)(tokenizer)
+        except TypeError:
+            return type(_tool_parser_instance)()
 
     parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
     return parser_cls(tokenizer)
 
 
@@ -2249,8 +2250,11 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     "Failed to init tool parser for responses streaming: %s", e
                 )
         if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+            _inst_tok = _get_engine_tokenizer(engine)
+            try:
+                tool_parser = type(_tool_parser_instance)(_inst_tok)
+            except TypeError:
+                tool_parser = type(_tool_parser_instance)()
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2650,8 +2654,10 @@ def _get_streaming_tool_parser(
                     _sanitize_log_text(e, limit=500),
                 )
                 return None
-        _tool_parser_instance.reset()
-        return _tool_parser_instance
+        try:
+            return type(_tool_parser_instance)(tokenizer)
+        except TypeError:
+            return type(_tool_parser_instance)()
 
     if not getattr(request, "tools", None):
         return None

@@ -3626,3 +3626,81 @@ class TestResponseModelFieldUsesServedName:
         body = json.loads(response.body.decode())
         assert body["model"] == served_name
         assert body["model"] != "user-sent-model-name"
+
+
+class TestToolParserConcurrencySafety:
+    """_get_streaming_tool_parser must not return the shared singleton.
+
+    When two sessions decode concurrently, Session B calling
+    _get_streaming_tool_parser() must not corrupt Session A's mid-stream
+    parser state.  This is the same singleton bug that was fixed for the
+    reasoning parser (commit e6b67b4).
+    """
+
+    def test_concurrent_sessions_get_independent_parser_instances(self, monkeypatch):
+        """Two back-to-back calls must return separate objects."""
+        import vllm_mlx.server as srv
+        from vllm_mlx.tool_parsers import QwenToolParser
+
+        template = QwenToolParser(None)
+        monkeypatch.setattr(srv, "_tool_parser_instance", template)
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "qwen")
+        monkeypatch.setattr(srv, "_engine", None)
+
+        mock_request = SimpleNamespace(tool_choice="auto")
+
+        parser_a = srv._get_streaming_tool_parser(mock_request)
+        assert parser_a is not None
+
+        # Simulate mid-stream state accumulated by session A
+        parser_a.current_tool_id = 3
+        parser_a.prev_tool_call_arr = [{"name": "get_weather", "arguments": "{}"}]
+
+        # Session B starts — must not disturb session A
+        parser_b = srv._get_streaming_tool_parser(mock_request)
+        assert parser_b is not None
+
+        # Session A's state must be intact
+        assert parser_a.current_tool_id == 3, (
+            "_get_streaming_tool_parser reset the shared singleton, corrupting "
+            "session A's mid-stream state"
+        )
+        assert parser_a.prev_tool_call_arr == [{"name": "get_weather", "arguments": "{}"}]
+
+        # The two parsers must be independent objects
+        assert parser_a is not parser_b
+
+    def test_responses_stream_gets_independent_parser_instance(self, monkeypatch):
+        """_stream_responses_request inline path must also create a fresh instance."""
+        import vllm_mlx.server as srv
+        from vllm_mlx.tool_parsers import QwenToolParser
+
+        instances_created: list = []
+
+        class TrackingParser(QwenToolParser):
+            def __init__(self, tokenizer=None):
+                super().__init__(tokenizer)
+                instances_created.append(self)
+
+        template = TrackingParser(None)
+        instances_created.clear()  # only count instances created via factory calls
+
+        monkeypatch.setattr(srv, "_tool_parser_instance", template)
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "qwen")
+        monkeypatch.setattr(srv, "_engine", None)
+        monkeypatch.setattr(
+            srv.ToolParserManager,
+            "get_tool_parser",
+            lambda _name: TrackingParser,
+        )
+
+        mock_request = SimpleNamespace(tool_choice="auto")
+
+        p1 = srv._get_streaming_tool_parser(mock_request)
+        p2 = srv._get_streaming_tool_parser(mock_request)
+
+        assert p1 is not p2, "Each call must return a fresh instance"
+        assert p1 is not template, "Must not return the cached template"
+        assert p2 is not template, "Must not return the cached template"
