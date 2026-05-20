@@ -321,6 +321,46 @@ class TurnPrefixCache:
         self._lock = threading.RLock()
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
+        self._on_spill: Callable | None = None   # set via set_spill_delegate
+        self._on_promote: Callable | None = None
+
+    # ── SpillableCache / PrefixCache protocol stubs ─────────────────────────
+    # TurnPrefixCache is a low-level trie; the PrefixCache protocol is
+    # implemented by TurnCacheAdapter.  These stubs exist solely so that
+    # isinstance(cache, SpillableCache) returns True (runtime_checkable).
+
+    def fetch(self, request) -> None:          # type: ignore[override]
+        raise NotImplementedError("Use TurnCacheAdapter.fetch()")
+
+    def store(self, request, cache: list) -> bool:  # type: ignore[override]
+        raise NotImplementedError("Use TurnCacheAdapter.store()")
+
+    def get_stats(self) -> dict:
+        return {"memory_bytes": self._memory_bytes}
+
+    def clear(self) -> None:
+        with self._lock:
+            self.root.children.clear()
+            self._eviction_heap.clear()
+            self._memory_bytes = 0
+
+    def on_prefill_checkpoint(
+        self, request: Any, processed_tokens: int, extracted_cache: list
+    ) -> None:
+        pass  # no-op; handled by TurnCacheAdapter
+
+    def set_spill_delegate(
+        self,
+        on_spill: Callable,
+        on_promote: Callable,
+    ) -> None:
+        """Register I/O delegates for spill/promote instead of direct SSD writes.
+
+        on_spill(tokens: tuple[int, ...], layers: list) -> handle
+        on_promote(handle) -> list | None
+        """
+        self._on_spill = on_spill
+        self._on_promote = on_promote
     
     def _split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
         """
@@ -991,6 +1031,23 @@ class TurnPrefixCache:
 
     # ── SSD offloading ─────────────────────────────────────────────────────
 
+    def _tokens_to_node(self, node: TurnNode) -> tuple[int, ...]:
+        """Reconstruct the full token sequence from the root down to *node*.
+
+        Walks the parent chain, collecting token_ids from each node, then
+        reverses to produce root-to-leaf order.
+        """
+        segments: list[list[int]] = []
+        current = node
+        while current.parent is not None:
+            segments.append(current.token_ids)
+            current = current.parent
+        # segments is in leaf-to-root order; reverse to get root-to-leaf
+        result: list[int] = []
+        for seg in reversed(segments):
+            result.extend(seg)
+        return tuple(result)
+
     def _ssd_path(self, node: TurnNode, suffix: str) -> str:
         ssd_dir = self.config.ssd_dir or os.path.join(
             self.config.persist_dir or "/tmp", "ssd"
@@ -999,7 +1056,22 @@ class TurnPrefixCache:
         return os.path.join(ssd_dir, f"{node.context_hash & 0xFFFFFFFFFFFFFFFF:016x}_{suffix}.safetensors")
 
     def _spill_to_ssd(self, node: TurnNode) -> None:
-        """Write node's KV (and recurrent if present) to SSD; replace with SSDRef."""
+        """Write node's KV (and recurrent if present) to SSD; replace with SSDRef.
+
+        When a spill delegate is set, delegates I/O to on_spill instead of
+        writing safetensors files directly.  The opaque handle returned by
+        on_spill is stored in node.kv_arrays.
+        """
+        # Delegate path: route through on_spill instead of direct SSD I/O.
+        if self._on_spill is not None:
+            if isinstance(node.kv_arrays, list) and node.kv_arrays:
+                tokens = self._tokens_to_node(node)
+                handle = self._on_spill(tokens, node.kv_arrays)
+                node.kv_arrays = handle
+                node.kv_scales = None
+            return
+
+        # Legacy path: direct SSD write via safetensors.
         from safetensors.numpy import save_file as st_save
 
         if isinstance(node.kv_arrays, list) and node.kv_arrays:
@@ -1080,7 +1152,21 @@ class TurnPrefixCache:
                 node.recurrent_scales = None
 
     def _promote_from_ssd(self, node: TurnNode) -> bool:
-        """Load node's KV from SSD back into RAM. Returns False on error."""
+        """Load node's KV from SSD back into RAM. Returns False on error.
+
+        When a promote delegate is set, calls on_promote(handle) to retrieve
+        the layers instead of reading safetensors files directly.
+        """
+        # Delegate path: the handle stored during spill is passed to on_promote.
+        if self._on_promote is not None:
+            handle = node.kv_arrays
+            result = self._on_promote(handle)
+            if result is None:
+                return False
+            node.kv_arrays = result
+            return True
+
+        # Legacy path: direct SSD read via safetensors.
         from safetensors.numpy import load_file as st_load
 
         if isinstance(node.kv_arrays, SSDRef):
