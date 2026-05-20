@@ -1057,3 +1057,75 @@ class SSDCacheTier:
 
         self._index.close()
         logger.info("[ssd_cache] SSDCacheTier closed")
+
+
+class FilesystemCacheDiskStore:
+    """CacheDiskStore backed by per-entry safetensors files.
+
+    Keys are tuples of token IDs. File paths are derived from a hash of
+    the token tuple so they are filesystem-safe regardless of sequence length.
+    """
+
+    def __init__(self, cache_dir: str) -> None:
+        self._dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        # In-memory index: token tuple -> file path (populated lazily from disk)
+        self._index: dict[tuple[int, ...], str] = {}
+        self._rebuild_index()
+
+    def _token_path(self, tokens: tuple[int, ...]) -> str:
+        key = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
+        return os.path.join(self._dir, f"{key}.safetensors")
+
+    def _rebuild_index(self) -> None:
+        """Scan cache_dir for existing entries and rebuild in-memory index."""
+        for fname in os.listdir(self._dir):
+            if not fname.endswith(".safetensors"):
+                continue
+            meta_path = os.path.join(
+                self._dir, fname.replace(".safetensors", ".tokens.json")
+            )
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    tokens = tuple(json.load(f))
+                self._index[tokens] = os.path.join(self._dir, fname)
+
+    def write(self, tokens: tuple[int, ...], layers: list) -> None:
+        from safetensors.numpy import save_file
+
+        path = self._token_path(tokens)
+        # Flatten all layer arrays into a single dict keyed by "l{i}_{key}"
+        tensors: dict[str, np.ndarray] = {}
+        for i, layer in enumerate(layers):
+            if isinstance(layer, dict):
+                for k, v in layer.items():
+                    arr = v if isinstance(v, np.ndarray) else np.array(v)
+                    tensors[f"l{i}_{k}"] = arr
+        save_file(tensors, path)
+        # Write token sidecar
+        meta_path = path.replace(".safetensors", ".tokens.json")
+        with open(meta_path, "w") as f:
+            json.dump(list(tokens), f)
+        self._index[tokens] = path
+
+    def read(self, tokens: tuple[int, ...]) -> list | None:
+        from safetensors.numpy import load_file
+
+        path = self._index.get(tokens)
+        if path is None or not os.path.exists(path):
+            return None
+        flat = load_file(path)
+        # Reconstruct list of layer dicts
+        layer_keys: dict[int, dict] = {}
+        for flat_key, arr in flat.items():
+            parts = flat_key.split("_", 1)
+            idx = int(parts[0][1:])  # strip leading 'l'
+            field = parts[1]
+            layer_keys.setdefault(idx, {})[field] = arr
+        return [layer_keys[i] for i in sorted(layer_keys)]
+
+    def has(self, tokens: tuple[int, ...]) -> bool:
+        return tokens in self._index
+
+    def all_keys(self):
+        return iter(list(self._index.keys()))
