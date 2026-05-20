@@ -52,7 +52,8 @@ class SSDOffloadedCache:
 
         tokens = tuple(request.prompt_token_ids)
 
-        # Return a completed background promotion if available.
+        # Return a completed background promotion if available;
+        # also guard the dedup check-then-add under the same lock.
         with self._promoted_lock:
             if tokens in self._promoted:
                 layers = self._promoted.pop(tokens)
@@ -63,11 +64,10 @@ class SSDOffloadedCache:
                     remaining_tokens=[],
                     hit_type="ssd_hit",
                 )
-
-        # Enqueue for background promotion (dedup).
-        if tokens not in self._in_flight and self._store.has(tokens):
-            self._in_flight.add(tokens)
-            self._queue.put_nowait(tokens)
+            # Enqueue for background promotion (dedup).
+            if tokens not in self._in_flight and self._store.has(tokens):
+                self._in_flight.add(tokens)
+                self._queue.put_nowait(tokens)
 
         return None
 
@@ -84,7 +84,13 @@ class SSDOffloadedCache:
         self._inner.clear()
         with self._promoted_lock:
             self._promoted.clear()
-        self._in_flight.clear()
+            self._in_flight.clear()
+        # Drain any pending promotions.
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except Exception:
+                break
 
     def on_prefill_checkpoint(
         self, request: Any, processed_tokens: int, extracted_cache: list
@@ -102,9 +108,10 @@ class SSDOffloadedCache:
 
     def close(self) -> None:
         """Stop background promotion thread."""
+        if self._thread is None:
+            return
         self._queue.put(None)  # sentinel
-        if self._thread is not None:
-            self._thread.join()
+        self._thread.join()
 
     def _promotion_loop(self) -> None:
         while True:
@@ -115,18 +122,29 @@ class SSDOffloadedCache:
             if layers is not None:
                 with self._promoted_lock:
                     self._promoted[tokens] = layers
+            else:
+                # Read failed — remove from in-flight so future fetches can retry.
+                with self._promoted_lock:
+                    self._in_flight.discard(tokens)
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, cache_dir: str | None = None) -> bool:
-        """Flush in-memory promoted entries to disk store."""
+        """Flush in-memory promoted entries to disk store.
+
+        `cache_dir` is ignored — the underlying CacheDiskStore owns its path.
+        """
         with self._promoted_lock:
             for tokens, layers in self._promoted.items():
                 self._store.write(tokens, layers)
         return True
 
     def load(self, cache_dir: str | None = None) -> int:
-        """Pre-populate _promoted from all keys currently on disk."""
+        """Pre-populate _promoted from all keys currently on disk.
+
+        `cache_dir` is ignored — the underlying CacheDiskStore owns its path.
+        WARNING: loads all disk keys into memory. Only call on small stores.
+        """
         count = 0
         for tokens in self._store.all_keys():
             layers = self._store.read(tokens)

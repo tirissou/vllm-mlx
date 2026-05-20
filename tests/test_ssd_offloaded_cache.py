@@ -161,3 +161,46 @@ class TestSSDOffloadedCacheLifecycle:
         cache.close()
         cache._thread.join(timeout=1.0)
         assert not cache._thread.is_alive()
+
+    def test_close_before_start_is_a_noop(self):
+        inner = _make_inner()
+        store = _make_store()
+        cache = SSDOffloadedCache(inner, store)
+        # Must not raise even though start() was never called.
+        cache.close()
+
+
+class TestSSDOffloadedCachePersistence:
+    def test_save_writes_promoted_entries_to_store(self):
+        inner = _make_inner()
+        store = _make_store()
+        cache = SSDOffloadedCache(inner, store)
+        cache._promoted[(1, 2)] = [{"keys": [1]}]
+        cache.save()
+        store.write.assert_called_once_with((1, 2), [{"keys": [1]}])
+
+    def test_load_populates_promoted_from_disk(self):
+        inner = _make_inner()
+        store = _make_store()
+        layers = [{"keys": [5]}]
+        store.all_keys.return_value = iter([(3, 4)])
+        store.read.return_value = layers
+        cache = SSDOffloadedCache(inner, store)
+        count = cache.load()
+        assert count == 1
+        assert cache._promoted[(3, 4)] == layers
+
+    def test_failed_promotion_clears_in_flight(self):
+        inner = _make_inner()
+        store = _make_store()
+        store.has.return_value = True
+        store.read.return_value = None  # read fails
+        cache = SSDOffloadedCache(inner, store)
+        cache.start()
+        try:
+            cache.fetch(_make_request([1, 2, 3]))
+            time.sleep(0.1)
+            # After failed promotion, token should no longer be in_flight
+            assert (1, 2, 3) not in cache._in_flight
+        finally:
+            cache.close()
