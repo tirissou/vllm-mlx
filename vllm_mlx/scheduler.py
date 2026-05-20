@@ -1244,6 +1244,11 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
                 f"SSD cache tier enabled: dir={config.ssd_cache_dir}, "
                 f"max={config.ssd_cache_max_gb}GB"
             )
+            from .ssd_offloaded_cache import SSDOffloadedCache
+            from .ssd_cache import FilesystemCacheDiskStore
+            disk_store = FilesystemCacheDiskStore(cache_dir=config.ssd_cache_dir)
+            bundle.adapter = SSDOffloadedCache(bundle.adapter, disk_store)
+            bundle.adapter.start()
 
     elif config.use_turn_cache:
         from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig

@@ -77,6 +77,10 @@ class MemoryCacheAdapter:
                 cs.mid_prefill_last_save = total_cached
                 cs.mid_prefill_cache_key = tuple(prefix_tokens)
 
+    def set_spill_delegate(self, on_spill, on_promote) -> None:
+        """Forward spill delegate registration to the underlying SpillableCache."""
+        self._inner.set_spill_delegate(on_spill, on_promote)
+
     # PersistableCache extension
     def save(self, cache_dir: str) -> bool:
         return self._inner.save_to_disk(cache_dir)
