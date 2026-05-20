@@ -1176,6 +1176,7 @@ class _PrefixCacheBundle:
     block_aware_cache: Any = None
     ssd_tier: Any = None
     turn_cache: Any = None
+    ssd_offloaded_cache: Any = None  # typed reference to SSDOffloadedCache when active
 
 
 def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBundle:
@@ -1249,6 +1250,14 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             disk_store = FilesystemCacheDiskStore(cache_dir=config.ssd_cache_dir)
             bundle.adapter = SSDOffloadedCache(bundle.adapter, disk_store)
             bundle.adapter.start()
+            bundle.ssd_offloaded_cache = bundle.adapter
+            # Clear ssd_tier so the old scheduler SSD paths don't try to read from it
+            # (Task 7 will remove those paths entirely; until then, they're safely no-ops)
+            bundle.ssd_tier = None
+            # Clear _ssd_tier on the inner MemoryAwarePrefixCache — evictions now go
+            # through the SSDOffloadedCache delegate, not the old SSDCacheTier path
+            if hasattr(memory_aware_cache, '_ssd_tier'):
+                memory_aware_cache._ssd_tier = None
 
     elif config.use_turn_cache:
         from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
@@ -1347,6 +1356,7 @@ class Scheduler:
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self._ssd_tier: Optional[SSDCacheTier] = None
+        self._ssd_offloaded_cache = None
         self.turn_cache: Optional[TurnPrefixCache] = None
 
         if self.config.enable_prefix_cache:
@@ -1357,6 +1367,7 @@ class Scheduler:
             self.paged_cache_manager = _bundle.paged_cache_manager
             self.block_aware_cache = _bundle.block_aware_cache
             self._ssd_tier = _bundle.ssd_tier
+            self._ssd_offloaded_cache = _bundle.ssd_offloaded_cache
             self.turn_cache = _bundle.turn_cache
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
@@ -2734,6 +2745,10 @@ class Scheduler:
 
     def close_ssd_tier(self) -> None:
         """Shut down the SSD cache tier if present."""
+        if self._ssd_offloaded_cache is not None:
+            self._ssd_offloaded_cache.close()
+            self._ssd_offloaded_cache = None
+            logger.info("SSD offloaded cache closed")
         if self._ssd_tier is not None:
             self._ssd_tier.close()
             self._ssd_tier = None
