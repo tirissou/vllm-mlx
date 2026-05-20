@@ -135,6 +135,73 @@ class TestBatchQuantizedKVCacheQuantizedArray:
         assert isinstance(merged.keys, QuantizedArray)
         assert merged.keys.packed.shape[0] == B
 
+    def test_extend_accepts_batch_kv_cache(self):
+        """extend() must handle BatchKVCache as other (not crash with .packed AttributeError).
+
+        Regression test for: 'mlx.core.array' object has no attribute 'packed'
+        This can occur when _quantize_batch_kv_cache misses a layer that was
+        produced by an older mlx-lm _process_prompts code path.
+        """
+        from mlx_lm.models.cache import BatchKVCache
+
+        B, H, T, D = 2, 4, 16, 64
+
+        # Active batch: BatchQuantizedKVCache with data
+        active = BatchQuantizedKVCache(left_padding=[0] * B)
+        _run_prefill(active, B=B, H=H, T=T, D=D)
+        mx.eval(active.keys, active.values)
+
+        # New batch: BatchKVCache (the type that triggers the bug)
+        new_bkv = BatchKVCache([0] * B)
+        k = mx.random.normal((B, H, T, D))
+        v = mx.random.normal((B, H, T, D))
+        mx.eval(k, v)
+        new_bkv.update_and_fetch(k, v)
+
+        # Before the fix this raised AttributeError: 'mlx.core.array' object
+        # has no attribute 'packed'
+        active.extend(new_bkv)
+
+        assert isinstance(active.keys, QuantizedArray)
+        assert active.keys.packed.shape[0] == B * 2
+
+    def test_quantize_batch_kv_cache_guard_prevents_shape_error(self):
+        """The _quantize_batch_kv_cache guard must prevent 'QuantizedArray has no .shape'.
+
+        Regression test for the reverse-direction batch decoding bug:
+          active_batch.cache[i] = BatchKVCache   (from _orig_process_prompts)
+          new_batch.cache[i]    = BatchQuantizedKVCache (from chunked-prefill path)
+        Without the guard, BatchKVCache.extend(BatchQuantizedKVCache) crashes:
+          'QuantizedArray' object has no attribute 'shape'
+        The guard converts active_batch.cache to BatchQuantizedKVCache first.
+        """
+        from mlx_lm.models.cache import BatchKVCache
+
+        B, H, T, D = 2, 4, 16, 64
+
+        # Simulate active_batch.cache[i] = BatchKVCache (unquantized)
+        active_bkvc = BatchKVCache([0] * B)
+        k = mx.random.normal((B, H, T, D))
+        v = mx.random.normal((B, H, T, D))
+        mx.eval(k, v)
+        active_bkvc.update_and_fetch(k, v)
+
+        # Simulate the _quantize_batch_kv_cache guard
+        cache_list = [active_bkvc]
+        cache_list[0] = BatchQuantizedKVCache.from_batch_kvcache(cache_list[0])
+        assert isinstance(cache_list[0], BatchQuantizedKVCache)
+
+        # Now extend with a BatchQuantizedKVCache — must not crash with
+        # AttributeError: 'QuantizedArray' object has no attribute 'shape'
+        new_quantized = BatchQuantizedKVCache(left_padding=[0] * B)
+        _run_prefill(new_quantized, B=B, H=H, T=T, D=D)
+        mx.eval(new_quantized.keys, new_quantized.values)
+
+        cache_list[0].extend(new_quantized)
+
+        assert isinstance(cache_list[0].keys, QuantizedArray)
+        assert cache_list[0].keys.packed.shape[0] == B * 2
+
 
 # ------------------------------------------------------------------
 # Helpers shared by adapter tests

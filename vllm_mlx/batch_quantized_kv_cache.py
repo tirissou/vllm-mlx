@@ -17,7 +17,7 @@ from typing import List
 
 import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
-from mlx_lm.models.cache import QuantizedKVCache
+from mlx_lm.models.cache import BatchKVCache, QuantizedKVCache
 
 from .kv_cache import QuantizedArray
 
@@ -156,6 +156,15 @@ class BatchQuantizedKVCache:
             self.left_padding -= min_left_pad
 
     def extend(self, other: BatchQuantizedKVCache):
+        # Defensive: if caller passes a BatchKVCache (unquantized), convert it
+        # on the fly.  This happens when the older mlx-lm BatchGenerator's
+        # _process_prompts produces a BatchKVCache that _quantize_batch_kv_cache
+        # didn't reach (e.g. via a code path not covered by the monkey-patch).
+        if isinstance(other, BatchKVCache):
+            other = BatchQuantizedKVCache.from_batch_kvcache(
+                other, group_size=self.group_size, bits=self.bits
+            )
+
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
