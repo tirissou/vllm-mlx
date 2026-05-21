@@ -143,3 +143,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "hybrid_only: requires a hybrid (MTP-capable) model; skip on pure-KV machines",
+]

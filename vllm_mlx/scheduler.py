@@ -226,7 +226,8 @@ def _install_mtp(
        Reject: trim KVCache by 1, skip_state from pos 0 (no cold start)
     5. Draft is emitted in the NEXT generation step after primary
     """
-    _orig_step = batch_gen._step
+    # Placeholder; assigned after _generation_batch is available (bottom of function)
+    _orig_gen_step = None
 
     # Greedy sampler for MTP draft tokens
     _draft_sampler = make_sampler(temp=0.0)
@@ -245,141 +246,67 @@ def _install_mtp(
     # MTP stats
     _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
 
-    def _mtp_step(
-        input_tokens,
-        prompt_cache,
-        samplers,
-        logits_processors,
-        tokens,
-    ):
-        """
-        Extended _step with MTP always-advance strategy.
+    def _mtp_step(self):
+        """Replacement for GenerationBatch._step with MTP always-advance strategy."""
+        self._current_tokens = self._next_tokens
+        inputs = self._current_tokens
+        batch_size = inputs.shape[0]
 
-        Every step (after skip):
-        1. Use skip_state logits/hidden OR run model forward
-        2. Sample primary token P
-        3. MTP head drafts token D
-        4. Verify [P, D] in one model call (always advances cache)
-        5. Accept: skip_state from position 1 (after D), defer D
-           Reject: trim KVCache by 1, skip_state from position 0 (after P)
+        if inputs.shape[0] == 0:
+            return _orig_gen_step(self)
 
-        No snapshot/restore — eliminates cold starts after rejection.
-        MambaCache layers accept minor pollution on reject (exponential decay).
-
-        During prefill (multi-token input), MTP is skipped entirely.
-        """
-        batch_size = input_tokens.shape[0]
-
-        # --- Prefill guard: skip MTP for multi-token input,
-        # during _process_prompts (active_batch not yet set), or when
-        # the cache doesn't belong to the active batch (e.g. during
-        # _process_prompts in the 2nd+ iteration of _orig_next's loop
-        # or during _chunked_next partial prefill finalization).
-        if (
-            input_tokens.shape[1] > 1
-            or batch_gen.active_batch is None
-            or prompt_cache is not batch_gen.active_batch.cache
-        ):
-            _skip_state[0] = None
-            return _orig_step(
-                input_tokens,
-                prompt_cache,
-                samplers,
-                logits_processors,
-                tokens,
-            )
-
-        # --- Check skip state from previous MTP step ---
         skip = _skip_state[0]
-        if skip is not None:
-            if skip["logits"].shape[0] != batch_size:
-                # Batch size changed since skip was stored — invalidate
-                skip = None
-                _skip_state[0] = None
+        if skip is not None and skip["logits"].shape[0] != batch_size:
+            skip = None
+            _skip_state[0] = None
 
         if skip is not None:
-            # Skip mode: model already processed input_tokens during
-            # previous verify. Use stored logits + hidden instead.
             logits = skip["logits"]
             hidden_states = skip["hidden"]
             _skip_state[0] = None
         else:
-            # Normal model forward
-            model_output = model(input_tokens, cache=prompt_cache, return_hidden=True)
-            if isinstance(model_output, tuple):
-                logits, hidden_states = model_output
-            else:
-                # Model doesn't support return_hidden — fall back
-                return _orig_step(
-                    input_tokens,
-                    prompt_cache,
-                    samplers,
-                    logits_processors,
-                    tokens,
-                )
+            model_output = self.model(inputs[:, None], cache=self.prompt_cache, return_hidden=True)
+            if not isinstance(model_output, tuple):
+                return _orig_gen_step(self)
+            logits, hidden_states = model_output
             logits = logits[:, -1, :]
 
-        # --- Apply logits processors + sample primary ---
-        if any(logits_processors):
-            logger.debug(
-                f"[logits_proc] applying {sum(len(lp) for lp in logits_processors)} "
-                f"processors to batch_size={batch_size}"
-            )
-            processed_logits = []
+        if any(self.logits_processors):
+            processed = []
             for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                for processor in logits_processors[e]:
-                    sample_logits = processor(tokens[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
+                sl = logits[e : e + 1]
+                for proc in self.logits_processors[e]:
+                    token_ctx = getattr(self, '_token_context', None)
+                    token_ctx_e = token_ctx[e] if token_ctx is not None else None
+                    sl = proc(token_ctx_e, sl) if token_ctx_e is not None else sl
+                processed.append(sl)
+            logits = mx.concatenate(processed, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if any(samplers):
-            all_samples = []
-            for e in range(batch_size):
-                sample_sampler = samplers[e] or batch_gen.sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            primary_tokens = mx.concatenate(all_samples, axis=0)
+        if any(self.samplers):
+            samples = [
+                (self.samplers[e] or self.fallback_sampler)(logprobs[e : e + 1])
+                for e in range(batch_size)
+            ]
+            primary_tokens = mx.concatenate(samples, axis=0)
         else:
-            primary_tokens = batch_gen.sampler(logprobs)
+            primary_tokens = self.fallback_sampler(logprobs)
 
-        # Get current UIDs (guaranteed non-empty: prefill guard above
-        # prevents MTP from running when active_batch is None).
-        current_uids = list(batch_gen.active_batch.uids)
+        current_uids = list(self.uids)
 
-        # --- MTP draft + always-advance verify ---
         try:
-            # Draft: predict token n+2 from hidden states + primary (n+1)
-            draft_logits = model.mtp_forward(
+            draft_logits = self.model.mtp_forward(
                 hidden_states[:, -1:, :],
                 primary_tokens[:, None],
                 mtp_cache=None,
             )
             draft_logits = draft_logits[:, -1, :]
-            draft_logprobs = draft_logits - mx.logsumexp(
-                draft_logits, axis=-1, keepdims=True
-            )
+            draft_logprobs = draft_logits - mx.logsumexp(draft_logits, axis=-1, keepdims=True)
             draft_tokens = _draft_sampler(draft_logprobs)
 
-            # Always-advance: feed [primary, draft] and let cache advance.
-            #
-            # Hybrid models (e.g. Qwen3-Next) mix attention (KVCache) and
-            # recurrent layers (MambaCache/DeltaRNN).  KVCache supports
-            # trim(1) to undo the draft token on reject, but recurrent
-            # state is irreversible — rejected drafts permanently pollute
-            # the RNN state, causing progressive output corruption.
-            #
-            # For hybrid models we snapshot recurrent state before verify
-            # and on reject: trim KV by 2 (remove both P and D), restore
-            # RNN snapshot, then re-advance with just P so both cache
-            # types end up consistent at [..., P].
-            # Skip RNN snapshots in optimistic mode — it never rejects,
-            # so the copies are wasted (~147 MB/step of lazy graph nodes
-            # that prevent pre-verify Metal buffers from being freed).
             _rnn_snapshots = {}
             if not optimistic:
-                for _ci, _c in enumerate(prompt_cache):
+                for _ci, _c in enumerate(self.prompt_cache):
                     if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
                         if hasattr(_c, "state"):
                             _rnn_snapshots[_ci] = [
@@ -389,15 +316,13 @@ def _install_mtp(
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
-            verify_output = model(verify_input, cache=prompt_cache, return_hidden=True)
+            verify_output = self.model(verify_input, cache=self.prompt_cache, return_hidden=True)
             if isinstance(verify_output, tuple):
                 verify_logits, verify_hidden = verify_output
             else:
-                verify_logits = verify_output
-                verify_hidden = None
+                verify_logits, verify_hidden = verify_output, None
 
             if optimistic:
-                # --- OPTIMISTIC: always accept, zero sync ---
                 if verify_hidden is not None:
                     _skip_state[0] = {
                         "logits": verify_logits[:, 1, :],
@@ -407,10 +332,8 @@ def _install_mtp(
                         verify_logits[:, 0, :], axis=-1, keepdims=True
                     )
                     mx.async_eval(
-                        _skip_state[0]["logits"],
-                        _skip_state[0]["hidden"],
-                        draft_tokens,
-                        verify_lp,
+                        _skip_state[0]["logits"], _skip_state[0]["hidden"],
+                        draft_tokens, verify_lp,
                     )
                     for e in range(batch_size):
                         uid = current_uids[e]
@@ -422,7 +345,6 @@ def _install_mtp(
                     _skip_state[0] = None
                 _mtp_stats["accepted"] += 1
             else:
-                # --- VERIFIED MODE: single eval + Python comparison ---
                 verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
                 mx.eval(verify_pred, draft_tokens)
                 pred_list = verify_pred.tolist()
@@ -430,7 +352,6 @@ def _install_mtp(
                 all_accepted = pred_list == draft_list
 
                 if all_accepted and verify_hidden is not None:
-                    # --- ACCEPT ---
                     _skip_state[0] = {
                         "logits": verify_logits[:, 1, :],
                         "hidden": verify_hidden[:, -1:, :],
@@ -440,69 +361,38 @@ def _install_mtp(
                         verify_logits[:, 0, :], axis=-1, keepdims=True
                     )
                     for e in range(batch_size):
-                        uid = current_uids[e]
-                        _deferred_drafts[uid] = {
+                        _deferred_drafts[current_uids[e]] = {
                             "token": draft_list[e],
                             "logprobs": verify_lp[e],
                         }
                     _mtp_stats["accepted"] += 1
-
                 else:
-                    # --- REJECT (always-advance) ---
                     if _rnn_snapshots:
-                        # Hybrid model: undo the entire verify pass
-                        # (both P and D) for all cache types, then
-                        # re-advance with just P for a consistent state.
-                        for c in prompt_cache:
-                            if (
-                                hasattr(c, "is_trimmable")
-                                and c.is_trimmable()
-                                and hasattr(c, "trim")
-                            ):
+                        for c in self.prompt_cache:
+                            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
                                 c.trim(2)
                         for _ci, _snap in _rnn_snapshots.items():
-                            prompt_cache[_ci].state = _snap
-                        # Re-advance with primary only — both KV and RNN
-                        # now advance by exactly 1 (the primary token).
-                        rerun_out = model(
-                            primary_tokens[:, None],
-                            cache=prompt_cache,
-                            return_hidden=True,
-                        )
-                        if isinstance(rerun_out, tuple):
-                            rerun_logits, rerun_hidden = rerun_out
-                        else:
-                            rerun_logits = rerun_out
-                            rerun_hidden = None
-                        if rerun_hidden is not None:
+                            self.prompt_cache[_ci].state = _snap
+                        rerun = self.model(primary_tokens[:, None], cache=self.prompt_cache, return_hidden=True)
+                        if isinstance(rerun, tuple):
+                            _, rerun_hidden = rerun
                             _skip_state[0] = {
-                                "logits": rerun_logits[:, -1, :],
+                                "logits": verify_logits[:, 0, :],
                                 "hidden": rerun_hidden[:, -1:, :],
                             }
-                            mx.async_eval(
-                                _skip_state[0]["logits"],
-                                _skip_state[0]["hidden"],
-                            )
+                            mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
                         else:
                             _skip_state[0] = None
                     else:
-                        # Pure attention model: simple trim(1) is enough.
-                        for c in prompt_cache:
-                            if (
-                                hasattr(c, "is_trimmable")
-                                and c.is_trimmable()
-                                and hasattr(c, "trim")
-                            ):
+                        for c in self.prompt_cache:
+                            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
                                 c.trim(1)
                         if verify_hidden is not None:
                             _skip_state[0] = {
                                 "logits": verify_logits[:, 0, :],
                                 "hidden": verify_hidden[:, 0:1, :],
                             }
-                            mx.async_eval(
-                                _skip_state[0]["logits"],
-                                _skip_state[0]["hidden"],
-                            )
+                            mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
                         else:
                             _skip_state[0] = None
                     for uid in current_uids:
@@ -514,118 +404,81 @@ def _install_mtp(
             _skip_state[0] = None
             _mtp_stats["errors"] += 1
 
-        return primary_tokens, list(logprobs)
+        self._next_tokens = primary_tokens
+        self._next_logprobs = list(logprobs)
+        mx.async_eval(self._next_tokens, self._next_logprobs)
 
-    # Wrap _next() to emit deferred MTP drafts after each primary token.
-    # This works regardless of whether _chunked_next or original _next is
-    # the current _next implementation, because it sits at the top level.
-    # Store as attribute so it's always the correct reference, even after
-    # BatchGenerator recreation.
-    batch_gen._inner_next = batch_gen._next
+        mx.eval(inputs, getattr(self, '_current_logprobs', None) or [])
+        inputs_list = inputs.tolist()
+        for sti, ti in zip(self.tokens, inputs_list):
+            sti.append(ti)
+        return inputs_list, getattr(self, '_current_logprobs', None) or list(logprobs)
 
     def _mtp_next(self=batch_gen):
-        """Wrapper around _next that emits deferred MTP draft tokens.
-
-        After each primary token, if the previous step's MTP draft was
-        accepted, it is emitted as an additional response.
-        """
-        # Clear stale MTP state when no batch is active.
-        # This prevents skip_state/deferred_drafts from a finished request
-        # from leaking into the next request and causing stale computation
-        # graph references on generation_stream.
-        if self.active_batch is None:
+        """Wrapper around _next that emits deferred MTP draft tokens."""
+        if not self._generation_batch.uids:
             _skip_state[0] = None
             _deferred_drafts.clear()
 
-        # Save deferred drafts from PREVIOUS step before _inner_next
-        # runs _mtp_step, which may store NEW deferred drafts.
         prev_deferred = {}
-        if self.active_batch is not None:
-            for uid in self.active_batch.uids:
+        if self._generation_batch.uids:
+            for uid in self._generation_batch.uids:
                 if uid in _deferred_drafts:
                     prev_deferred[uid] = _deferred_drafts.pop(uid)
 
-        # Run the inner _next (original or chunked) — calls _mtp_step
-        responses = self._inner_next()
+        prompt_responses, gen_responses = self._inner_next()
 
-        if not prev_deferred or not responses:
-            return responses
+        if not prev_deferred or not gen_responses:
+            return prompt_responses, gen_responses
 
-        # Augment responses with deferred drafts from the previous step.
-        # The Response from _next reports the OLD batch.y (the primary
-        # from the *previous* _step call). The deferred draft follows
-        # that primary in the token stream, so emit it AFTER the primary.
         augmented = []
         draft_end_uids = set()
-        for r in responses:
+        for r in gen_responses:
             uid = r.uid
-
-            # Emit the primary response first
             augmented.append(r)
 
             if r.finish_reason is not None:
-                # Sequence ended with primary — discard any pending draft
                 _deferred_drafts.pop(uid, None)
                 prev_deferred.pop(uid, None)
                 continue
 
-            # Emit deferred draft AFTER its primary
             if uid in prev_deferred:
                 draft_info = prev_deferred.pop(uid)
-                if "token" in draft_info:
-                    draft_t = draft_info["token"]
-                else:
-                    draft_t = draft_info["token_array"].item()
+                draft_t = (
+                    draft_info["token"]
+                    if "token" in draft_info
+                    else draft_info["token_array"].item()
+                )
                 draft_lp = draft_info["logprobs"]
 
-                if draft_t in self.stop_tokens:
-                    augmented.append(
-                        self.Response(uid, draft_t, draft_lp, "stop", None)
-                    )
-                    draft_end_uids.add(uid)
-                else:
-                    draft_finish = None
-                    batch = self.active_batch
-                    if batch is not None:
-                        for e, bu in enumerate(batch.uids):
-                            if bu == uid:
-                                batch.num_tokens[e] += 1
-                                batch.tokens[e] = mx.concatenate(
-                                    (batch.tokens[e], mx.array([draft_t]))
-                                )
-                                if batch.num_tokens[e] >= batch.max_tokens[e]:
-                                    draft_finish = "length"
-                                    draft_end_uids.add(uid)
-                                break
+                draft_finish = None
+                gb = self._generation_batch
+                if gb is not None and uid in gb.uids:
+                    e = gb.uids.index(uid)
+                    gb._num_tokens[e] = gb._num_tokens[e] + 1
+                    if gb._num_tokens[e] >= gb.max_tokens[e]:
+                        draft_finish = "length"
+                        draft_end_uids.add(uid)
 
-                    draft_cache_out = None
-                    if draft_finish is not None and batch is not None:
-                        for e, bu in enumerate(batch.uids):
-                            if bu == uid:
-                                draft_cache_out = batch.extract_cache(e)
-                                break
+                from dataclasses import replace as _dc_replace
+                draft_r = _dc_replace(
+                    r,
+                    token=draft_t,
+                    logprobs=draft_lp,
+                    finish_reason=draft_finish,
+                    prompt_cache=None,
+                )
+                augmented.append(draft_r)
 
-                    augmented.append(
-                        self.Response(
-                            uid, draft_t, draft_lp, draft_finish, draft_cache_out
-                        )
-                    )
+        if draft_end_uids and self._generation_batch.uids:
+            keep = [e for e, u in enumerate(self._generation_batch.uids) if u not in draft_end_uids]
+            self._generation_batch.filter(keep)
 
-        # Remove sequences that finished due to draft tokens
-        if draft_end_uids and self.active_batch is not None:
-            keep = [
-                e
-                for e, u in enumerate(self.active_batch.uids)
-                if u not in draft_end_uids
-            ]
-            if keep:
-                self.active_batch.filter(keep)
-            else:
-                self.active_batch = None
+        return prompt_responses, augmented
 
-        return augmented
-
-    batch_gen._step = _mtp_step
+    _orig_gen_step = batch_gen._generation_batch._step
+    batch_gen._generation_batch._step = _mtp_step
+    batch_gen._inner_next = batch_gen._next
     batch_gen._next = _mtp_next
 
     if num_draft_tokens != 1:
