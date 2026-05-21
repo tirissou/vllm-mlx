@@ -2361,6 +2361,7 @@ class Scheduler:
             except TypeError as e:
                 # Catch the NoneType error specifically
                 if self._is_cache_corruption_error(e):
+                    raise
                     if attempt < max_retries:
                         logger.warning(
                             f"Cache corruption detected (attempt {attempt + 1}), "
