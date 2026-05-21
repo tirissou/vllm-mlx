@@ -155,12 +155,12 @@ class BatchQuantizedKVCache:
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 
-    def extend(self, other: BatchQuantizedKVCache):
-        # Defensive: if caller passes a BatchKVCache (unquantized), convert it
-        # on the fly.  This happens when the older mlx-lm BatchGenerator's
-        # _process_prompts produces a BatchKVCache that _quantize_batch_kv_cache
-        # didn't reach (e.g. via a code path not covered by the monkey-patch).
-        if isinstance(other, BatchKVCache):
+    def extend(self, other):
+        if isinstance(other, QuantizedKVCache):
+            # Single-sequence quantized cache arriving directly (e.g. safety net for
+            # code paths that bypass _patched_merge_caches).
+            other = BatchQuantizedKVCache.merge([other])
+        elif isinstance(other, BatchKVCache):
             other = BatchQuantizedKVCache.from_batch_kvcache(
                 other, group_size=self.group_size, bits=self.bits
             )

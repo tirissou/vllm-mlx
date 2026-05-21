@@ -773,3 +773,37 @@ def test_patched_merge_caches_routes_quantized_kvcache():
     assert isinstance(result[0], BatchQuantizedKVCache), (
         f"Expected BatchQuantizedKVCache, got {type(result[0])}"
     )
+
+
+def test_bqkvc_extend_accepts_quantized_kvcache_input():
+    """BatchQuantizedKVCache.extend() must accept a bare QuantizedKVCache as other.
+
+    Safety net: a single-sequence QuantizedKVCache should be promoted to
+    BatchQuantizedKVCache before the concatenation, not crash with AttributeError.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
+
+    def _make_qkvc(n_tokens=4, n_heads=2, d_head=64, group_size=64, bits=4):
+        el_per_int = 8
+        q = QuantizedKVCache(group_size=group_size, bits=bits)
+        shape = (1, n_heads, n_tokens)
+        q.keys = [
+            mx.zeros((*shape, d_head // el_per_int), dtype=mx.uint32),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+        ]
+        q.values = [
+            mx.zeros((*shape, d_head // el_per_int), dtype=mx.uint32),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+        ]
+        q.offset = n_tokens
+        return q
+
+    batch = BatchQuantizedKVCache.merge([_make_qkvc()])  # batch=1
+    batch.extend(_make_qkvc())  # bare QuantizedKVCache — must not crash
+    assert batch.keys.packed.shape[0] == 2, (
+        f"Expected batch dimension 2 after extend, got {batch.keys.packed.shape[0]}"
+    )
