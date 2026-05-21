@@ -22,7 +22,6 @@ from vllm_mlx.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulingPolicy,
-    _install_chunked_prefill,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
