@@ -36,3 +36,40 @@ def test_single_request_produces_tokens(qwen3_small):
     _run_to_completion(scheduler)
     req = scheduler.requests.get("r1") or scheduler._finished_requests.get("r1")
     assert req is not None and req.num_output_tokens > 0
+
+
+@pytest.mark.slow
+def test_mid_prefill_save_fires_before_prefill_completes(qwen3_small):
+    """Prefix cache must receive a checkpoint mid-prefill, not just at the end."""
+    model, tokenizer = qwen3_small
+    checkpoints = []
+
+    config = SchedulerConfig(
+        mid_prefill_save_interval=64,
+        use_memory_aware_cache=True,
+        prefill_step_size=128,
+    )
+    scheduler = Scheduler(model, tokenizer, config)
+
+    original = scheduler._prefix_cache.on_prefill_checkpoint
+    def _recording_checkpoint(request, processed_tokens, cache_states):
+        checkpoints.append(processed_tokens)
+        original(request, processed_tokens, cache_states)
+    scheduler._prefix_cache.on_prefill_checkpoint = _recording_checkpoint
+
+    long_prompt_ids = list(range(512))
+    scheduler.add_request(Request(
+        request_id="r1",
+        prompt=" ".join(str(t) for t in long_prompt_ids),
+        prompt_token_ids=long_prompt_ids,
+        sampling_params=SamplingParams(max_tokens=4),
+    ))
+
+    for _ in range(300):
+        output = scheduler.step()
+        if "r1" in output.finished_request_ids:
+            break
+
+    assert len(checkpoints) >= 2, (
+        f"Expected >=2 mid-prefill checkpoints, got {checkpoints}"
+    )
