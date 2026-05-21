@@ -686,7 +686,11 @@ def _install_chunked_prefill(
 
                     # Save intermediate cache for disconnect resilience
                     if mid_prefill_save is not None and len(uids) == 1:
-                        mid_prefill_save(uids[0], n_to_process, prompt_cache)
+                        _save_processed = n_to_process
+                        if _needs_boundary_split and _first_chunk < budget and n_to_process > 0:
+                            # on_prefill_checkpoint checks total_cached+1 in boundaries
+                            _save_processed = n_to_process - 1
+                        mid_prefill_save(uids[0], _save_processed, prompt_cache)
 
                     self._stats.prompt_time += _time.perf_counter() - tic
 
