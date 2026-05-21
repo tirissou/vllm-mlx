@@ -21,7 +21,7 @@ from mlx.nn.utils import checkpoint
 import numpy as np
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 _CACHE_FORMAT_VERSION = 2
 
@@ -509,11 +509,13 @@ class TurnPrefixCache:
             return self._insert_legacy(
                 parent_or_segments, segment_or_extracted, acquire_lock=actual_lock
             )
-        return self._insert_node(
+        rval = self._insert_node(
             parent_or_segments, segment_or_extracted,
             kv_arrays or [], kv_scales, recurrent_state,
             is_system_prompt, recurrent_scales, acquire_lock,
         )
+        logger.debug(self.visualize())
+        return rval
 
     def _insert_node(
         self,
