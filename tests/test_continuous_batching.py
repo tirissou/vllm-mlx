@@ -183,42 +183,55 @@ class TestContinuousBatchingIntegration:
         ]
         params = SamplingParams(max_tokens=30, temperature=0.0)
 
+        formatted_prompts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+        async def get_result(engine, rid):
+            async for out in engine.stream_outputs(rid, timeout=60):
+                if out.finished:
+                    return out.completion_tokens
+            return 0
+
+        # Batch pass: all requests in flight concurrently
         async with AsyncEngineCore(model, tokenizer, config) as engine:
             await asyncio.sleep(0.1)
 
-            # Concurrent batch
             start = time.perf_counter()
-
-            request_ids = []
-            for p in prompts:
-                formatted = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                rid = await engine.add_request(formatted, params)
-                request_ids.append(rid)
-
-            async def get_result(rid):
-                async for out in engine.stream_outputs(rid, timeout=60):
-                    if out.finished:
-                        return out.completion_tokens
-                return 0
-
-            results = await asyncio.gather(*[get_result(r) for r in request_ids])
-
+            request_ids = [
+                await engine.add_request(p, params) for p in formatted_prompts
+            ]
+            results = await asyncio.gather(*[get_result(engine, r) for r in request_ids])
             batch_time = time.perf_counter() - start
-            total_tokens = sum(results)
-            batch_throughput = total_tokens / batch_time
 
-            print(f"\nBatch: {len(prompts)} requests in {batch_time:.2f}s")
-            print(f"Total tokens: {total_tokens}")
-            print(f"Throughput: {batch_throughput:.1f} tok/s")
-            print(f"Requests/sec: {len(prompts)/batch_time:.2f}")
+        batch_tokens = sum(results)
+        batch_throughput = batch_tokens / batch_time
 
-            # Batching should achieve reasonable throughput
-            assert batch_throughput > 100  # At least 100 tok/s
-            assert all(t > 0 for t in results)
+        print(f"\nBatch:      {len(prompts)} requests in {batch_time:.2f}s, {batch_throughput:.1f} tok/s")
+
+        # Sequential pass: one request at a time
+        async with AsyncEngineCore(model, tokenizer, config) as engine:
+            await asyncio.sleep(0.1)
+
+            start = time.perf_counter()
+            seq_tokens = 0
+            for p in formatted_prompts:
+                rid = await engine.add_request(p, params)
+                seq_tokens += await get_result(engine, rid)
+            seq_time = time.perf_counter() - start
+
+        seq_throughput = seq_tokens / seq_time
+
+        print(f"Sequential: {len(prompts)} requests in {seq_time:.2f}s, {seq_throughput:.1f} tok/s")
+        print(f"Speedup: {batch_throughput / seq_throughput:.2f}x")
+
+        assert all(t > 0 for t in results)
+        assert batch_throughput > seq_throughput * 1.1
 
 
 if __name__ == "__main__":
