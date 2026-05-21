@@ -114,3 +114,40 @@ def test_turn_boundary_checkpoint_saved_at_each_boundary(qwen3_small):
     assert any(abs(p - 256) <= 16 for p in boundary_positions), (
         f"No checkpoint near turn boundary 256; got checkpoints at {boundary_positions}"
     )
+
+
+@pytest.fixture(scope="module")
+def qwen3_mtp_model():
+    try:
+        from mlx_lm import load
+        model, tokenizer = load("mlx-community/Qwen3-0.6B-4bit")
+        if not (hasattr(model, "mtp") and model.mtp is not None):
+            pytest.skip("loaded model has no MTP head")
+        return model, tokenizer
+    except Exception:
+        pytest.skip("mlx-community/Qwen3-0.6B-4bit not available or has no MTP head")
+
+
+@pytest.mark.slow
+@pytest.mark.hybrid_only
+def test_mtp_produces_extra_tokens(qwen3_mtp_model):
+    """With MTP enabled, at least one step should return 2 tokens for a request."""
+    model, tokenizer = qwen3_mtp_model
+    config = SchedulerConfig(enable_mtp=True)
+    scheduler = Scheduler(model, tokenizer, config)
+    scheduler.add_request(Request(
+        request_id="r-mtp",
+        prompt="Hello",
+        sampling_params=SamplingParams(max_tokens=16),
+    ))
+    token_counts_per_step = []
+    for _ in range(100):
+        output = scheduler.step()
+        total = sum(len(o.output_token_ids) for o in output.outputs)
+        if total > 0:
+            token_counts_per_step.append(total)
+        if not scheduler.has_requests():
+            break
+    assert any(c > 1 for c in token_counts_per_step), (
+        "MTP never produced more than 1 token in a single step"
+    )
