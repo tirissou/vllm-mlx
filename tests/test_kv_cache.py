@@ -733,3 +733,43 @@ class TestSpillableCacheProtocol:
             def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
             # No set_spill_delegate
         assert not isinstance(NoDelegate(), SpillableCache)
+
+
+
+def test_patched_merge_caches_routes_quantized_kvcache():
+    """_patched_merge_caches must produce BatchQuantizedKVCache for QuantizedKVCache inputs.
+
+    Prefix cache restore returns QuantizedKVCache objects (via BatchQuantizedKVCache.extract).
+    Before the fix this raises ValueError: 'QuantizedKVCache does not yet support batching'.
+    """
+    import importlib
+    import mlx.core as mx
+    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.utils.mamba_cache import ensure_mamba_support
+    from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
+
+    ensure_mamba_support()
+    gen_module = importlib.import_module("mlx_lm.generate")
+    merge_fn = gen_module._merge_caches
+
+    def _make_qkvc(n_tokens=4, n_heads=2, d_head=64, group_size=64, bits=4):
+        el_per_int = 8  # 8*4 bytes // 4 bits
+        q = QuantizedKVCache(group_size=group_size, bits=bits)
+        shape = (1, n_heads, n_tokens)
+        q.keys = [
+            mx.zeros((*shape, d_head // el_per_int), dtype=mx.uint32),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+        ]
+        q.values = [
+            mx.zeros((*shape, d_head // el_per_int), dtype=mx.uint32),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+            mx.zeros((*shape, d_head // group_size), dtype=mx.bfloat16),
+        ]
+        q.offset = n_tokens
+        return q
+
+    result = merge_fn([[_make_qkvc()], [_make_qkvc()]])
+    assert isinstance(result[0], BatchQuantizedKVCache), (
+        f"Expected BatchQuantizedKVCache, got {type(result[0])}"
+    )

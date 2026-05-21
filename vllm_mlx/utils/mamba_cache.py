@@ -96,6 +96,40 @@ class BatchMambaCache(MambaCache):
         return merged_cache
 
 
+def _patch_merge_caches(gen_module, KVCache, RotatingKVCache, OrigMambaCache):
+    """Install a patched _merge_caches on gen_module.
+
+    Routes QuantizedKVCache to BatchQuantizedKVCache.merge (before the KVCache
+    branch, since QuantizedKVCache is a KVCache subclass).  Also handles
+    RotatingKVCache and MambaCache/BatchMambaCache.
+    """
+    from mlx_lm.models.cache import QuantizedKVCache
+    from ..batch_quantized_kv_cache import BatchQuantizedKVCache as _BatchQuantizedKVCache
+    from mlx_lm.generate import BatchKVCache, BatchRotatingKVCache
+
+    def _patched_merge_caches(caches):
+        """Merge caches with MambaCache and QuantizedKVCache support."""
+        batch_cache = []
+        for i in range(len(caches[0])):
+            cache = None
+            if isinstance(caches[0][i], QuantizedKVCache):
+                cache = _BatchQuantizedKVCache.merge([c[i] for c in caches])
+            elif isinstance(caches[0][i], KVCache):
+                cache = BatchKVCache.merge([c[i] for c in caches])
+            elif isinstance(caches[0][i], RotatingKVCache):
+                cache = BatchRotatingKVCache.merge([c[i] for c in caches])
+            elif isinstance(caches[0][i], (OrigMambaCache, BatchMambaCache)):
+                cache = BatchMambaCache.merge([c[i] for c in caches])
+            else:
+                raise ValueError(
+                    f"{type(caches[0][i])} does not yet support batching with history"
+                )
+            batch_cache.append(cache)
+        return batch_cache
+
+    gen_module._merge_caches = _patched_merge_caches
+
+
 def patch_mlx_lm_for_mamba():
     """
     Patch mlx-lm to support MambaCache in BatchGenerator.
@@ -168,28 +202,8 @@ def patch_mlx_lm_for_mamba():
     # Patch the module
     gen_module._make_cache = _patched_make_cache
 
-    # Also patch _merge_caches to handle BatchMambaCache
-    _original_merge_caches = gen_module._merge_caches
-
-    def _patched_merge_caches(caches):
-        """Merge caches with MambaCache support."""
-        batch_cache = []
-        for i in range(len(caches[0])):
-            cache = None
-            if isinstance(caches[0][i], KVCache):
-                cache = BatchKVCache.merge([c[i] for c in caches])
-            elif isinstance(caches[0][i], RotatingKVCache):
-                cache = BatchRotatingKVCache.merge([c[i] for c in caches])
-            elif isinstance(caches[0][i], (OrigMambaCache, BatchMambaCache)):
-                cache = BatchMambaCache.merge([c[i] for c in caches])
-            else:
-                raise ValueError(
-                    f"{type(caches[0][i])} does not yet support batching with history"
-                )
-            batch_cache.append(cache)
-        return batch_cache
-
-    gen_module._merge_caches = _patched_merge_caches
+    # Also patch _merge_caches to handle BatchMambaCache and QuantizedKVCache
+    _patch_merge_caches(gen_module, KVCache, RotatingKVCache, OrigMambaCache)
 
     logger.info("Patched mlx-lm for MambaCache batching support")
 
@@ -201,15 +215,37 @@ _patched = False
 def ensure_mamba_support():
     """Ensure MambaCache batching support is enabled.
 
-    NOTE: Disabled for mlx-lm >= 0.30.6 where ArraysCache natively supports
-    all batch operations (extract, merge, filter, prepare).  The old patch
-    replaced ArraysCache with BatchMambaCache, which broke hybrid models
-    (Qwen3.5) that mix ArraysCache + KVCache layers.
+    NOTE: The _make_cache patch is disabled for mlx-lm >= 0.30.6 where
+    ArraysCache natively supports all batch operations (extract, merge, filter,
+    prepare).  The old patch replaced ArraysCache with BatchMambaCache, which
+    broke hybrid models (Qwen3.5) that mix ArraysCache + KVCache layers.
+
+    The _merge_caches patch is always applied: it routes QuantizedKVCache
+    inputs to BatchQuantizedKVCache.merge so prefix-cache hits on quantized
+    models don't fall into the wrong BatchKVCache branch.
     """
     global _patched
     if not _patched:
+        import importlib
+
+        gen_module = importlib.import_module("mlx_lm.generate")
+        from mlx_lm.models.cache import (
+            KVCache,
+            ArraysCache,
+            RotatingKVCache,
+        )
+
+        # MambaCache was removed in mlx-lm 0.30.6
+        try:
+            from mlx_lm.models.cache import MambaCache as OrigMambaCache
+        except ImportError:
+            OrigMambaCache = ArraysCache  # Fallback
+
+        _patch_merge_caches(gen_module, KVCache, RotatingKVCache, OrigMambaCache)
+
         logger.info(
             "[MambaCache] Skipping _make_cache patch — "
-            "mlx-lm ArraysCache has native batching support"
+            "mlx-lm ArraysCache has native batching support; "
+            "_merge_caches patched for QuantizedKVCache routing"
         )
         _patched = True
