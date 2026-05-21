@@ -514,7 +514,9 @@ def _install_chunked_prefill(
                 if self.active_batch is None:
                     self.active_batch = new_batch
                 else:
-                    if kv_quant:
+                    if kv_quant or any(
+                        isinstance(c, _BatchQuantizedKVCache) for c in new_batch.cache
+                    ):
                         _quantize_batch_kv_cache(self.active_batch.cache)
                     self.active_batch.extend(new_batch)
 
@@ -723,7 +725,9 @@ def _install_chunked_prefill(
                     if self.active_batch is None:
                         self.active_batch = new_batch
                     else:
-                        if kv_quant:
+                        if kv_quant or any(
+                            isinstance(c, _BatchQuantizedKVCache) for c in new_batch.cache
+                        ):
                             _quantize_batch_kv_cache(self.active_batch.cache)
                         self.active_batch.extend(new_batch)
 
