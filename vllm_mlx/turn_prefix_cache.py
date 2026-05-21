@@ -509,11 +509,13 @@ class TurnPrefixCache:
             return self._insert_legacy(
                 parent_or_segments, segment_or_extracted, acquire_lock=actual_lock
             )
-        return self._insert_node(
+        rval = self._insert_node(
             parent_or_segments, segment_or_extracted,
             kv_arrays or [], kv_scales, recurrent_state,
             is_system_prompt, recurrent_scales, acquire_lock,
         )
+        logger.info(self.visualize())
+        return rval
 
     def _insert_node(
         self,
