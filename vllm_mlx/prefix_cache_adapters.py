@@ -161,12 +161,19 @@ class TurnCacheAdapter:
         reconstructed = reconstruct_cache_from_states(assembled)
         cached_tokens = ancestor.n_tokens
         remaining = list(request.prompt_token_ids[cached_tokens:])
+        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+        prefill_boundaries = sorted(
+            b - cached_tokens
+            for b in _turn_boundaries
+            if b > cached_tokens
+        )
         return CacheHit(
             cache=reconstructed,
             cached_tokens=cached_tokens,
             remaining_tokens=remaining,
             handle=path,
             hit_type="hit",
+            prefill_boundaries=prefill_boundaries,
         )
 
     def store(self, request, cache: list) -> bool:

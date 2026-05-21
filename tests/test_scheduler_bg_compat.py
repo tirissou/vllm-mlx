@@ -73,3 +73,44 @@ def test_mid_prefill_save_fires_before_prefill_completes(qwen3_small):
     assert len(checkpoints) >= 2, (
         f"Expected >=2 mid-prefill checkpoints, got {checkpoints}"
     )
+
+
+@pytest.mark.slow
+def test_turn_boundary_checkpoint_saved_at_each_boundary(qwen3_small):
+    """With use_turn_cache, the turn cache must record state at each turn boundary."""
+    model, tokenizer = qwen3_small
+    config = SchedulerConfig(
+        use_turn_cache=True,
+        use_memory_aware_cache=False,
+        chunked_prefill_tokens=256,
+        turn_cache_stride=64,
+        turn_cache_memory_gb=1.0,
+    )
+    scheduler = Scheduler(model, tokenizer, config)
+
+    boundary_positions = []
+    original_checkpoint = scheduler._prefix_cache.on_prefill_checkpoint
+    def _record(request, processed_tokens, cache_states):
+        boundary_positions.append(processed_tokens)
+        original_checkpoint(request, processed_tokens, cache_states)
+    scheduler._prefix_cache.on_prefill_checkpoint = _record
+
+    turn1 = list(range(256))
+    turn2 = list(range(256, 512))
+    req = Request(
+        request_id="r-turns",
+        prompt="placeholder",
+        prompt_token_ids=turn1 + turn2,
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    req._turn_boundaries = [256]
+    scheduler.add_request(req)
+
+    for _ in range(400):
+        output = scheduler.step()
+        if "r-turns" in output.finished_request_ids:
+            break
+
+    assert any(abs(p - 256) <= 16 for p in boundary_positions), (
+        f"No checkpoint near turn boundary 256; got checkpoints at {boundary_positions}"
+    )

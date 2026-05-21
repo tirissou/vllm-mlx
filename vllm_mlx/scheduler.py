@@ -1249,6 +1249,7 @@ class Scheduler:
                     request._cache_state.cache = hit.cache
                     request._cache_state.cached_tokens = hit.cached_tokens
                     request._cache_state.remaining_tokens = hit.remaining_tokens
+                    request._cache_state.prefill_boundaries = hit.prefill_boundaries
                     self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
                     logger.info(
                         f"[cache_fetch] request={request.request_id[:12]} HIT "
@@ -1257,6 +1258,7 @@ class Scheduler:
                 else:
                     request._cache_state.hit_type = "miss"
                     request._cache_state.remaining_tokens = request.prompt_token_ids
+                    request._cache_state.prefill_boundaries = list(getattr(request, "_turn_boundaries", []))
                     self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
                     logger.info(
                         f"[cache_fetch] request={request.request_id[:12]} MISS "
@@ -1331,11 +1333,35 @@ class Scheduler:
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
             }
+
+            def _split_at_boundaries(tokens, boundaries):
+                """Split token list at pre-adjusted boundary positions."""
+                if not boundaries:
+                    return [tokens]
+                segments = []
+                prev = 0
+                for b in sorted(boundaries):
+                    if 0 < b < len(tokens):
+                        segments.append(tokens[prev:b])
+                        prev = b
+                segments.append(tokens[prev:])
+                return [s for s in segments if s]
+
+            prefill_bds = request._cache_state.prefill_boundaries if request._cache_state else []
+            segments = _split_at_boundaries(tokens_to_process, prefill_bds)
+            use_segments = len(segments) > 1
+
             try:
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    **insert_kwargs,
-                )
+                if use_segments:
+                    uids = self.batch_generator.insert_segments(
+                        [segments],
+                        **insert_kwargs,
+                    )
+                else:
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process],
+                        **insert_kwargs,
+                    )
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(
@@ -1346,12 +1372,19 @@ class Scheduler:
                     request._cache_state.cache = None
                     request._cache_state.cached_tokens = 0
                     request._cache_state.remaining_tokens = request.prompt_token_ids
+                    request._cache_state.prefill_boundaries = list(getattr(request, "_turn_boundaries", []))
                     tokens_to_process = request.prompt_token_ids
+                    segments = _split_at_boundaries(tokens_to_process, request._cache_state.prefill_boundaries)
+                    use_segments = len(segments) > 1
                     insert_kwargs["caches"] = None
-                    uids = self.batch_generator.insert(
-                        [tokens_to_process],
-                        **insert_kwargs,
-                    )
+                    if use_segments:
+                        uids = self.batch_generator.insert_segments(
+                            [segments], **insert_kwargs
+                        )
+                    else:
+                        uids = self.batch_generator.insert(
+                            [tokens_to_process], **insert_kwargs
+                        )
                 else:
                     raise
 
@@ -1756,7 +1789,8 @@ class Scheduler:
                     # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
                     # older versions returned a flat list.
                     if isinstance(result, tuple):
-                        responses = result[1]  # generation_responses only
+                        prompt_responses, responses = result
+                        self._handle_prompt_segment_ends(prompt_responses)
                     else:
                         responses = result
 
@@ -2078,6 +2112,36 @@ class Scheduler:
             self._ssd_tier.close()
             self._ssd_tier = None
             logger.info("SSD cache tier closed")
+
+    def _handle_prompt_segment_ends(self, prompt_responses) -> None:
+        """Save turn-cache state at each completed prompt segment boundary."""
+        if self._prefix_cache is None:
+            return
+        for resp in prompt_responses:
+            if not resp.end_of_segment or resp.end_of_prompt:
+                continue
+            uid = resp.uid
+            request_id = self.uid_to_request_id.get(uid)
+            if not request_id:
+                continue
+            request = self.requests.get(request_id)
+            if not request:
+                continue
+            processed = resp.progress[0]
+            bg = self.batch_generator
+            pb = getattr(bg, "_prompt_batch", None)
+            if pb is None or uid not in pb.uids:
+                continue
+            idx = pb.uids.index(uid)
+            per_uid_cache = pb.extract_cache(idx)
+            extracted = extract_cache_states(per_uid_cache)
+            if extracted:
+                cached_offset = (
+                    request._cache_state.cached_tokens if request._cache_state else 0
+                )
+                self._prefix_cache.on_prefill_checkpoint(
+                    request, cached_offset + processed, extracted
+                )
 
     def _messages_to_segments(self, request):
         """Delegates to TurnCacheAdapter.messages_to_segments (kept for existing tests)."""
