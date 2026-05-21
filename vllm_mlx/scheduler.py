@@ -174,6 +174,39 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+class _InstrumentedBatchGenerator(BatchGenerator):
+    """BatchGenerator subclass that fires a mid-prefill callback after each chunk."""
+
+    def __init__(self, *args, mid_prefill_callback=None, save_interval=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._mid_prefill_callback = mid_prefill_callback
+        self._save_interval = save_interval
+        self._uid_last_saved: dict = {}
+
+    def _next(self):
+        prompt_responses, gen_responses = super()._next()
+
+        if self._mid_prefill_callback and prompt_responses:
+            uid_to_idx = {uid: i for i, uid in enumerate(self._prompt_batch.uids)}
+            for resp in prompt_responses:
+                if resp.end_of_prompt or resp.uid not in uid_to_idx:
+                    continue
+                processed = resp.progress[0]
+                last = self._uid_last_saved.get(resp.uid, 0)
+                if self._save_interval > 0 and (processed - last) < self._save_interval:
+                    continue
+                idx = uid_to_idx[resp.uid]
+                per_uid_cache = self._prompt_batch.extract_cache(idx)
+                self._mid_prefill_callback(resp.uid, processed, per_uid_cache)
+                self._uid_last_saved[resp.uid] = processed
+
+        active = set(self._prompt_batch.uids)
+        for uid in list(self._uid_last_saved):
+            if uid not in active:
+                del self._uid_last_saved[uid]
+
+        return prompt_responses, gen_responses
+
 
 def _install_mtp(
     batch_gen: "BatchGenerator",
@@ -925,7 +958,13 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        bg = BatchGenerator(
+        save_interval = self.config.mid_prefill_save_interval
+        mid_prefill_cb = None
+        if self._prefix_cache is not None and (save_interval > 0 or self.turn_cache is not None):
+            mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
+            logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
+
+        bg = _InstrumentedBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -933,6 +972,8 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
+            mid_prefill_callback=mid_prefill_cb,
+            save_interval=save_interval,
         )
         # mlx-lm >=0.31.x BatchGenerator natively interleaves prefill and
         # decode — chunked_prefill_tokens now only controls mid-prefill save
