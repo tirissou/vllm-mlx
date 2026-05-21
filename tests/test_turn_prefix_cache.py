@@ -2303,3 +2303,59 @@ def test_get_dequantized_recurrent_after_load_output_dtype(tmp_path, recurrent_d
     if isinstance(result, (list, tuple)):
         result = result[0]
     assert result.dtype == expected_dtype
+
+
+def test_exchange_level_round_trip_store_then_fetch():
+    """Store turn-1 exchange; cache.match at turn-2 finds sys + exchange node (depth >= 2).
+
+    Regression guard for the Option-C boundary scheme: verifies that the trie
+    walks to depth >= 2 when turn-2 segments include the previously-stored exchange.
+    Depth >= 2 implies the segment content hashes matched (sys node + exchange node).
+    """
+    from unittest.mock import MagicMock
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    adapter = TurnCacheAdapter(cache)
+
+    # Token layout — values are arbitrary; lengths chosen to be distinct.
+    sys_tokens = list(range(10))
+    u1 = list(range(10, 16))
+    gen_prompt1 = [200, 201]
+    a1_output = [300, 301, 302, 303]
+    u2 = list(range(20, 24))
+    gen_prompt2 = [400, 401]
+
+    B_sys = len(sys_tokens)                          # 10
+    B_a1  = B_sys + len(u1) + len(gen_prompt1) + len(a1_output)  # 22
+
+    # ── Turn 1: store exchange [sys | u1+gen_prompt1+a1_output] ─────────────
+    # No KV state passed — we test trie structure, not KV restoration.
+    req1 = MagicMock()
+    req1.prompt_token_ids = sys_tokens + u1 + gen_prompt1
+    req1._turn_boundaries  = [B_sys]
+    req1._boundary_states  = {}   # no system KV checkpoint
+    req1._turn_cache_path  = []
+    req1._cache_state      = None
+    req1.output_token_ids  = a1_output
+
+    stored = adapter.store(req1, [])
+    assert stored, "TurnCacheAdapter.store should return True for a valid request"
+
+    # ── Turn 2: match [sys | u1+gen_prompt1+a1_output | u2+gen_prompt2] ─────
+    req2 = MagicMock()
+    req2.prompt_token_ids = (
+        sys_tokens + u1 + gen_prompt1 + a1_output + u2 + gen_prompt2
+    )
+    req2._turn_boundaries = [B_sys, B_a1]
+    req2._cache_state     = None
+
+    segments2 = TurnCacheAdapter.messages_to_segments(req2)
+    path, _   = cache.match(segments2)
+
+    assert len(path) >= 2, (
+        f"Expected depth-2 trie match (sys + exchange node), got depth {len(path)}: "
+        f"{[n.token_ids for n in path]}"
+    )
+    cache.release(path)
