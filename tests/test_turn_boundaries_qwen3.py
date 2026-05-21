@@ -299,19 +299,19 @@ class TestTurnBoundariesQwen3:
             )
 
     def test_exact_boundary_count_two_messages(self):
-        """system + user → exactly 2 boundaries (after system, after user)."""
+        """system + user → exactly 1 boundary (after system only)."""
         eng = _make_engine_with_qwen3()
         messages = [
             {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": "Q1"},
         ]
         boundaries = eng._compute_turn_boundaries(messages)
-        assert len(boundaries) == 2, (
-            f"Expected 2 boundaries (system, user), got {len(boundaries)}: {boundaries}"
+        assert len(boundaries) == 1, (
+            f"Expected 1 boundary (system only), got {len(boundaries)}: {boundaries}"
         )
 
     def test_exact_boundary_count_multi_turn(self):
-        """system + user + asst + user → exactly 4 boundaries."""
+        """system + user + asst + user → exactly 2 boundaries (system + assistant)."""
         eng = _make_engine_with_qwen3()
         messages = [
             {"role": "system", "content": "You are helpful."},
@@ -320,8 +320,8 @@ class TestTurnBoundariesQwen3:
             {"role": "user", "content": "Q2"},
         ]
         boundaries = eng._compute_turn_boundaries(messages)
-        assert len(boundaries) == 4, (
-            f"Expected 4 boundaries, got {len(boundaries)}: {boundaries}"
+        assert len(boundaries) == 2, (
+            f"Expected 2 boundaries (system + assistant), got {len(boundaries)}: {boundaries}"
         )
 
     def test_same_system_boundary_for_different_user_messages(self):

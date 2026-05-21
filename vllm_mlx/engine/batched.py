@@ -1021,13 +1021,15 @@ class BatchedEngine(BaseEngine):
 
             # Try im_end scan for Qwen3-like tokenizers
             if im_end_id is not None and im_end_id != getattr(tokenizer, "unk_token_id", None):
-                nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
-                nl_id = nl_tokens[0] if nl_tokens else None
-
                 boundaries = []
+                im_end_count = 0
                 for i, tok in enumerate(full_tokens):
                     if tok == im_end_id:
-                        boundaries.append(i + 1)
+                        if im_end_count < len(messages):
+                            role = messages[im_end_count].get("role", "")
+                            if role in ("system", "assistant"):
+                                boundaries.append(i + 1)
+                        im_end_count += 1
 
                 logger.info(
                     f"[turn_cache] _compute_turn_boundaries: "
