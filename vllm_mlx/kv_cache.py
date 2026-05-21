@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import mlx.core as mx
@@ -40,6 +40,7 @@ class RequestCacheState:
     cache: list | None = None
     cached_tokens: int = 0
     remaining_tokens: list | None = None
+    prefill_boundaries: list = field(default_factory=list)
 
     # Written by Scheduler before calling store()
     store_tokens: list | None = None        # N-1 token key
@@ -63,6 +64,7 @@ class CacheHit:
     remaining_tokens: list         # tokens not yet covered by cache
     handle: Any = None             # opaque value passed back to release()
     hit_type: str = "hit"
+    prefill_boundaries: list = field(default_factory=list)
 
 
 @runtime_checkable
