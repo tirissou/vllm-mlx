@@ -6,6 +6,8 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 - Local inference may use llama.cpp or LM Studio via OpenAI-compatible endpoints.
 - Prefer `rg` over `grep`.
 - Prefer `fd` over `find` when available.
+- Python virtual environment at `.venv` is managed by `uv`. Use `uv pip` always.
+- The python source code is in `vllm_mlx`.
 
 ## Research
 - Use the available web search tool for:
@@ -35,6 +37,34 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 - When asked for code, provide complete corrected code blocks unless a diff or partial snippet is specifically requested.
 - Do not re-summarize obvious changes unless asked.
 - Surface important command errors instead of hiding them.
+
+## mlx-lm Cache Primitives
+
+mlx-lm provides these cache types (`mlx_lm.models.cache`):
+
+| Class                 | Sequences | Storage   | Batch ops                        |
+|-----------------------|-----------|-----------|----------------------------------|
+| KVCache               | 1         | float     | —                                |
+| RotatingKVCache       | 1         | float     | —                                |
+| QuantizedKVCache      | 1         | int4/int8 | —                                |
+| BatchKVCache          | N         | float     | filter / extend / extract / merge |
+| BatchRotatingKVCache  | N         | float     | filter / extend / extract / merge |
+| ArraysCache           | N         | float     | filter / extend / extract / merge |
+
+Padding support:
+- `BatchKVCache` / `BatchRotatingKVCache`: left-padding (constructor) + right-padding
+  (`prepare(right_padding=...)` / `finalize()` via `dynamic_roll`).
+- `ArraysCache`: `prepare(lengths=...)` / `finalize()` for pad masking in SSM layers.
+  Called before batched prefill with per-sequence real token counts.
+
+No batched quantized KV cache exists upstream. `BatchQuantizedKVCache` fills this gap.
+`VllmQuantizedKVCache` is its single-sequence extract form (returned by `extract()`).
+
+Single-sequence types delegate `merge` to their batch counterparts:
+- `KVCache.merge` → `BatchKVCache`
+- `RotatingKVCache.merge` → `BatchRotatingKVCache`
+- `VllmQuantizedKVCache.merge` → `BatchQuantizedKVCache` (ours)
+- `ArraysCache.merge` → `ArraysCache` (already batched)
 
 ## Stop Conditions
 - If the same test fails twice with the same root cause, stop and explain the blocker.
