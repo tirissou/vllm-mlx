@@ -1468,6 +1468,7 @@ def reconstruct_cache_from_states(extracted_states):
                 from mlx_lm.models.cache import (
                     BatchKVCache as _BatchKVCache,
                     KVCache as _KVCache,
+                    QuantizedKVCache as _QuantizedKVCache,
                 )
                 if cache_cls is _BatchKVCache:
                     keys, values = state[0], state[1]
@@ -1475,6 +1476,17 @@ def reconstruct_cache_from_states(extracted_states):
                     cache.keys = keys
                     cache.values = values
                     cache.offset = keys.shape[2]
+                elif cache_cls is _QuantizedKVCache:
+                    # Dequantize to KVCache so mlx-lm's KVCache.extend() works.
+                    # state = ((w_k, s_k, b_k), (w_v, s_v, b_v)); meta = (n, group, bits)
+                    (w_k, s_k, b_k), (w_v, s_v, b_v) = state
+                    group_size = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
+                    bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
+                    n_tokens = int(meta_state[0]) if meta_state else w_k.shape[2]
+                    cache = _KVCache()
+                    cache.keys = mx.dequantize(w_k, s_k, b_k, group_size=group_size, bits=bits)
+                    cache.values = mx.dequantize(w_v, s_v, b_v, group_size=group_size, bits=bits)
+                    cache.offset = n_tokens
                 else:
                     cache = cache_cls.from_state(state, meta_state)
             else:
