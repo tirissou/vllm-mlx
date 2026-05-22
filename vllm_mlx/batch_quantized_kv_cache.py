@@ -222,7 +222,7 @@ class BatchQuantizedKVCache:
     # ------------------------------------------------------------------
 
     def extract(self, idx: int) -> QuantizedKVCache:
-        cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
+        cache = VllmQuantizedKVCache(group_size=self.group_size, bits=self.bits)
         padding = self.left_padding[idx].item()
         # QuantizedKVCache expects keys/values as a list of 3 arrays
         cache.keys = [
@@ -290,6 +290,18 @@ class BatchQuantizedKVCache:
         return result
 
 
+class VllmQuantizedKVCache(QuantizedKVCache):
+    """Single-sequence quantized KV cache returned by BatchQuantizedKVCache.extract().
+
+    Mirrors the mlx-lm pattern: KVCache.merge → BatchKVCache,
+    RotatingKVCache.merge → BatchRotatingKVCache.
+    """
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchQuantizedKVCache.merge(caches)
+
+
 def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4):
     """Like mlx-lm's _make_cache but emits BatchQuantizedKVCache for KV layers.
 
@@ -328,13 +340,3 @@ def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64,
             for _ in model.layers]
 
 
-# ------------------------------------------------------------------
-# Monkey-patch QuantizedKVCache.merge → BatchQuantizedKVCache.merge
-# ------------------------------------------------------------------
-
-def _qkv_merge(_, caches):
-    return BatchQuantizedKVCache.merge(caches)
-
-
-if not hasattr(QuantizedKVCache, "merge"):
-    QuantizedKVCache.merge = classmethod(_qkv_merge)
