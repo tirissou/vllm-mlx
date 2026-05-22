@@ -252,6 +252,28 @@ class TestBatchQuantizedKVCacheAlignment:
         with pytest.raises(NotImplementedError):
             cache.meta_state = ("0", "64", "4")
 
+    def test_is_trimmable_returns_true(self):
+        from mlx_lm.models.cache import can_trim_prompt_cache
+        cache = self._make_cache(B=2)
+        assert cache.is_trimmable() is True
+        assert can_trim_prompt_cache([cache]) is True
+
+    def test_trim_reduces_idx_and_offset(self):
+        cache = self._make_cache(B=2, T=16)
+        mx.eval(cache.offset)
+        offset_before = cache.offset.tolist()
+        result = cache.trim(4)
+        assert result == 4
+        assert cache._idx == 12
+        mx.eval(cache.offset)
+        assert cache.offset.tolist() == [o - 4 for o in offset_before]
+
+    def test_trim_clamps_to_idx(self):
+        cache = self._make_cache(B=1, T=8)
+        result = cache.trim(100)
+        assert result == 8
+        assert cache._idx == 0
+
 
 # ------------------------------------------------------------------
 # Helpers shared by adapter tests
