@@ -423,6 +423,26 @@ class TestMakeQuantizedCache:
         assert isinstance(cache[1], ArraysCache)
 
 
+    def test_kvcache_subclass_gets_replaced(self):
+        """isinstance check: a KVCache subclass must be converted to BatchQuantizedKVCache."""
+        from mlx_lm.models.cache import KVCache
+        from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache, make_quantized_cache
+
+        class MyKVCache(KVCache):
+            pass
+
+        class FakeModel:
+            layers = [None]
+
+            def make_cache(self):
+                return [MyKVCache()]
+
+        cache = make_quantized_cache(FakeModel(), [0], max_kv_size=None)
+        assert isinstance(cache[0], BatchQuantizedKVCache), (
+            f"Expected BatchQuantizedKVCache, got {type(cache[0])}"
+        )
+
+
 class TestInstallChunkedPrefillAcceptsKvQuantParams:
     """_install_chunked_prefill must accept kv_quant/bits/group_size params."""
 
