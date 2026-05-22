@@ -274,6 +274,45 @@ class TestBatchQuantizedKVCacheAlignment:
         assert result == 8
         assert cache._idx == 0
 
+    def test_right_padding_finalize_adjusts_offset_and_left_padding(self):
+        """After right-padded prefill + finalize, offset and left_padding reflect real tokens only."""
+        B, H, T, D = 2, 4, 6, 64
+        cache = BatchQuantizedKVCache(left_padding=[0, 0])
+        cache.prepare(right_padding=[2, 0])
+
+        keys = mx.random.normal((B, H, T, D)).astype(mx.bfloat16)
+        values = mx.random.normal((B, H, T, D)).astype(mx.bfloat16)
+        cache.update_and_fetch(keys, values)
+        mx.eval(cache.keys, cache.values, cache.offset, cache.left_padding)
+
+        offset_before = cache.offset.tolist()
+        lp_before = cache.left_padding.tolist()
+
+        cache.finalize()
+        mx.eval(cache.offset, cache.left_padding)
+
+        offset_after = cache.offset.tolist()
+        lp_after = cache.left_padding.tolist()
+
+        # Seq 0: 2 right-padding tokens removed → offset shrinks, left_padding grows
+        assert offset_after[0] == offset_before[0] - 2
+        assert lp_after[0] == lp_before[0] + 2
+        # Seq 1: no right padding → unchanged
+        assert offset_after[1] == offset_before[1]
+        assert lp_after[1] == lp_before[1]
+
+    def test_finalize_without_right_padding_is_noop(self):
+        cache = self._make_cache(B=2, T=10)
+        mx.eval(cache.offset, cache.left_padding)
+        offset_before = cache.offset.tolist()
+        lp_before = cache.left_padding.tolist()
+
+        cache.finalize()
+        mx.eval(cache.offset, cache.left_padding)
+
+        assert cache.offset.tolist() == offset_before
+        assert cache.left_padding.tolist() == lp_before
+
 
 # ------------------------------------------------------------------
 # Helpers shared by adapter tests

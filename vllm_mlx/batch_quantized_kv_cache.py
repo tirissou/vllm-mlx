@@ -17,7 +17,7 @@ from typing import List
 
 import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
-from mlx_lm.models.cache import BatchKVCache, QuantizedKVCache, _BaseCache
+from mlx_lm.models.cache import BatchKVCache, QuantizedKVCache, _BaseCache, dynamic_roll
 
 from .kv_cache import QuantizedArray
 
@@ -33,6 +33,7 @@ class BatchQuantizedKVCache(_BaseCache):
         self._idx = 0
         self.group_size = group_size
         self.bits = bits
+        self._right_padding = None
 
     # ------------------------------------------------------------------
     # Core cache interface
@@ -106,10 +107,23 @@ class BatchQuantizedKVCache(_BaseCache):
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
             self.offset -= left_padding
-        # right_padding unsupported for quantized caches (no dynamic_roll equivalent)
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
 
     def finalize(self):
-        pass
+        if self._right_padding is not None:
+            padding = self._right_padding
+
+            def roll_qa(qa):
+                return QuantizedArray(*[
+                    dynamic_roll(c, padding[:, None], axis=2) for c in qa
+                ])
+
+            self.keys = roll_qa(self.keys)
+            self.values = roll_qa(self.values)
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
 
     @property
     def state(self):
