@@ -193,7 +193,9 @@ class _InstrumentedBatchGenerator(BatchGenerator):
                     continue
                 processed = resp.progress[0]
                 last = self._uid_last_saved.get(resp.uid, 0)
-                if self._save_interval > 0 and (processed - last) < self._save_interval:
+                # Always fire at segment boundaries (needed for eager turn insertion);
+                # apply interval throttle only for mid-segment checkpoints.
+                if not resp.end_of_segment and self._save_interval > 0 and (processed - last) < self._save_interval:
                     continue
                 idx = uid_to_idx[resp.uid]
                 per_uid_cache = self._prompt_batch.extract_cache(idx)

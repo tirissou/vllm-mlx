@@ -915,11 +915,14 @@ class _MockKVLayer:
 
 
 def _make_extracted_state(n_layers=2, n_tokens=10):
-    """Build a list of dicts in _extract_cache_states format."""
+    """Build a list of dicts in _extract_cache_states format.
+
+    head_dim=64 ensures divisibility by _split_cache_arrays' group_size=64.
+    """
     from mlx_lm.models.cache import KVCache
     return [
         {
-            "state": (mx.zeros([1, 4, n_tokens, 32]), mx.zeros([1, 4, n_tokens, 32])),
+            "state": (mx.zeros([1, 4, n_tokens, 64]), mx.zeros([1, 4, n_tokens, 64])),
             "meta_state": "",  # KVCache.meta_state is a string
             "class_name": "KVCache",
             "class_ref": KVCache,
@@ -1266,7 +1269,6 @@ def test_multi_turn_conv_stored_after_turn2_new():
     req2 = MagicMock()
     req2.prompt_token_ids = sys_tokens + u1 + a1 + u2
     req2._turn_boundaries = [B_sys, B_1]
-    req2._boundary_states = {B_sys: sys_state, B_1: conv_state}
     req2._turn_cache_path = [sys_node]
     req2._extracted_cache = _make_extracted_state(n_layers=1, n_tokens=B_1 + len(u2))
     req2.output_token_ids = [999]
@@ -1280,7 +1282,7 @@ def test_multi_turn_conv_stored_after_turn2_new():
     parent = sys_node
     new_segments = segs2[matched_depth:]
     _turn_boundaries = req2._turn_boundaries
-    _boundary_states = req2._boundary_states
+    boundary_states = {B_sys: sys_state, B_1: conv_state}
     parent_before_user = parent
 
     inserted = []
@@ -1288,7 +1290,7 @@ def test_multi_turn_conv_stored_after_turn2_new():
         abs_idx = matched_depth + i
         is_sys = segment.role == "system" and abs_idx == 0
         is_last = i == len(new_segments) - 1
-        state = None if is_last else _boundary_states.get(_turn_boundaries[abs_idx]) if abs_idx < len(_turn_boundaries) else None
+        state = None if is_last else boundary_states.get(_turn_boundaries[abs_idx]) if abs_idx < len(_turn_boundaries) else None
         parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
         if not is_last:
             parent_before_user = parent
@@ -1662,48 +1664,37 @@ def test_messages_to_segments_new_sys_stable():
     assert segs1[1].token_ids != segs2[1].token_ids
 
 
-def test_mid_prefill_saves_boundary_state():
-    """Test that _make_mid_prefill_save_callback saves state at boundaries.
-
-    insert_segments() fires end_of_segment AT boundary B (not B-1), so
-    processed==B must match _turn_boundaries directly.
-    """
+def test_mid_prefill_eagerly_inserts_turn_at_boundary():
+    """_make_mid_prefill_save_callback eagerly inserts the turn into the trie at boundary."""
     from unittest.mock import MagicMock, patch
 
     sched = _make_minimal_scheduler_new()
     callback = sched._make_mid_prefill_save_callback(save_interval=512)
 
-    # Create a simple request object (not MagicMock to avoid mock attribute issues)
     class SimpleRequest:
         pass
 
     req = SimpleRequest()
     req.request_id = "test-1"
-    req.prompt_token_ids = list(range(100))
-    req.cached_tokens = 0
-    req._turn_boundaries = [50]  # boundary at 50 tokens
-    req._boundary_states = {}
+    req.prompt_token_ids = list(range(100))  # 100 tokens; B_sys=50 → sys=[0-49], user=[50-99]
+    req._turn_boundaries = [50]
     req._mid_prefill_last_save = 0
 
     sched.requests["test-1"] = req
     sched.uid_to_request_id[123] = "test-1"
 
-    # Mock extract_cache_states (free function imported in scheduler module)
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
-        # insert_segments fires at processed=50 (AT the boundary, not B-1)
-        prompt_cache = MagicMock()
-        callback(123, 50, prompt_cache)
+        callback(123, 50, MagicMock())
 
-    # Verify _boundary_states keyed by boundary position (50)
-    assert hasattr(req, "_boundary_states")
-    assert req._boundary_states is not None
-    assert 50 in req._boundary_states
-    assert req._boundary_states[50] is mock_extracted
+    # System turn eagerly inserted into trie
+    assert len(sched.turn_cache.root.children) == 1
+    assert hasattr(req, "_turn_cache_path")
+    assert len(req._turn_cache_path) == 1
 
 
-def test_mid_prefill_does_not_save_away_from_boundary():
-    """Test that callback does not save away from boundaries."""
+def test_mid_prefill_does_not_insert_away_from_boundary():
+    """Callback does nothing when processed position is not a turn boundary."""
     from unittest.mock import MagicMock, patch
 
     sched = _make_minimal_scheduler_new()
@@ -1715,9 +1706,7 @@ def test_mid_prefill_does_not_save_away_from_boundary():
     req = SimpleRequest()
     req.request_id = "test-2"
     req.prompt_token_ids = list(range(100))
-    req.cached_tokens = 0
     req._turn_boundaries = [50]  # boundary at 50, not at 30
-    req._boundary_states = {}
     req._mid_prefill_last_save = 0
 
     sched.requests["test-2"] = req
@@ -1725,19 +1714,14 @@ def test_mid_prefill_does_not_save_away_from_boundary():
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
-        # processed=30 → total=30, 30 not in [50] → no save
-        prompt_cache = MagicMock()
-        callback(124, 30, prompt_cache)
+        callback(124, 30, MagicMock())  # total=30, not in [50] → no insert
 
-    # Should NOT save to _boundary_states
-    assert req._boundary_states == {}
+    assert len(sched.turn_cache.root.children) == 0
+    assert not getattr(req, "_turn_cache_path", None)
 
 
-def test_mid_prefill_saves_multiple_boundaries():
-    """Test that callback saves state at multiple boundaries.
-
-    insert_segments() fires end_of_segment AT boundary B, so processed==B.
-    """
+def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
+    """Callback inserts all turn nodes in sequence at each boundary."""
     from unittest.mock import MagicMock, patch
 
     sched = _make_minimal_scheduler_new()
@@ -1748,109 +1732,74 @@ def test_mid_prefill_saves_multiple_boundaries():
 
     req = SimpleRequest()
     req.request_id = "test-3"
+    # 200 tokens: sys=[0-49], conv1=[50-99], conv2=[100-149], user=[150-199]
     req.prompt_token_ids = list(range(200))
-    req.cached_tokens = 0
-    req._turn_boundaries = [50, 100, 150]  # three boundaries
-    req._boundary_states = {}
+    req._turn_boundaries = [50, 100, 150]
     req._mid_prefill_last_save = 0
 
     sched.requests["test-3"] = req
     sched.uid_to_request_id[125] = "test-3"
 
-    # Save at first boundary (fire AT B=50)
-    mock_extracted_50 = _make_extracted_state(n_layers=2, n_tokens=50)
-    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_50):
-        callback(125, 50, MagicMock())
+    for boundary, n_tok in [(50, 50), (100, 100), (150, 150)]:
+        extracted = _make_extracted_state(n_layers=2, n_tokens=n_tok)
+        with patch('vllm_mlx.scheduler.extract_cache_states', return_value=extracted):
+            callback(125, boundary, MagicMock())
 
-    # Save at second boundary (fire AT B=100)
-    mock_extracted_100 = _make_extracted_state(n_layers=2, n_tokens=100)
-    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_100):
-        callback(125, 100, MagicMock())
-
-    # Save at third boundary (fire AT B=150)
-    mock_extracted_150 = _make_extracted_state(n_layers=2, n_tokens=150)
-    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_150):
-        callback(125, 150, MagicMock())
-
-    # Verify all boundaries were saved (keyed by boundary position)
-    assert hasattr(req, "_boundary_states")
-    assert 50 in req._boundary_states
-    assert 100 in req._boundary_states
-    assert 150 in req._boundary_states
+    # Three turns inserted, chained: root → sys → conv1 → conv2
+    assert len(req._turn_cache_path) == 3
+    root_children = sched.turn_cache.root.children
+    assert len(root_children) == 1
+    sys_node = list(root_children.values())[0]
+    assert len(sys_node.children) == 1
+    conv1_node = list(sys_node.children.values())[0]
+    assert len(conv1_node.children) == 1
 
 
-def test_store_side_uses_boundary_states():
-    """After generation, nodes get state from _boundary_states[B_k]."""
+def test_store_side_uses_adapter_state_from_eager_insertion():
+    """store() uses pre-populated adapter_state from eager prefill insertion."""
     from unittest.mock import MagicMock
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
-    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+    from vllm_mlx.kv_cache import RequestCacheState
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
 
-    sched = object.__new__(Scheduler)
-    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
-    sched.memory_aware_cache = None
-    sched.block_aware_cache = None
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
-    sched.turn_cache = cache
+    adapter = TurnCacheAdapter(cache)
 
     sys_tokens = list(range(10))
     user_tokens = list(range(10, 15))
     B_sys = 10
 
+    # Simulate eager insertion: sys node already in trie via on_prefill_checkpoint
     sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
+    sys_seg = Segment(role="system", token_ids=sys_tokens)
+    kv, recur = cache._split_cache_arrays(sys_state, 0)
+    sys_node = cache.insert(cache.root, sys_seg, kv, None, recur, is_system_prompt=True)
+
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + user_tokens
     req._turn_boundaries = [B_sys]
-    req._boundary_states = {B_sys: sys_state}
-    req._extracted_cache = _make_extracted_state(n_layers=2, n_tokens=15)
-    req._turn_cache_path = []
+    req._cache_state = RequestCacheState(cached_tokens=0, adapter_state=[sys_node])
     req.output_token_ids = [500, 501]
 
-    segments = sched._messages_to_segments(req)
-    assert len(segments) == 2
+    final_state = _make_extracted_state(n_layers=2, n_tokens=15)
+    result = adapter.store(req, final_state)
+    assert result is True
 
-    parent = cache.root
-    matched_depth = 0
-    new_segments = segments
-    _turn_boundaries = req._turn_boundaries
-    _boundary_states = req._boundary_states
-    parent_before_user = parent
-
-    for i, segment in enumerate(new_segments):
-        abs_idx = matched_depth + i
-        is_sys = segment.role == "system" and abs_idx == 0
-        is_last = i == len(new_segments) - 1
-
-        if is_last:
-            state = None
-        elif abs_idx < len(_turn_boundaries):
-            state = _boundary_states.get(_turn_boundaries[abs_idx])
-        else:
-            state = None
-
-        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
-        if not is_last:
-            parent_before_user = parent
-
-    sys_node = list(cache.root.children.values())[0]
-    assert sys_node.recurrent_state is not None
-    assert sys_node.recurrent_state is sys_state
-
-    user_node = list(sys_node.children.values())[0]
-    assert user_node.recurrent_state is None  # user = structural
+    # store() should insert only the response node under sys_node
+    assert len(sys_node.children) == 1
+    response_node = list(sys_node.children.values())[0]
+    assert response_node.token_ids == user_tokens + [500, 501]
 
 
-def test_store_side_conv_node_gets_boundary_state():
-    """Conv node gets _boundary_states[B_1], not sys state."""
+def test_store_side_two_turn_with_eager_insertion():
+    """With two eagerly-inserted turns, store() inserts only the response node."""
     from unittest.mock import MagicMock
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
-    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+    from vllm_mlx.kv_cache import RequestCacheState
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
 
-    sched = object.__new__(Scheduler)
-    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
-    sched.memory_aware_cache = None
-    sched.block_aware_cache = None
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
-    sched.turn_cache = cache
+    adapter = TurnCacheAdapter(cache)
 
     sys_tokens = list(range(10))
     conv_tokens = list(range(10, 25))
@@ -1858,41 +1807,32 @@ def test_store_side_conv_node_gets_boundary_state():
     B_sys = 10
     B_1 = 25
 
+    # Eagerly insert sys node and conv node (simulating two on_prefill_checkpoint calls)
     sys_state = _make_extracted_state(n_layers=1, n_tokens=10)
     conv_state = _make_extracted_state(n_layers=1, n_tokens=25)
+
+    sys_seg = Segment(role="system", token_ids=sys_tokens)
+    kv_sys, recur_sys = cache._split_cache_arrays(sys_state, 0)
+    sys_node = cache.insert(cache.root, sys_seg, kv_sys, None, recur_sys, is_system_prompt=True)
+
+    conv_seg = Segment(role="conversation", token_ids=conv_tokens)
+    kv_conv, recur_conv = cache._split_cache_arrays(conv_state, sys_node.n_tokens)
+    conv_node = cache.insert(sys_node, conv_seg, kv_conv, None, recur_conv)
 
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + conv_tokens + user_tokens
     req._turn_boundaries = [B_sys, B_1]
-    req._boundary_states = {B_sys: sys_state, B_1: conv_state}
-    req._extracted_cache = _make_extracted_state(n_layers=1, n_tokens=27)
-    req._turn_cache_path = []
+    req._cache_state = RequestCacheState(cached_tokens=0, adapter_state=[sys_node, conv_node])
     req.output_token_ids = [999]
 
-    segments = sched._messages_to_segments(req)
-    assert len(segments) == 3
+    final_state = _make_extracted_state(n_layers=1, n_tokens=27)
+    result = adapter.store(req, final_state)
+    assert result is True
 
-    parent = cache.root
-    _turn_boundaries = req._turn_boundaries
-    _boundary_states = req._boundary_states
-    parent_before_user = parent
-
-    for i, segment in enumerate(segments):
-        is_sys = segment.role == "system" and i == 0
-        is_last = i == len(segments) - 1
-        if is_last:
-            state = None
-        elif i < len(_turn_boundaries):
-            state = _boundary_states.get(_turn_boundaries[i])
-        else:
-            state = None
-        parent = cache.insert(parent, segment, [], [], state, is_system_prompt=is_sys)
-        if not is_last:
-            parent_before_user = parent
-
-    sys_node = list(cache.root.children.values())[0]
-    conv_node = list(sys_node.children.values())[0]
-    assert conv_node.recurrent_state is conv_state
+    # Response node should be a child of conv_node
+    assert len(conv_node.children) == 1
+    response_node = list(conv_node.children.values())[0]
+    assert response_node.token_ids == user_tokens + [999]
 
 
 def test_chunked_prefill_boundary_aware_first_chunk():

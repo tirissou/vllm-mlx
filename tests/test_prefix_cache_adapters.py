@@ -145,37 +145,44 @@ def test_memory_cache_adapter_on_prefill_checkpoint_stores_prefix():
     assert stored_tokens == list(range(5))
 
 
-def test_turn_cache_adapter_on_prefill_checkpoint_captures_boundary_state():
-    """TurnCacheAdapter records boundary state when processed AT the boundary position."""
+def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
+    """TurnCacheAdapter.on_prefill_checkpoint eagerly inserts the turn into the trie."""
     from vllm_mlx.kv_cache import RequestCacheState
     inner = MagicMock()
+    inner.root = MagicMock(n_tokens=0)
+    new_node = MagicMock(n_tokens=5)
+    inner._split_cache_arrays.return_value = ([], None)
+    inner.insert.return_value = new_node
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
-    request._cache_state = RequestCacheState(cached_tokens=0)
-    request._turn_boundaries = [5]   # boundary at 5
-    request._boundary_states = {}
+    cs = RequestCacheState(cached_tokens=0, adapter_state=[])
+    request._cache_state = cs
+    request.prompt_token_ids = list(range(10))  # 10 tokens; B_sys=5 → sys=[0-4], user=[5-9]
+    request._turn_boundaries = [5]
 
     extracted = [{"state": (None, None), "class_name": "KVCache"}]
-    # insert_segments fires at processed=5 (AT boundary, not B-1)
     adapter.on_prefill_checkpoint(request, 5, extracted)
 
-    assert 5 in request._boundary_states
-    assert request._boundary_states[5] is extracted
+    inner.insert.assert_called_once()
+    assert len(cs.adapter_state) == 1
+    assert cs.adapter_state[0] is new_node
 
 
 def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
     from vllm_mlx.kv_cache import RequestCacheState
     inner = MagicMock()
+    inner.root = MagicMock(n_tokens=0)
+    inner._split_cache_arrays.return_value = ([], None)
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
-    request._cache_state = RequestCacheState(cached_tokens=0)
+    request._cache_state = RequestCacheState(cached_tokens=0, adapter_state=[])
     request._turn_boundaries = [5]
-    request._boundary_states = {}
+    request.prompt_token_ids = list(range(10))
 
-    adapter.on_prefill_checkpoint(request, 3, [])  # total=3, not in [5] → no save
-    assert request._boundary_states == {}
+    adapter.on_prefill_checkpoint(request, 3, [])  # total=3, not in [5] → no insert
+    inner.insert.assert_not_called()
 
 
 import mlx.core as mx

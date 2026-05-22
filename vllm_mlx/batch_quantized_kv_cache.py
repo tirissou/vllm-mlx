@@ -281,6 +281,19 @@ class BatchQuantizedKVCache(_BaseCache):
             b = getattr(caches[0], "bits", 4) if caches else 4
             return cls([0] * len(caches), group_size=gs, bits=b)
 
+        # Fast-path for single cache: wrap existing arrays directly, no copy.
+        if len(caches) == 1:
+            c = caches[0]
+            gs = getattr(c, "group_size", 64)
+            b = getattr(c, "bits", 4)
+            result = cls([0], group_size=gs, bits=b)
+            if c.keys is not None:
+                result.keys = QuantizedArray(*c.keys)
+                result.values = QuantizedArray(*c.values)
+                result._idx = c.offset
+                result.offset = mx.array([c.offset])
+            return result
+
         padding = [max_length - l for l in lengths]
         group_size = getattr(caches[0], "group_size", 64)
         bits = getattr(caches[0], "bits", 4)
