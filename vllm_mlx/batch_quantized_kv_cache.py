@@ -351,7 +351,7 @@ def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64,
     )
 
     def to_quantized_batch(c):
-        if type(c) is KVCache:
+        if isinstance(c, KVCache):
             return BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
