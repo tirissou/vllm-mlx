@@ -237,6 +237,23 @@ class TestBatchQuantizedKVCacheAlignment:
         assert isinstance(merged, BatchQuantizedKVCache)
         assert merged.keys.packed.shape[0] == 3
 
+    def test_is_instance_of_base_cache(self):
+        from mlx_lm.models.cache import _BaseCache
+        cache = BatchQuantizedKVCache(left_padding=[0])
+        assert isinstance(cache, _BaseCache)
+
+    def test_state_setter_raises_not_implemented(self):
+        import pytest
+        cache = BatchQuantizedKVCache(left_padding=[0])
+        with pytest.raises(NotImplementedError):
+            cache.state = (None, None)
+
+    def test_meta_state_setter_raises_not_implemented(self):
+        import pytest
+        cache = BatchQuantizedKVCache(left_padding=[0])
+        with pytest.raises(NotImplementedError):
+            cache.meta_state = ("0", "64", "4")
+
 
 # ------------------------------------------------------------------
 # Helpers shared by adapter tests
