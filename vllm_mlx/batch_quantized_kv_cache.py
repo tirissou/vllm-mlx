@@ -135,6 +135,15 @@ class BatchQuantizedKVCache(_BaseCache):
     def size(self):
         return self._idx
 
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
     def empty(self):
         return self.keys is None
 
