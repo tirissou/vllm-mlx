@@ -111,19 +111,22 @@ class BatchQuantizedKVCache(_BaseCache):
             self._right_padding = mx.array(right_padding)
 
     def finalize(self):
-        if self._right_padding is not None:
-            padding = self._right_padding
+        if self._right_padding is None:
+            return
+        padding = self._right_padding
+        self._right_padding = None
+        if self.keys is None:
+            return
 
-            def roll_qa(qa):
-                return QuantizedArray(*[
-                    dynamic_roll(c, padding[:, None], axis=2) for c in qa
-                ])
+        def roll_qa(qa):
+            return QuantizedArray(*[
+                dynamic_roll(c, padding[:, None], axis=2) for c in qa
+            ])
 
-            self.keys = roll_qa(self.keys)
-            self.values = roll_qa(self.values)
-            self.offset -= padding
-            self.left_padding += padding
-            self._right_padding = None
+        self.keys = roll_qa(self.keys)
+        self.values = roll_qa(self.values)
+        self.offset -= padding
+        self.left_padding += padding
 
     @property
     def state(self):
