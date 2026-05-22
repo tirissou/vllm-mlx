@@ -1665,6 +1665,15 @@ class Scheduler:
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
 
+                # Eagerly absorb requests that arrived during next() so they
+                # join the current prefill session on the very next next() call,
+                # rather than waiting for the following step().
+                if self.waiting:
+                    extra = self._schedule_waiting()
+                    if extra:
+                        output.scheduled_request_ids.extend(r.request_id for r in extra)
+                        output.num_scheduled_tokens += sum(r.num_prompt_tokens for r in extra)
+
                 # Success - break out of retry loop
                 break
 
