@@ -17,12 +17,12 @@ from typing import List
 
 import mlx.core as mx
 from mlx_lm.models.base import create_causal_mask
-from mlx_lm.models.cache import BatchKVCache, QuantizedKVCache
+from mlx_lm.models.cache import BatchKVCache, QuantizedKVCache, _BaseCache
 
 from .kv_cache import QuantizedArray
 
 
-class BatchQuantizedKVCache:
+class BatchQuantizedKVCache(_BaseCache):
     step = 256
 
     def __init__(self, left_padding: List[int], group_size: int = 64, bits: int = 4):
@@ -120,9 +120,17 @@ class BatchQuantizedKVCache:
             QuantizedArray(*[v[..., : self._idx, :] for v in self.values]),
         )
 
+    @state.setter
+    def state(self, v):
+        raise NotImplementedError("BatchQuantizedKVCache does not support from_state")
+
     @property
     def meta_state(self):
         return tuple(map(str, (self._idx, self.group_size, self.bits)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        raise NotImplementedError("BatchQuantizedKVCache does not support from_state")
 
     def size(self):
         return self._idx
