@@ -115,10 +115,9 @@ if type(c) is KVCache:
 if isinstance(c, KVCache):
 ```
 
-### 5. AGENTS.md — new mlx-lm section
+### 5. AGENTS.md — mlx-lm section
 
-Document what mlx-lm provides natively so future contributors don't rediscover it.
-See design discussion for full table content.
+Already written and committed. See `AGENTS.md § mlx-lm Cache Primitives`.
 
 ## Files Changed
 
