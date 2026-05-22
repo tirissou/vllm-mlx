@@ -146,7 +146,7 @@ def test_memory_cache_adapter_on_prefill_checkpoint_stores_prefix():
 
 
 def test_turn_cache_adapter_on_prefill_checkpoint_captures_boundary_state():
-    """TurnCacheAdapter must record boundary state at boundary-1 positions."""
+    """TurnCacheAdapter records boundary state when processed AT the boundary position."""
     from vllm_mlx.kv_cache import RequestCacheState
     inner = MagicMock()
     adapter = TurnCacheAdapter(inner)
@@ -157,10 +157,9 @@ def test_turn_cache_adapter_on_prefill_checkpoint_captures_boundary_state():
     request._boundary_states = {}
 
     extracted = [{"state": (None, None), "class_name": "KVCache"}]
-    # checkpoint fires at processed=4 (one before boundary 5, per split-chunk convention)
-    adapter.on_prefill_checkpoint(request, 4, extracted)
+    # insert_segments fires at processed=5 (AT boundary, not B-1)
+    adapter.on_prefill_checkpoint(request, 5, extracted)
 
-    # boundary_states keyed by boundary position (5), not checkpoint position (4)
     assert 5 in request._boundary_states
     assert request._boundary_states[5] is extracted
 
@@ -175,7 +174,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
     request._turn_boundaries = [5]
     request._boundary_states = {}
 
-    adapter.on_prefill_checkpoint(request, 3, [])  # total=3, boundary=5 → 3+1=4 ≠ 5
+    adapter.on_prefill_checkpoint(request, 3, [])  # total=3, not in [5] → no save
     assert request._boundary_states == {}
 
 
