@@ -1665,8 +1665,8 @@ def test_messages_to_segments_new_sys_stable():
 def test_mid_prefill_saves_boundary_state():
     """Test that _make_mid_prefill_save_callback saves state at boundaries.
 
-    Split-chunk convention: checkpoint fires at processed=B-1 so that
-    total_cached+1 == B matches the boundary.
+    insert_segments() fires end_of_segment AT boundary B (not B-1), so
+    processed==B must match _turn_boundaries directly.
     """
     from unittest.mock import MagicMock, patch
 
@@ -1691,9 +1691,9 @@ def test_mid_prefill_saves_boundary_state():
     # Mock extract_cache_states (free function imported in scheduler module)
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
-        # Split-chunk convention: fire at processed=49 so total_cached=49, 49+1=50 in [50]
+        # insert_segments fires at processed=50 (AT the boundary, not B-1)
         prompt_cache = MagicMock()
-        callback(123, 49, prompt_cache)
+        callback(123, 50, prompt_cache)
 
     # Verify _boundary_states keyed by boundary position (50)
     assert hasattr(req, "_boundary_states")
@@ -1725,9 +1725,9 @@ def test_mid_prefill_does_not_save_away_from_boundary():
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
-        # processed=29 → total=29, 29+1=30 not in [50] → no save
+        # processed=30 → total=30, 30 not in [50] → no save
         prompt_cache = MagicMock()
-        callback(124, 29, prompt_cache)
+        callback(124, 30, prompt_cache)
 
     # Should NOT save to _boundary_states
     assert req._boundary_states == {}
@@ -1736,7 +1736,7 @@ def test_mid_prefill_does_not_save_away_from_boundary():
 def test_mid_prefill_saves_multiple_boundaries():
     """Test that callback saves state at multiple boundaries.
 
-    Split-chunk convention: fire at processed=B-1 for each boundary B.
+    insert_segments() fires end_of_segment AT boundary B, so processed==B.
     """
     from unittest.mock import MagicMock, patch
 
@@ -1757,20 +1757,20 @@ def test_mid_prefill_saves_multiple_boundaries():
     sched.requests["test-3"] = req
     sched.uid_to_request_id[125] = "test-3"
 
-    # Save at first boundary (fire at B-1=49)
+    # Save at first boundary (fire AT B=50)
     mock_extracted_50 = _make_extracted_state(n_layers=2, n_tokens=50)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_50):
-        callback(125, 49, MagicMock())
+        callback(125, 50, MagicMock())
 
-    # Save at second boundary (fire at B-1=99)
+    # Save at second boundary (fire AT B=100)
     mock_extracted_100 = _make_extracted_state(n_layers=2, n_tokens=100)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_100):
-        callback(125, 99, MagicMock())
+        callback(125, 100, MagicMock())
 
-    # Save at third boundary (fire at B-1=149)
+    # Save at third boundary (fire AT B=150)
     mock_extracted_150 = _make_extracted_state(n_layers=2, n_tokens=150)
     with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted_150):
-        callback(125, 149, MagicMock())
+        callback(125, 150, MagicMock())
 
     # Verify all boundaries were saved (keyed by boundary position)
     assert hasattr(req, "_boundary_states")

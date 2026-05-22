@@ -1989,11 +1989,8 @@ class Scheduler:
             per_uid_cache = pb.extract_cache(idx)
             extracted = extract_cache_states(per_uid_cache)
             if extracted:
-                cached_offset = (
-                    request._cache_state.cached_tokens if request._cache_state else 0
-                )
                 self._prefix_cache.on_prefill_checkpoint(
-                    request, cached_offset + processed, extracted
+                    request, processed, extracted
                 )
 
     def _messages_to_segments(self, request):

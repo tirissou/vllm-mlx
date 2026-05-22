@@ -243,13 +243,13 @@ class TurnCacheAdapter:
         total_cached = ((cs.cached_tokens if cs is not None else None) or 0) + processed_tokens
         _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
 
-        # Split-chunk convention: checkpoint fires at B-1, boundary key is B.
-        if total_cached + 1 not in _turn_boundaries:
+        # insert_segments() fires end_of_segment AT boundary B (not B-1).
+        if total_cached not in _turn_boundaries:
             return
 
         if not hasattr(request, "_boundary_states") or request._boundary_states is None:
             request._boundary_states = {}
-        request._boundary_states[total_cached + 1] = extracted_cache
+        request._boundary_states[total_cached] = extracted_cache
 
     # PersistableCache extension
     def save(self, cache_dir: str) -> bool:
