@@ -243,13 +243,11 @@ class TestBatchQuantizedKVCacheAlignment:
         assert isinstance(cache, _BaseCache)
 
     def test_state_setter_raises_not_implemented(self):
-        import pytest
         cache = BatchQuantizedKVCache(left_padding=[0])
         with pytest.raises(NotImplementedError):
             cache.state = (None, None)
 
     def test_meta_state_setter_raises_not_implemented(self):
-        import pytest
         cache = BatchQuantizedKVCache(left_padding=[0])
         with pytest.raises(NotImplementedError):
             cache.meta_state = ("0", "64", "4")
