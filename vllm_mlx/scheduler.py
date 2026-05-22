@@ -207,6 +207,18 @@ class _InstrumentedBatchGenerator(BatchGenerator):
 
         return prompt_responses, gen_responses
 
+    def _make_new_cache(self):
+        from mlx_lm.models.cache import QuantizedKVCache
+        from .batch_quantized_kv_cache import VllmQuantizedKVCache
+        caches = super()._make_new_cache()
+        # model.make_cache() may return QuantizedKVCache objects (e.g. --kv-bits models).
+        # Plain QuantizedKVCache has no .merge(), so _merge_caches would fail.
+        # Upgrade to VllmQuantizedKVCache which adds .merge() → BatchQuantizedKVCache.
+        return [
+            VllmQuantizedKVCache(c.group_size, c.bits) if type(c) is QuantizedKVCache else c
+            for c in caches
+        ]
+
 
 def _install_mtp(
     batch_gen: "BatchGenerator",
