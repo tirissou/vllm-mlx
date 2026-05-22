@@ -1021,16 +1021,16 @@ class BatchedEngine(BaseEngine):
 
             # Try im_end scan for Qwen3-like tokenizers
             if im_end_id is not None and im_end_id != getattr(tokenizer, "unk_token_id", None):
-                nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
-                nl_id = nl_tokens[0] if nl_tokens else None
-
                 boundaries = []
                 for i, tok in enumerate(full_tokens):
                     if tok == im_end_id:
-                        if nl_id is not None and i + 1 < len(full_tokens) and full_tokens[i + 1] == nl_id:
-                            boundaries.append(i + 2)
-                        else:
-                            boundaries.append(i + 1)
+                        # Boundary points AT the \n after <|im_end|>, not past it.
+                        # This means each segment ends with <|im_end|> (no trailing \n),
+                        # and the \n becomes the first token of the next segment.
+                        # This is required for insert/match consistency: output_token_ids
+                        # ends at <|im_end|> (the model's EOS), so response_tokens must
+                        # also end at <|im_end|> for the next-turn segment to match.
+                        boundaries.append(i + 1)
 
                 logger.info(
                     f"[turn_cache] _compute_turn_boundaries: "

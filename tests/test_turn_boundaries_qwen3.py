@@ -344,8 +344,15 @@ class TestTurnBoundariesQwen3:
             f"{ba[0]} != {bb[0]}"
         )
 
-    def test_segments_end_with_im_end_newline(self):
-        """Every non-tail segment decoded from boundaries ends with <|im_end|>\\n."""
+    def test_segments_end_with_im_end(self):
+        """Every non-tail segment decoded from boundaries ends with <|im_end|>.
+
+        Boundaries point AT the \\n after <|im_end|> (i.e. boundary = im_end_index + 1),
+        so each segment ends at <|im_end|> without the trailing \\n.  The \\n
+        becomes the first token of the next segment instead.  This is required
+        for insert/match consistency: model output_token_ids ends at <|im_end|>
+        (the EOS), so the stored response segment must also end there.
+        """
         eng = _make_engine_with_qwen3()
         tok = eng._tokenizer
         messages = [
@@ -364,9 +371,13 @@ class TestTurnBoundariesQwen3:
         for b in boundaries:
             seg_tokens = full_tokens[prev:b]
             seg_text = tok.decode(seg_tokens)
-            assert seg_text.endswith("<|im_end|>\n"), (
-                f"Segment [{prev},{b}) should end with '<|im_end|>\\n', "
+            assert seg_text.endswith("<|im_end|>"), (
+                f"Segment [{prev},{b}) should end with '<|im_end|>', "
                 f"got: {repr(seg_text[-20:])}"
+            )
+            assert not seg_text.endswith("<|im_end|>\n"), (
+                f"Segment [{prev},{b}) must NOT include trailing \\n "
+                f"(that belongs to the next segment for insert/match consistency)"
             )
             prev = b
 
