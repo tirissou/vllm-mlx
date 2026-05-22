@@ -203,6 +203,41 @@ class TestBatchQuantizedKVCacheQuantizedArray:
         assert cache_list[0].keys.packed.shape[0] == B * 2
 
 
+class TestBatchQuantizedKVCacheAlignment:
+    """Alignment with mlx-lm _BaseCache conventions."""
+
+    def _make_cache(self, B=2, H=4, T=16, D=64):
+        cache = BatchQuantizedKVCache(left_padding=[0] * B)
+        keys = mx.random.normal((B, H, T, D)).astype(mx.bfloat16)
+        values = mx.random.normal((B, H, T, D)).astype(mx.bfloat16)
+        cache.update_and_fetch(keys, values)
+        mx.eval(cache.keys, cache.values)
+        return cache
+
+    def test_extract_returns_vllm_quantized_kv_cache(self):
+        from vllm_mlx.batch_quantized_kv_cache import VllmQuantizedKVCache
+        cache = self._make_cache(B=2)
+        extracted = cache.extract(0)
+        assert isinstance(extracted, VllmQuantizedKVCache)
+
+    def test_vllm_quantized_kv_cache_merge_returns_batch_quantized(self):
+        from vllm_mlx.batch_quantized_kv_cache import VllmQuantizedKVCache
+        cache = self._make_cache(B=2, T=16)
+        e0, e1 = cache.extract(0), cache.extract(1)
+        merged = VllmQuantizedKVCache.merge([e0, e1])
+        assert isinstance(merged, BatchQuantizedKVCache)
+        assert merged._idx == 16
+        assert merged.keys.packed.shape[0] == 2
+
+    def test_polymorphic_merge_matches_engine_call_site(self):
+        """Engine calls extracted[0].merge(extracted) — must work via VllmQuantizedKVCache."""
+        cache = self._make_cache(B=3)
+        extracted = [cache.extract(i) for i in range(3)]
+        merged = extracted[0].merge(extracted)
+        assert isinstance(merged, BatchQuantizedKVCache)
+        assert merged.keys.packed.shape[0] == 3
+
+
 # ------------------------------------------------------------------
 # Helpers shared by adapter tests
 # ------------------------------------------------------------------
