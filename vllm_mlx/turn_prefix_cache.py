@@ -454,7 +454,6 @@ class TurnPrefixCache:
         # NOTE: Assuming no SSD for now
         """Reconstruct the cache for a node to pipe to _reconstruct_cache_from_states."""
         with self._lock:
-            assert node.recurrent_state is not None
             assert hasattr(self, '_reassemble_cache_fn')
             path = self._inorder_path(node)
             # Filter nodes that have KV slices; pure-SSM nodes have kv_arrays=[].
@@ -475,7 +474,7 @@ class TurnPrefixCache:
             else:
                 kv = []
                 logger.info("Rebuilding cache... (SSM-only, no KV layers)")
-            recurrent = node.recurrent_state
+            recurrent = node.recurrent_state if node.recurrent_state is not None else []
             rval = self._reassemble_cache_fn(kv, recurrent)
             logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
             return rval

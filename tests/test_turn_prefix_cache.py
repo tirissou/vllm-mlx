@@ -2119,6 +2119,34 @@ def test_retrieve_full_cache_concatenates_two_nodes():
         assert layer.offset == 15  # 10 + 5 tokens
 
 
+def test_retrieve_full_cache_kv_only_does_not_crash():
+    """_retrieve_full_cache must work when node.recurrent_state is None (KV-only model)."""
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
+    from mlx_lm.models.cache import QuantizedKVCache
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    ext = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
+    kv, recur = trie._split_cache_arrays(ext, 0)
+    assert recur == []  # confirms this is KV-only data
+
+    node = trie.insert(
+        trie.root,
+        Segment(role="system", token_ids=list(range(10))),
+        kv, None, None,
+        is_system_prompt=True,
+    )
+    assert not trie.has_recurrent_state
+
+    raw_state = trie._retrieve_full_cache(node)
+    assert raw_state is not None
+
+    prompt_cache = reconstruct_cache_from_states(raw_state)
+    assert prompt_cache is not None
+    for layer in prompt_cache:
+        assert isinstance(layer, QuantizedKVCache)
+        assert layer.offset == 10
+
+
 # ---------------------------------------------------------------------------
 # Regression: find_checkpoint_ancestor must reject nodes with empty recurrent
 # ---------------------------------------------------------------------------
