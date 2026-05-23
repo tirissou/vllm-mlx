@@ -103,10 +103,26 @@ def test_apply_patches_module():
 
     original = _base.scaled_dot_product_attention
     try:
+        _base._prefill_flash_sdpa_patched = False
         apply()
         assert _base.scaled_dot_product_attention is _patched_sdpa
     finally:
         _base.scaled_dot_product_attention = original
+        _base._prefill_flash_sdpa_patched = False
+
+
+def test_apply_is_idempotent():
+    """Calling apply() twice leaves the patch installed without double-wrapping."""
+    from vllm_mlx.patches.mlx_lm_prefill_flash_sdpa import apply, _patched_sdpa
+
+    original = _base.scaled_dot_product_attention
+    try:
+        assert apply() is True
+        assert apply() is False  # sentinel prevents re-patching
+        assert _base.scaled_dot_product_attention is _patched_sdpa
+    finally:
+        _base.scaled_dot_product_attention = original
+        _base._prefill_flash_sdpa_patched = False
 
 
 def test_rejects_sinks_with_quantized_cache():
