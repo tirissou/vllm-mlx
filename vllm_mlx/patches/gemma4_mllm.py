@@ -73,7 +73,7 @@ def patch_gemma4_attention_for_batching() -> bool:
         cache: Optional[Any] = None,
         shared_kv=None,  # absorbed: patch derives this via self.is_kv_shared_layer
         offset=None,     # absorbed: patch derives this via _snapshot_cache_offset(cache)
-    ) -> mx.array:
+    ) -> tuple[mx.array, tuple, Any]:
         B, L, _ = x.shape
 
         queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
@@ -115,7 +115,7 @@ def patch_gemma4_attention_for_batching() -> bool:
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.o_proj(output), (keys, values), offset
 
     Gemma4Attention.__call__ = _patched_call
     Gemma4Attention._batch_patched = True
