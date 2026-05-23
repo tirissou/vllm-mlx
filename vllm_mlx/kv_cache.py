@@ -207,6 +207,23 @@ def extract_layer_state(layer) -> dict | None:
     return None
 
 
+def _build_batch_kv_types() -> tuple:
+    """Return a tuple of batch-level KV cache types for isinstance checks.
+
+    Covers both standard and quantized batch caches. Used to identify
+    recurrent (non-KV) layers in a batch generator's prompt_cache list.
+    """
+    from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, QuantizedKVCache
+    try:
+        from .batch_quantized_kv_cache import BatchQuantizedKVCache
+        return (BatchKVCache, BatchRotatingKVCache, QuantizedKVCache, BatchQuantizedKVCache)
+    except ImportError:
+        return (BatchKVCache, BatchRotatingKVCache, QuantizedKVCache)
+
+
+_BATCH_KV_TYPES: tuple = _build_batch_kv_types()
+
+
 def extract_recurrent_state(cache: list) -> list:
     """Return only the non-KV layers from a live cache list.
 

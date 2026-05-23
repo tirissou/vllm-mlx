@@ -34,6 +34,7 @@ from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .kv_cache import (
     RequestCacheState,
+    _BATCH_KV_TYPES,
     compose_n_minus_1_cache,
     extract_cache_states,
     extract_recurrent_state,
@@ -1637,19 +1638,23 @@ class Scheduler:
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
                     # Snapshot recurrent state before this decode step (gives N-1 snapshot).
+                    # Only recurrent (non-KV) layers need snapshotting; KV layers are
+                    # monotonically extended and never need a "previous step" copy.
+                    # ArraysCache.extract() is lazy (no .item()); BatchKVCache.extract()
+                    # calls .item() per layer — skipping KV layers eliminates those syncs.
                     _gb = getattr(self.batch_generator, "_generation_batch", None)
                     if _gb is not None and _gb.uids:
-                        for _e, _uid in enumerate(_gb.uids):
-                            _rid = self.uid_to_request_id.get(_uid)
-                            _req = self.running.get(_rid) if _rid else None
-                            if _req is not None:
-                                _live_cache = _gb.extract_cache(_e)
-                                if _live_cache:
-                                    _req_recur = extract_recurrent_state(_live_cache)
-                                    _req._cache_state.prev_recurrent = (
-                                        extract_cache_states(_req_recur)
-                                        if _req_recur else []
-                                    )
+                        _recurrent_indices = [
+                            i for i, c in enumerate(_gb.prompt_cache)
+                            if not isinstance(c, _BATCH_KV_TYPES)
+                        ]
+                        if _recurrent_indices:
+                            for _e, _uid in enumerate(_gb.uids):
+                                _rid = self.uid_to_request_id.get(_uid)
+                                _req = self.running.get(_rid) if _rid else None
+                                if _req is not None:
+                                    _recur_caches = [_gb.prompt_cache[i].extract(_e) for i in _recurrent_indices]
+                                    _req._cache_state.prev_recurrent = extract_cache_states(_recur_caches)
                     result = self.batch_generator.next()
                     output.has_work = True
 
