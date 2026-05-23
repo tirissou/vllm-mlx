@@ -153,6 +153,36 @@ def make_cache(stride=512, max_gb=8.0, kv_dtype="bf16", recurrent_dtype="bf16"):
     ))
 
 
+# --- has_recurrent_state flag ---
+
+def test_has_recurrent_state_starts_false():
+    cache = make_cache()
+    assert not cache.has_recurrent_state
+
+
+def test_has_recurrent_state_not_set_for_kv_only_insert():
+    cache = make_cache(stride=0)
+    kv = _make_kv()
+    cache.insert(cache.root, seg([1, 2, 3]), kv, None, None, is_system_prompt=True)
+    assert not cache.has_recurrent_state
+
+
+def test_has_recurrent_state_set_on_hybrid_insert():
+    cache = make_cache(stride=0)
+    state = mx.zeros((2, 3))
+    cache.insert(cache.root, seg([1, 2, 3]), [], None, state, is_system_prompt=True)
+    assert cache.has_recurrent_state
+
+
+def test_has_recurrent_state_survives_clear():
+    cache = make_cache(stride=0)
+    state = mx.zeros((2, 3))
+    cache.insert(cache.root, seg([1]), [], None, state, is_system_prompt=True)
+    assert cache.has_recurrent_state
+    cache.clear()
+    assert cache.has_recurrent_state
+
+
 def test_insert_creates_child_of_root():
     cache = make_cache()
     node = cache.insert(cache.root, seg([1, 2, 3]), kv_arrays=[], kv_scales=[], recurrent_state=None)

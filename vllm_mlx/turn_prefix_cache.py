@@ -323,6 +323,7 @@ class TurnPrefixCache:
         self._memory_bytes: int = 0
         self._on_spill: Callable | None = None   # set via set_spill_delegate
         self._on_promote: Callable | None = None
+        self.has_recurrent_state: bool = False
 
     # ── SpillableCache / PrefixCache protocol stubs ─────────────────────────
     # TurnPrefixCache is a low-level trie; the PrefixCache protocol is
@@ -529,6 +530,8 @@ class TurnPrefixCache:
         acquire_lock: bool = True,
     ) -> TurnNode:
         with self._lock if acquire_lock else nullcontext():
+            if recurrent_state is not None:
+                self.has_recurrent_state = True
             h = _context_hash(parent.context_hash, segment.token_ids)
 
             # Exact match: child already exists
@@ -1379,7 +1382,7 @@ class TurnPrefixCache:
             ntok = len(node.token_ids)
             ckpt = "✓" if node.is_permanent_checkpoint else " "
             has_kv = "K" if node.kv_arrays else " "
-            has_state = "S" if node.recurrent_state else " "
+            has_state = "S" if node.recurrent_state is not None else " "
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
             if node.token_ids:
