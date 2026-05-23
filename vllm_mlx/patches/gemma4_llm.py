@@ -94,8 +94,11 @@ def patch_gemma4_attention_for_batching() -> bool:
         queries = self.rope(queries, offset=offset)
 
         if mask is not None and isinstance(mask, mx.array):
-            if mask.shape[-1] != keys.shape[-2]:
-                mask = mask[..., -keys.shape[-2]:]
+            # keys may be a QuantizedArray (NamedTuple) from BatchQuantizedKVCache;
+            # fall back to its .scales component which shares the seq-len dimension.
+            key_len = keys.shape[-2] if hasattr(keys, "shape") else keys.scales.shape[-2]
+            if mask.shape[-1] != key_len:
+                mask = mask[..., -key_len:]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask

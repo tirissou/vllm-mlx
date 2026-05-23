@@ -1329,7 +1329,7 @@ class TurnPrefixCache:
             ntok = len(node.token_ids)
             ckpt = "✓" if node.is_permanent_checkpoint else " "
             has_kv = "K" if node.kv_arrays else " "
-            has_state = "S" if node.recurrent_state is not None else " "
+            has_state = "S" if node.recurrent_state else " "
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
             if node.token_ids:

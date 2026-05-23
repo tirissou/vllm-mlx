@@ -3,9 +3,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from .kv_cache import CacheHit
+from vllm_mlx.turn_prefix_cache import TurnPrefixCache
+
+from .kv_cache import CacheHit, PrefixCache
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class MemoryCacheAdapter:
@@ -92,7 +98,7 @@ class MemoryCacheAdapter:
 class TurnCacheAdapter:
     """Adapts TurnPrefixCache to the PrefixCache / PersistableCache protocol."""
 
-    def __init__(self, inner):
+    def __init__(self, inner: TurnPrefixCache):
         self._inner = inner
 
     @staticmethod
@@ -132,10 +138,12 @@ class TurnCacheAdapter:
         from .turn_prefix_cache import reconstruct_cache_from_states
 
         segments = self.messages_to_segments(request)
+        logger.debug(f"Fetch segments: {segments}")
         if not segments:
             return None
 
         path, _ = self._inner.match(segments)
+        logger.debug(f"Fetch matched path: {path}")
         if not path:
             self._inner.release(path)
             return None
@@ -150,7 +158,7 @@ class TurnCacheAdapter:
         ancestor = self._inner.find_checkpoint_ancestor(path)
         if ancestor is None:
             return CacheHit(
-                cache=None,
+                cache=[],
                 cached_tokens=0,
                 remaining_tokens=list(request.prompt_token_ids),
                 handle=path,
