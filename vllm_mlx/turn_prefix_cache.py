@@ -1038,7 +1038,7 @@ class TurnPrefixCache:
             if node is self.root:
                 continue
             state = node.recurrent_state
-            if state is not None and not isinstance(state, SSDRef):
+            if state is not None and not isinstance(state, SSDRef) and len(state) > 0:
                 self.has_recurrent_state = True
                 break
 
