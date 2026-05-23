@@ -46,9 +46,11 @@ from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
 from .patches.mlx_lm_quantized_sdpa import patch_quantized_sdpa
 from .patches.mlx_lm_prefill_flash_sdpa import apply as _apply_prefill_flash_sdpa
+from .patches.gemma4_llm import patch_gemma4_attention_for_batching as _patch_gemma4_llm
 
 patch_quantized_sdpa()
 _apply_prefill_flash_sdpa()
+_patch_gemma4_llm()
 
 
 from .batch_quantized_kv_cache import make_quantized_cache as _make_quantized_cache  # re-export for tests
