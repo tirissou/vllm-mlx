@@ -71,6 +71,8 @@ def patch_gemma4_attention_for_batching() -> bool:
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        shared_kv=None,  # absorbed: patch derives this via self.is_kv_shared_layer
+        offset=None,     # absorbed: patch derives this via _snapshot_cache_offset(cache)
     ) -> mx.array:
         B, L, _ = x.shape
 
