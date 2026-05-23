@@ -206,6 +206,34 @@ def test_load_leaves_has_recurrent_state_false_for_kv_only_cache(tmp_path):
     assert not cache2.has_recurrent_state
 
 
+def test_find_checkpoint_ancestor_kv_only_returns_deepest_kv_node():
+    """In KV-only mode, find_checkpoint_ancestor returns the deepest node with kv_arrays."""
+    cache = make_cache(stride=0)
+    kv = _make_kv()
+    n1 = cache.insert(cache.root, seg([1], role="system"), kv, None, None, is_system_prompt=True)
+    n2 = cache.insert(n1, seg([2]), kv, None, None)
+    assert not cache.has_recurrent_state  # confirm KV-only mode
+
+    path, _ = cache.match([seg([1], role="system"), seg([2])])
+    ancestor = cache.find_checkpoint_ancestor(path)
+    cache.release(path)
+
+    assert ancestor is n2
+
+
+def test_find_checkpoint_ancestor_kv_only_returns_none_when_no_kv():
+    """In KV-only mode, returns None if no node in path has kv_arrays."""
+    cache = make_cache(stride=0)
+    n1 = cache.insert(cache.root, seg([1], role="system"), [], None, None, is_system_prompt=True)
+    assert not cache.has_recurrent_state
+
+    path, _ = cache.match([seg([1], role="system")])
+    ancestor = cache.find_checkpoint_ancestor(path)
+    cache.release(path)
+
+    assert ancestor is None
+
+
 def test_insert_creates_child_of_root():
     cache = make_cache()
     node = cache.insert(cache.root, seg([1, 2, 3]), kv_arrays=[], kv_scales=[], recurrent_state=None)
@@ -2121,6 +2149,7 @@ def test_find_checkpoint_ancestor_accepts_nonempty_recurrent_state():
     """Sanity check: nodes with actual recurrent state are still selected."""
     import mlx.core as mx
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    cache.has_recurrent_state = True
     node = TurnNode(
         token_ids=[1, 2],
         context_hash=1,

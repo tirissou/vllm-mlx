@@ -676,12 +676,17 @@ class TurnPrefixCache:
                     heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
 
     def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode | None:
-        """Return the deepest node in path with recurrent state, preferring permanent checkpoints.
+        """Return the deepest node in path that can serve as a prefill resume point.
 
-        First pass: deepest permanent checkpoint with real recurrent state.
-        Second pass: deepest node with any real recurrent state (temp leaf fallback).
-        Returns None if nothing found.
+        Hybrid models: deepest node with real recurrent state.
+        KV-only models: deepest node with non-empty, in-memory kv_arrays.
         """
+        if not self.has_recurrent_state:
+            for node in reversed(path):
+                if node.kv_arrays and not isinstance(node.kv_arrays, SSDRef):
+                    return node
+            return None
+
         def _has_real_recurrent(node: TurnNode) -> bool:
             return (
                 node.recurrent_state is not None
