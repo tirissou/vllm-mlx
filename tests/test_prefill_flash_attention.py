@@ -3,7 +3,6 @@
 
 import mlx.core as mx
 import mlx_lm.models.base as _base
-import pytest
 from mlx_lm.models.cache import QuantizedKVCache
 
 
