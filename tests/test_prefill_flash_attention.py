@@ -59,15 +59,19 @@ def test_decode_output_matches_quantized_path():
     B, H_q, H_kv, C, D = 1, 4, 2, 64, 64
     cache, q_keys, q_values = _make_quantized_context(B, H_kv, C, D)
 
-    queries = mx.random.normal((B, H_q, 1, D)).astype(mx.float16)
+    queries_orig = mx.random.normal((B, H_q, 1, D)).astype(mx.float16)
     scale = D ** -0.5
 
+    # Make copies to avoid in-place modification issues with quantized_scaled_dot_product_attention
+    queries_expected = mx.array(queries_orig)
+    queries_actual = mx.array(queries_orig)
+
     expected = _base.quantized_scaled_dot_product_attention(
-        queries, q_keys, q_values,
+        queries_expected, q_keys, q_values,
         scale=scale, mask="causal",
         group_size=cache.group_size, bits=cache.bits,
     )
-    actual = _patched_sdpa(queries, q_keys, q_values, cache=cache, scale=scale, mask="causal")
+    actual = _patched_sdpa(queries_actual, q_keys, q_values, cache=cache, scale=scale, mask="causal")
 
     mx.eval(expected, actual)
     assert mx.allclose(actual, expected, atol=1e-5).item()
