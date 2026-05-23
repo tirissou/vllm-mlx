@@ -1,4 +1,4 @@
-# TurnPrefixCache: KV-Only Model Support
+# TurnPrefixCache: KV-Only Model Support + Legacy Insert Removal
 
 **Date:** 2026-05-23  
 **Status:** Approved
@@ -20,11 +20,9 @@ Add a single boolean `has_recurrent_state` to `TurnPrefixCache`. It starts `Fals
 For hybrid models (flag `True`): a node is resumable when it has real recurrent state — same as today.  
 For KV-only models (flag `False`): every node with non-empty `kv_arrays` is resumable.
 
-### Write sites (three, all set `True`, never `False`)
+### Write sites (two, all set `True`, never `False`)
 
 **`_insert_node`** — receives `recurrent_state` directly. Set `self.has_recurrent_state = True` when `recurrent_state is not None`. Runs inside `self._lock`.
-
-**`_insert_legacy`** — calls `_split_cache_arrays` which returns `(kv, recur)`. Set `self.has_recurrent_state = True` when `recur` is non-empty. Runs inside `self._lock`.
 
 **`load`** — after all nodes are linked, scan them: if any node has `recurrent_state is not None and not isinstance(recurrent_state, SSDRef) and len(recurrent_state) > 0`, set `True`.
 
@@ -56,11 +54,23 @@ return None
 - `_split_cache_arrays` — already naturally produces `recurrent=[]` for KV-only models
 - `clear()` — does not touch `has_recurrent_state`
 
+## Legacy insert removal
+
+`_insert_legacy` and the dispatch branch in `insert()` are dead code in production — `prefix_cache_adapters.py` uses the new `insert(parent, segment, kv, scales, recurrent)` API exclusively. The only callers are three test calls in `test_turn_prefix_cache.py` (lines 2007, 2026, 2029).
+
+**Changes:**
+- Delete `_insert_legacy` from `turn_prefix_cache.py`
+- Remove the `isinstance(parent_or_segments, list)` dispatch branch from `insert()`
+- Update the three test calls to use the new API directly
+
+The `_split_cache_arrays` call that was inside `_insert_legacy` is not needed at the `insert()` level — it is already called by the adapter layer (`TurnCacheAdapter.store` and `on_prefill_checkpoint`) before handing KV and recurrent arrays to `insert()`.
+
 ## Files affected
 
 | File | Change |
 |------|--------|
-| `vllm_mlx/turn_prefix_cache.py` | Add `has_recurrent_state` field; update `_insert_node`, `_insert_legacy`, `load`, `find_checkpoint_ancestor`, `_retrieve_full_cache` |
+| `vllm_mlx/turn_prefix_cache.py` | Add `has_recurrent_state` field; update `_insert_node`, `load`, `find_checkpoint_ancestor`, `_retrieve_full_cache`; delete `_insert_legacy` and its dispatch branch |
+| `tests/test_turn_prefix_cache.py` | Update 3 legacy `insert(segments, extracted)` calls to new API |
 
 No changes to `prefix_cache_adapters.py`, `scheduler.py`, or any config class.
 
