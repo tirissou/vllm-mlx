@@ -39,6 +39,8 @@ def _patched_sdpa(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if hasattr(cache, "bits"):
+        if sinks is not None:
+            raise ValueError("Quantized SDPA does not support attention sinks.")
         if queries.shape[-2] > 1:
             # Prefill: dequantize this layer's KV and use flash attention.
             # keys / values are (data, scales, biases) tuples from update_and_fetch.

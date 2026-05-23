@@ -107,3 +107,17 @@ def test_apply_patches_module():
         assert _base.scaled_dot_product_attention is _patched_sdpa
     finally:
         _base.scaled_dot_product_attention = original
+
+
+def test_rejects_sinks_with_quantized_cache():
+    """Quantized cache + sinks should raise ValueError."""
+    import pytest
+    from vllm_mlx.patches.mlx_lm_prefill_flash_sdpa import _patched_sdpa
+
+    cache, q_keys, q_values = _make_quantized_context()
+    queries = mx.random.normal((1, 4, 16, 64)).astype(mx.float16)
+    sinks = mx.random.normal((1, 4, 64)).astype(mx.float16)
+
+    with pytest.raises(ValueError, match="does not support attention sinks"):
+        _patched_sdpa(queries, q_keys, q_values, cache=cache,
+                      scale=1.0, mask=None, sinks=sinks)
