@@ -125,6 +125,40 @@ def test_apply_is_idempotent():
         _base._prefill_flash_sdpa_patched = False
 
 
+def test_apply_patches_already_imported_model_modules():
+    """apply() must also fix model modules that imported sdpa before the patch.
+
+    All mlx_lm model files do `from .base import scaled_dot_product_attention`,
+    which binds the original function in their own namespace at import time.
+    Patching _base alone has no effect on those local bindings — apply() must
+    walk sys.modules and overwrite the attribute in every already-imported
+    mlx_lm.models.* module.
+    """
+    import sys
+    from vllm_mlx.patches.mlx_lm_prefill_flash_sdpa import apply, _patched_sdpa
+
+    # Ensure a concrete model module is imported (simulates model loading
+    # happening before scheduler.py fires the patch).
+    import mlx_lm.models.llama as _llama_mod
+
+    original_base = _base.scaled_dot_product_attention
+    original_llama = _llama_mod.scaled_dot_product_attention
+    try:
+        _base._prefill_flash_sdpa_patched = False
+        apply()
+        # The base module must be patched.
+        assert _base.scaled_dot_product_attention is _patched_sdpa
+        # The already-imported model module must also be patched.
+        assert _llama_mod.scaled_dot_product_attention is _patched_sdpa, (
+            "apply() did not patch the local binding in mlx_lm.models.llama — "
+            "the memory spike will persist during prefill."
+        )
+    finally:
+        _base.scaled_dot_product_attention = original_base
+        _llama_mod.scaled_dot_product_attention = original_llama
+        _base._prefill_flash_sdpa_patched = False
+
+
 def test_rejects_sinks_with_quantized_cache():
     """Quantized cache + sinks should raise ValueError."""
     import pytest

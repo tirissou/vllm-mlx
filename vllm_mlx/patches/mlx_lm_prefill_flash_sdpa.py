@@ -68,12 +68,38 @@ def apply() -> bool:
     """Replace mlx_lm.models.base.scaled_dot_product_attention with _patched_sdpa.
 
     Returns True if patched, False if already patched.
+
+    All mlx_lm model modules do `from .base import scaled_dot_product_attention`
+    at import time, which binds the original function directly in their own
+    namespace. Patching _base alone has no effect on those already-bound names.
+    We must also walk sys.modules and overwrite the attribute in every
+    already-imported mlx_lm.models.* module.
     """
+    import sys
+
     if getattr(_base, "_prefill_flash_sdpa_patched", False):
         logger.debug("[prefill_flash_sdpa patch] Already patched")
         return False
 
     _base.scaled_dot_product_attention = _patched_sdpa
     setattr(_base, "_prefill_flash_sdpa_patched", True)
+
+    patched_modules = []
+    for mod_name, module in sys.modules.items():
+        if (
+            mod_name.startswith("mlx_lm.models.")
+            and mod_name != "mlx_lm.models.base"
+            and hasattr(module, "scaled_dot_product_attention")
+        ):
+            module.scaled_dot_product_attention = _patched_sdpa
+            patched_modules.append(mod_name)
+
+    if patched_modules:
+        logger.info(
+            "[prefill_flash_sdpa patch] Also patched %d model module(s): %s",
+            len(patched_modules),
+            patched_modules,
+        )
+
     logger.info("[prefill_flash_sdpa patch] Prefill flash-attention patch applied")
     return True
