@@ -183,6 +183,29 @@ def test_has_recurrent_state_survives_clear():
     assert cache.has_recurrent_state
 
 
+def test_load_sets_has_recurrent_state_for_hybrid_cache(tmp_path):
+    cache1 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    state = mx.zeros((2, 3))
+    cache1.insert(cache1.root, seg([1, 2, 3], role="system"), [], None, state, is_system_prompt=True)
+    cache1.save(str(tmp_path))
+
+    cache2 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    assert not cache2.has_recurrent_state
+    cache2.load(str(tmp_path))
+    assert cache2.has_recurrent_state
+
+
+def test_load_leaves_has_recurrent_state_false_for_kv_only_cache(tmp_path):
+    cache1 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    kv = [mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)]
+    cache1.insert(cache1.root, seg([1, 2, 3], role="system"), kv, None, None, is_system_prompt=True)
+    cache1.save(str(tmp_path))
+
+    cache2 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    cache2.load(str(tmp_path))
+    assert not cache2.has_recurrent_state
+
+
 def test_insert_creates_child_of_root():
     cache = make_cache()
     node = cache.insert(cache.root, seg([1, 2, 3]), kv_arrays=[], kv_scales=[], recurrent_state=None)

@@ -1034,6 +1034,14 @@ class TurnPrefixCache:
                 if node.is_evictable:
                     heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
 
+        for node in hash_to_node.values():
+            if node is self.root:
+                continue
+            state = node.recurrent_state
+            if state is not None and not isinstance(state, SSDRef):
+                self.has_recurrent_state = True
+                break
+
     # ── SSD offloading ─────────────────────────────────────────────────────
 
     def _tokens_to_node(self, node: TurnNode) -> tuple[int, ...]:
