@@ -2084,8 +2084,13 @@ def test_retrieve_full_cache_produces_quantized_kvcache():
 
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     sys_extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    segs_sys = [Segment(role="system", token_ids=list(range(10)))]
-    sys_node = trie.insert(segs_sys, sys_extracted)
+    kv, recur = trie._split_cache_arrays(sys_extracted, 0)
+    sys_node = trie.insert(
+        trie.root,
+        Segment(role="system", token_ids=list(range(10))),
+        kv, None, recur,
+        is_system_prompt=True,
+    )
 
     raw_state = trie._retrieve_full_cache(sys_node)
     assert raw_state is not None
@@ -2102,13 +2107,23 @@ def test_retrieve_full_cache_concatenates_two_nodes():
     from mlx_lm.models.cache import QuantizedKVCache
 
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
-    # Node 1: 10 tokens
+    # Node 1: system, 10 tokens
     ext1 = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    node1 = trie.insert([Segment(role="system", token_ids=list(range(10)))], ext1)
-    # Node 2: 5 more tokens (total 15, offset=10)
+    kv1, recur1 = trie._split_cache_arrays(ext1, 0)
+    node1 = trie.insert(
+        trie.root,
+        Segment(role="system", token_ids=list(range(10))),
+        kv1, None, recur1,
+        is_system_prompt=True,
+    )
+    # Node 2: user, 5 more tokens (full cache has 15 tokens, offset starts at 10)
     ext2 = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=15)
-    node2 = trie.insert([Segment(role="system", token_ids=list(range(10))),
-                          Segment(role="user", token_ids=list(range(10, 15)))], ext2)
+    kv2, recur2 = trie._split_cache_arrays(ext2, node1.n_tokens)
+    node2 = trie.insert(
+        node1,
+        Segment(role="user", token_ids=list(range(10, 15))),
+        kv2, None, recur2,
+    )
 
     raw_state = trie._retrieve_full_cache(node2)
     from vllm_mlx.kv_cache import reconstruct_cache_from_states

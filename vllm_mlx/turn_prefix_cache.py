@@ -489,8 +489,8 @@ class TurnPrefixCache:
 
     def insert(
         self,
-        parent_or_segments,
-        segment_or_extracted=None,
+        parent: TurnNode,
+        segment: Segment,
         kv_arrays: list | None = None,
         kv_scales: list | None = None,
         recurrent_state: Any = None,
@@ -500,17 +500,10 @@ class TurnPrefixCache:
     ) -> TurnNode:
         """Insert a node into the trie.
 
-        New API: insert(parent, segment, kv_arrays, kv_scales, recurrent_state, ...)
-        Legacy API: insert(segments_list, extracted_cache[, acquire_lock])
+        API: insert(parent, segment, kv_arrays, kv_scales, recurrent_state, ...)
         """
-        if isinstance(parent_or_segments, list):
-            # Legacy API: insert(segments, extracted_cache, acquire_lock=True)
-            actual_lock = kv_arrays if isinstance(kv_arrays, bool) else True
-            return self._insert_legacy(
-                parent_or_segments, segment_or_extracted, acquire_lock=actual_lock
-            )
         rval = self._insert_node(
-            parent_or_segments, segment_or_extracted,
+            parent, segment,
             kv_arrays or [], kv_scales, recurrent_state,
             is_system_prompt, recurrent_scales, acquire_lock,
         )
@@ -529,7 +522,7 @@ class TurnPrefixCache:
         acquire_lock: bool = True,
     ) -> TurnNode:
         with self._lock if acquire_lock else nullcontext():
-            if recurrent_state is not None:
+            if recurrent_state:
                 self.has_recurrent_state = True
             h = _context_hash(parent.context_hash, segment.token_ids)
 
@@ -581,64 +574,6 @@ class TurnPrefixCache:
             self._memory_bytes += _node_data_bytes(node)
             heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
             self._evict_if_needed_unlocked()
-            return node
-
-    def _insert_legacy(
-        self,
-        segments: list[Segment],
-        extracted_cache,
-        acquire_lock: bool = True,
-    ) -> TurnNode:
-        """Legacy insert: walks the trie, splits extracted_cache with _split_cache_arrays."""
-        with self._lock if acquire_lock else nullcontext():
-            path, _ = self.match(segments, acquire_lock=False)
-
-            if path and len(path) == len(segments):
-                node = path[-1]
-                node.touch()
-                self.release(path)
-                return node
-
-            is_system_prompt = not path
-            parent = self.root if is_system_prompt else path[-1]
-            segment = segments[len(path)]
-            tokens_since = parent.tokens_since_checkpoint + len(segment.token_ids)
-            is_permanent = is_system_prompt or (tokens_since >= self.config.checkpoint_stride)
-            node_tsc = 0 if is_permanent else tokens_since
-
-            kv, recur = self._split_cache_arrays(extracted_cache, parent.n_tokens)
-
-            h = _context_hash(parent.context_hash, segment.token_ids)
-            node = TurnNode(
-                token_ids=segment.token_ids,
-                context_hash=h,
-                kv_arrays=kv,
-                kv_scales=None,
-                recurrent_state=recur,
-                recurrent_scales=None,
-                parent=parent,
-                is_permanent_checkpoint=is_permanent,
-                tokens_since_checkpoint=node_tsc,
-            )
-            node.touch()
-            parent.children[h] = node
-
-            if (
-                len(parent.children) == 1
-                and not parent.is_permanent_checkpoint
-                and parent is not self.root
-            ):
-                freed = _node_data_bytes(parent)
-                parent.recurrent_state = None
-                parent.recurrent_scales = None
-                freed -= _node_data_bytes(parent)
-                self._memory_bytes -= freed
-
-            self._memory_bytes += _node_data_bytes(node)
-            heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
-            self._evict_if_needed_unlocked()
-            if path:
-                self.release(path)
             return node
 
     def match(self, segments: list[Segment], acquire_lock=True) -> tuple[list[TurnNode], bool]:
