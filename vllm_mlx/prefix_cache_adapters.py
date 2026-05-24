@@ -10,8 +10,8 @@ from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 from .kv_cache import CacheHit, PrefixCache
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+# logger = logging.getLogger(__name__)
+# logger.setLevel(logging.DEBUG)
 
 
 class MemoryCacheAdapter:
@@ -138,12 +138,12 @@ class TurnCacheAdapter:
         from .turn_prefix_cache import reconstruct_cache_from_states
 
         segments = self.messages_to_segments(request)
-        logger.debug(f"Fetch segments: {segments}")
+        # logger.debug(f"Fetch segments: {segments}")
         if not segments:
             return None
 
         path, _ = self._inner.match(segments)
-        logger.debug(f"Fetch matched path: {path}")
+        # logger.debug(f"Fetch matched path: {path}")
         if not path:
             self._inner.release(path)
             return None
