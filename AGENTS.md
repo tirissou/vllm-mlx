@@ -1,7 +1,7 @@
-## Core Principle
+#### Core Principle
 When uncertain, look it up. Do not fabricate API signatures, file contents, config behavior, library behavior, or command output. If an available tool can resolve the uncertainty, use it.
 
-## Environment
+#### Environment
 - macOS on Apple Silicon.
 - Local inference may use llama.cpp or LM Studio via OpenAI-compatible endpoints.
 - Prefer `rg` over `grep`.
@@ -9,7 +9,7 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 - Python virtual environment at `.venv` is managed by `uv`. Use `uv pip` always.
 - The python source code is in `vllm_mlx`.
 
-## Research
+#### Research
 - Use the available web search tool for:
   - Current library versions
   - Recent APIs
@@ -18,19 +18,19 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
   - Anything likely to be stale in model training data
 - Prefer primary sources: official docs, changelogs, source repositories, and issue trackers.
 
-## Codebase Workflow
+#### Codebase Workflow
 - Read files before editing them.
 - Use `rg` to locate relevant sections before opening large files.
 - Keep changes scoped to the request.
 - Ask before refactors that touch more than 3 files or change public behavior, such as API surface, return types, function signatures, or exported names.
 - Preserve existing style, naming, formatting, and architecture unless there is a clear reason to change them.
 
-## Verification
+#### Verification
 - After code changes, run the project's relevant typecheck, lint, and tests when available.
 - Do not claim work is complete without saying what verification ran.
 - If verification could not be run, say why.
 
-## Output Style
+#### Output Style
 - Be direct.
 - No unnecessary preamble.
 - Push back on bad ideas or risky assumptions.
@@ -38,7 +38,7 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 - Do not re-summarize obvious changes unless asked.
 - Surface important command errors instead of hiding them.
 
-## mlx-lm Cache Primitives
+#### mlx-lm Cache Primitives
 
 mlx-lm provides these cache types (`mlx_lm.models.cache`):
 
@@ -66,7 +66,7 @@ Single-sequence types delegate `merge` to their batch counterparts:
 - `VllmQuantizedKVCache.merge` → `BatchQuantizedKVCache` (ours)
 - `ArraysCache.merge` → `ArraysCache` (already batched)
 
-## Stop Conditions
+#### Stop Conditions
 - If the same test fails twice with the same root cause, stop and explain the blocker.
 - If a tool returns an unexpected error, report it before trying a substantially different approach.
 - If 5 or more tool calls make no progress on the same subproblem, stop and ask for direction.
