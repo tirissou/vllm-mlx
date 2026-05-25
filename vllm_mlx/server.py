@@ -4474,14 +4474,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
-    msg_roles = [m.role for m in request.messages]
     total_chars = 0
-    last_user_preview = ""
+    turn_previews = []
     for m in request.messages:
         content = m.content if isinstance(m.content, str) else str(m.content)
         total_chars += len(content)
-        if m.role == "user":
-            last_user_preview = content[:300]
+        preview = " ".join(content.split()[:8])
+        turn_previews.append((m.role, preview))
     n_tools = len(request.tools) if request.tools else 0
     logger.info(
         f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
@@ -4490,14 +4489,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         f"top_k={request.top_k} min_p={request.min_p} "
         f"presence_penalty={request.presence_penalty} "
         f"repetition_penalty={request.repetition_penalty} "
-        f"msgs={n_msgs} roles={msg_roles} "
-        f"total_chars={total_chars} tools={n_tools} "
+        f"msgs={n_msgs} total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
-    logger.info(
-        "[REQUEST] last user message preview: %s",
-        _sanitize_log_text(last_user_preview, limit=300),
-    )
+    _role_colors = {"system": "\033[90m", "user": "\033[94m", "assistant": "\033[92m"}
+    _reset = "\033[0m"
+    lines = [f"\033[1m┌── conversation ({n_msgs} turns) ──\033[0m"]
+    for role, preview in turn_previews:
+        color = _role_colors.get(role, "")
+        lines.append(f"│  {color}{role:<12}{_reset} {preview!r}")
+    lines.append("└" + "─" * 36)
+    print("\n".join(lines), flush=True)
 
     try:
         import json as _json, time as _t
