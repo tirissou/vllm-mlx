@@ -4477,7 +4477,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     total_chars = 0
     turn_previews = []
     for m in request.messages:
-        content = m.content if isinstance(m.content, str) else str(m.content)
+        if isinstance(m.content, str):
+            content = m.content
+        else:
+            content = " ".join(p.text for p in m.content if hasattr(p, "text") and p.text)
         total_chars += len(content)
         preview = " ".join(content.split()[:8])
         turn_previews.append((m.role, preview))

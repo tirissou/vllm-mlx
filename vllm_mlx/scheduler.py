@@ -1659,6 +1659,11 @@ class Scheduler:
                                 if _req is not None:
                                     _recur_caches = [_gb.prompt_cache[i].extract(_e) for i in _recurrent_indices]
                                     _req._cache_state.prev_recurrent = extract_cache_states(_recur_caches)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        for req in self.running.values():
+                            all_ids = list(req.prompt_token_ids) + list(req.output_token_ids)
+                            text = self.tokenizer.decode(all_ids)
+                            logger.debug(f"[decode_step] request_id={req.request_id}\n{text}")
                     result = self.batch_generator.next()
                     output.has_work = True
 
