@@ -267,12 +267,18 @@ def compose_n_minus_1_cache(
             continue
 
         if _is_kv_extracted(layer):
-            meta = layer.get("meta_state")
-            if meta and len(meta) > 0:
-                new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
-                result.append({**layer, "meta_state": new_meta})
+            class_name = layer.get("class_name", "")
+            if "Rotating" in class_name:
+                # RotatingKVCache meta[0] is `keep`, not `offset` — don't touch it.
+                # Signal _split_cache_arrays to trim the last temporal token instead.
+                result.append({**layer, "trim_last": True})
             else:
-                result.append(layer)
+                meta = layer.get("meta_state")
+                if meta and len(meta) > 0:
+                    new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
+                    result.append({**layer, "meta_state": new_meta})
+                else:
+                    result.append(layer)
         else:
             if recurrent_idx < len(prev_recurrent_extracted):
                 result.append(prev_recurrent_extracted[recurrent_idx])

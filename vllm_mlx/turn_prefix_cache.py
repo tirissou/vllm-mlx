@@ -367,6 +367,8 @@ class TurnPrefixCache:
         """
         Process the output from Scheduler._extract_cache_states.
         KV arrays are quantized to int4 (group_size=64) before storage.
+        RotatingKVCache is linearized (temporal order) then quantized at rest;
+        it is restored as a plain RotatingKVCache for unquantized decoding.
         """
         from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
         _KV_GROUP_SIZE = 64
@@ -374,12 +376,45 @@ class TurnPrefixCache:
 
         kv = []
         kv_indices = []
+        rotating_kv_meta: dict[int, tuple[int, int]] = {}  # kv-slot → (max_size, keep)
         recurrent = []
         recurrent_indices = []
         recurrent_cls = None
         logs = []
         for i, state in enumerate(cache_states):
-            if "KVCache" in state['class_name']:
+            class_name = state['class_name']
+            if class_name == 'RotatingKVCache':
+                meta = state.get('meta_state')
+                raw_keys, raw_values = state['state']
+                try:
+                    keep_r, max_size_r, offset_r, _idx_r = map(int, meta)
+                except (TypeError, ValueError):
+                    keep_r, _idx_r = 0, raw_keys.shape[2]
+                    max_size_r = offset_r = raw_keys.shape[2]
+
+                def _linearize(v, _idx=_idx_r, off=offset_r, keep=keep_r):
+                    if _idx == v.shape[2]:
+                        return v
+                    elif _idx < off:  # buffer has wrapped around
+                        return mx.concatenate(
+                            [v[..., :keep, :], v[..., _idx:, :], v[..., keep:_idx, :]], axis=2
+                        )
+                    else:
+                        return v[..., :_idx, :]
+
+                lin_keys = _linearize(raw_keys)
+                lin_values = _linearize(raw_values)
+                if state.get("trim_last") and lin_keys.shape[2] > 0:
+                    lin_keys = lin_keys[..., :-1, :]
+                    lin_values = lin_values[..., :-1, :]
+                q_state = (
+                    mx.quantize(mx.contiguous(lin_keys), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
+                    mx.quantize(mx.contiguous(lin_values), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
+                )
+                rotating_kv_meta[len(kv)] = (max_size_r, keep_r)
+                kv.append(q_state)
+                kv_indices.append(i)
+            elif "KVCache" in class_name:
                 meta = state.get('meta_state')
                 raw_state = state['state']
                 try:
@@ -426,12 +461,21 @@ class TurnPrefixCache:
             for i, out_i in enumerate(kv_indices):
                 q_keys, q_values = kv[i]
                 n_tokens = q_keys[0].shape[2]  # packed array; axis=2 is token dim
-                rval[out_i] = {
-                    "state": kv[i],
-                    "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS)),
-                    "class_name": _QuantizedKVCache.__name__,
-                    "class_ref": _QuantizedKVCache,
-                }
+                if i in rotating_kv_meta:
+                    max_size_r, keep_r = rotating_kv_meta[i]
+                    rval[out_i] = {
+                        "state": kv[i],
+                        "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS), str(max_size_r), str(keep_r)),
+                        "class_name": "QuantizedRotatingKVCache",
+                        "class_ref": None,
+                    }
+                else:
+                    rval[out_i] = {
+                        "state": kv[i],
+                        "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS)),
+                        "class_name": _QuantizedKVCache.__name__,
+                        "class_ref": _QuantizedKVCache,
+                    }
             for i, out_i in enumerate(recurrent_indices):
                 rval[out_i] = {
                     "state": recurrent[i],
@@ -469,8 +513,8 @@ class TurnPrefixCache:
                     )
                     for arrs in zip(*kv_slices)
                 ]
-                n = kv[0][0][0].shape[2]  # layer 0, q_keys, packed component, token dim
-                logger.info(f"Rebuilding cache... {n} tokens")
+                n = max((kv[i][0][0].shape[2] for i in range(len(kv))))  # layer 0, q_keys, packed component, token dim
+                logger.info(f"Rebuilding KV cache... {n} tokens")
             else:
                 kv = []
                 logger.info("Rebuilding cache... (SSM-only, no KV layers)")
@@ -1414,7 +1458,26 @@ def reconstruct_cache_from_states(extracted_states):
             if state is None:
                 return None
 
-            if cache_cls is not None and hasattr(cache_cls, "from_state"):
+            if layer_state.get("class_name") == "QuantizedRotatingKVCache":
+                from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
+                (w_k, s_k, b_k), (w_v, s_v, b_v) = state
+                n_tokens = int(meta_state[0]) if meta_state else 0
+                group_size = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
+                bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
+                max_size = int(meta_state[3]) if meta_state and len(meta_state) > 3 else n_tokens
+                keep = int(meta_state[4]) if meta_state and len(meta_state) > 4 else 0
+                keys = mx.dequantize(w_k, s_k, b_k, group_size=group_size, bits=bits)
+                values = mx.dequantize(w_v, s_v, b_v, group_size=group_size, bits=bits)
+                # Trim to max_size if concatenation across turns exceeded the window
+                if keys.shape[2] > max_size:
+                    keys = keys[..., -max_size:, :]
+                    values = values[..., -max_size:, :]
+                cache = _RotatingKVCache(max_size, keep)
+                cache.keys = keys
+                cache.values = values
+                cache.offset = min(n_tokens, max_size)
+                cache._idx = keys.shape[2]
+            elif cache_cls is not None and hasattr(cache_cls, "from_state"):
                 from mlx_lm.models.cache import (
                     BatchKVCache as _BatchKVCache,
                     KVCache as _KVCache,
