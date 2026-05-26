@@ -519,6 +519,48 @@ def test_boundaries_empty_when_no_turn_boundaries():
     assert adapter.boundaries(req) == []
 
 
+# ── messages_to_segments() ───────────────────────────────────────────────────
+
+def test_messages_to_segments_system_only_prompt_returns_one_segment():
+    """System-only prompt (boundary at or beyond token count) should cache the system segment."""
+    req = _make_request(
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        turn_boundaries=[5],  # boundary == len(tokens) → system fills whole context
+    )
+    segments = TurnCacheAdapter.messages_to_segments(req)
+    assert len(segments) == 1
+    assert list(segments[0].token_ids) == [1, 2, 3, 4, 5]
+
+
+def test_messages_to_segments_no_boundaries_returns_empty():
+    """No turn boundaries → caching genuinely inapplicable."""
+    req = _make_request(prompt_token_ids=[1, 2, 3], turn_boundaries=[])
+    assert TurnCacheAdapter.messages_to_segments(req) == []
+
+
+def test_messages_to_segments_system_plus_user_returns_two_segments():
+    """Normal case: system boundary mid-prompt yields 2 segments."""
+    req = _make_request(
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        turn_boundaries=[3],  # sys=[1,2,3], user=[4,5]
+    )
+    segments = TurnCacheAdapter.messages_to_segments(req)
+    assert len(segments) == 2
+    assert list(segments[0].token_ids) == [1, 2, 3]
+    assert list(segments[1].token_ids) == [4, 5]
+
+
+def test_messages_to_segments_empty_tokens_returns_empty():
+    req = _make_request(prompt_token_ids=[], turn_boundaries=[3])
+    assert TurnCacheAdapter.messages_to_segments(req) == []
+
+
+def test_messages_to_segments_boundary_at_zero_returns_empty():
+    """Boundary at position 0 means no actual system prefix — skip."""
+    req = _make_request(prompt_token_ids=[1, 2, 3], turn_boundaries=[0])
+    assert TurnCacheAdapter.messages_to_segments(req) == []
+
+
 # ── fetch() ──────────────────────────────────────────────────────────────────
 
 def test_fetch_miss_returns_none():

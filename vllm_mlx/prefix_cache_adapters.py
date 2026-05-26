@@ -181,7 +181,7 @@ class TurnCacheAdapter(CacheManager):
             return []
 
         B_sys = _turn_boundaries[0]
-        if B_sys <= 0 or B_sys >= len(full_tokens):
+        if B_sys <= 0:
             return []
 
         segments: list = [Segment(role="system", token_ids=full_tokens[:B_sys])]
@@ -195,7 +195,7 @@ class TurnCacheAdapter(CacheManager):
         if prev < len(full_tokens):
             segments.append(Segment(role="user", token_ids=full_tokens[prev:]))
 
-        return segments if len(segments) > 1 else []
+        return segments
 
     def fetch(self, request) -> CacheHit | None:
         from .turn_prefix_cache import reconstruct_cache_from_states

@@ -1673,17 +1673,18 @@ def test_messages_to_segments_new_no_boundaries():
 
 
 def test_messages_to_segments_new_boundary_at_end():
-    """Boundary at or beyond end → empty list (invalid)."""
+    """Boundary at end of tokens → system-only segment (entire prompt is the system prefix)."""
     from vllm_mlx.scheduler import Scheduler
     sched = object.__new__(Scheduler)
 
     req = _make_request_with_boundaries(
         prompt_token_ids=list(range(10)),
-        turn_boundaries=[10],  # B_sys == len(full_tokens)
+        turn_boundaries=[10],  # B_sys == len(full_tokens) → system fills whole context
     )
     segs = TurnCacheAdapter.messages_to_segments(req)
 
-    assert segs == []
+    assert len(segs) == 1
+    assert list(segs[0].token_ids) == list(range(10))
 
 
 def test_messages_to_segments_new_three_boundaries():
@@ -2087,7 +2088,7 @@ def test_retrieve_full_cache_produces_quantized_kvcache():
 
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     sys_extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    kv, recur = trie._split_cache_arrays(sys_extracted, 0)
+    kv, recur = trie.split_cache_arrays(sys_extracted, 0)
     sys_node = trie.insert(
         trie.root,
         Segment(role="system", token_ids=list(range(10))),
@@ -2112,7 +2113,7 @@ def test_retrieve_full_cache_concatenates_two_nodes():
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     # Node 1: system, 10 tokens
     ext1 = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    kv1, recur1 = trie._split_cache_arrays(ext1, 0)
+    kv1, recur1 = trie.split_cache_arrays(ext1, 0)
     node1 = trie.insert(
         trie.root,
         Segment(role="system", token_ids=list(range(10))),
@@ -2121,7 +2122,7 @@ def test_retrieve_full_cache_concatenates_two_nodes():
     )
     # Node 2: user, 5 more tokens (full cache has 15 tokens, offset starts at 10)
     ext2 = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=15)
-    kv2, recur2 = trie._split_cache_arrays(ext2, node1.n_tokens)
+    kv2, recur2 = trie.split_cache_arrays(ext2, node1.n_tokens)
     node2 = trie.insert(
         node1,
         Segment(role="user", token_ids=list(range(10, 15))),
@@ -2144,7 +2145,7 @@ def test_retrieve_full_cache_kv_only_does_not_crash():
 
     trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     ext = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    kv, recur = trie._split_cache_arrays(ext, 0)
+    kv, recur = trie.split_cache_arrays(ext, 0)
     assert recur == []  # confirms this is KV-only data
 
     node = trie.insert(
@@ -2168,6 +2169,80 @@ def test_retrieve_full_cache_kv_only_does_not_crash():
 # ---------------------------------------------------------------------------
 # Regression: find_checkpoint_ancestor must reject nodes with empty recurrent
 # ---------------------------------------------------------------------------
+
+def _make_mixed_kv_rotating_extracted(n_tokens: int, max_size: int, n_kv_heads: int = 4, head_dim: int = 64):
+    """Extracted state with one normal KV layer and one RotatingKV layer.
+
+    n_tokens > max_size simulates a wrapped buffer (offset > max_size).
+    """
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+    buf_size = min(n_tokens, max_size)
+    kv_layer = {
+        "state": (
+            mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(mx.bfloat16),
+            mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(mx.bfloat16),
+        ),
+        "meta_state": (str(n_tokens),),
+        "class_name": "KVCache",
+        "class_ref": KVCache,
+    }
+    rotating_layer = {
+        "state": (
+            mx.random.normal([1, n_kv_heads, max_size, head_dim]).astype(mx.bfloat16),
+            mx.random.normal([1, n_kv_heads, max_size, head_dim]).astype(mx.bfloat16),
+        ),
+        # meta: (keep, max_size, offset, _idx) — offset is total tokens seen
+        "meta_state": ("0", str(max_size), str(n_tokens), str(buf_size)),
+        "class_name": "RotatingKVCache",
+        "class_ref": RotatingKVCache,
+    }
+    return [kv_layer, rotating_layer]
+
+
+# ---------------------------------------------------------------------------
+# Regression: RotatingKVCache.offset must survive store/fetch round-trip
+# ---------------------------------------------------------------------------
+
+def test_rotating_kv_offset_preserved_after_cache_round_trip():
+    """RotatingKVCache.offset (total tokens seen) must equal normal KV offset
+    after store → fetch → reconstruct, even when the rotating buffer has wrapped.
+
+    Before the fix, split_cache_arrays discarded offset_r from the extracted
+    meta, so reconstruct_cache_from_states set cache.offset = min(buf_size,
+    max_size) — always wrong once the sequence exceeds the rotating window.
+    """
+    from vllm_mlx.kv_cache import reconstruct_cache_from_states
+    from mlx_lm.models.cache import RotatingKVCache
+
+    max_size = 8
+    n_tokens = 14  # buffer has wrapped: n_tokens > max_size
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    extracted = _make_mixed_kv_rotating_extracted(n_tokens=n_tokens, max_size=max_size)
+    kv, recurrent = trie.split_cache_arrays(extracted, offset=0)
+    node = trie.insert(
+        trie.root,
+        seg(list(range(n_tokens))),
+        kv, None, recurrent,
+    )
+
+    raw_state = trie._retrieve_full_cache(node)
+    caches = reconstruct_cache_from_states(raw_state)
+
+    normal_kv = caches[0]
+    rotating_kv = caches[1]
+
+    assert normal_kv.offset == n_tokens, (
+        f"Normal KV offset {normal_kv.offset} != total tokens {n_tokens}"
+    )
+    # RotatingKVCache.offset is total tokens seen, not buffer size.
+    # After a wrapped buffer, this must be n_tokens (14), not max_size (8).
+    assert rotating_kv.offset == n_tokens, (
+        f"RotatingKVCache.offset {rotating_kv.offset} != total tokens {n_tokens}; "
+        f"got min(buf,max)={min(n_tokens, max_size)} instead — offset_r was discarded"
+    )
+    assert isinstance(rotating_kv, RotatingKVCache)
+
 
 def test_find_checkpoint_ancestor_rejects_empty_recurrent_state():
     """Nodes with recurrent_state=[] must not be selected as checkpoint ancestors.

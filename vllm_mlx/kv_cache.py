@@ -309,10 +309,31 @@ def reconstruct_cache_from_states(extracted_states: list) -> list | None:
             state = layer_state.get("state")
             meta_state = layer_state.get("meta_state")
             cache_cls = layer_state.get("class_ref")
+            class_name = layer_state.get("class_name", "")
             if state is None:
                 return None
 
-            if cache_cls is not None and hasattr(cache_cls, "from_state"):
+            if class_name == "QuantizedRotatingKVCache":
+                from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
+                (w_k, s_k, b_k), (w_v, s_v, b_v) = state
+                n_tokens = int(meta_state[0]) if meta_state else 0
+                group_size = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
+                bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
+                max_size = int(meta_state[3]) if meta_state and len(meta_state) > 3 else n_tokens
+                keep = int(meta_state[4]) if meta_state and len(meta_state) > 4 else 0
+                # meta_state[5] is total tokens seen (true offset); n_tokens is buffer size.
+                total_offset = int(meta_state[5]) if meta_state and len(meta_state) > 5 else n_tokens
+                keys = mx.dequantize(w_k, s_k, b_k, group_size=group_size, bits=bits)
+                values = mx.dequantize(w_v, s_v, b_v, group_size=group_size, bits=bits)
+                if keys.shape[2] > max_size:
+                    keys = keys[..., -max_size:, :]
+                    values = values[..., -max_size:, :]
+                cache = _RotatingKVCache(max_size, keep)
+                cache.keys = keys
+                cache.values = values
+                cache.offset = total_offset
+                cache._idx = keys.shape[2]
+            elif cache_cls is not None and hasattr(cache_cls, "from_state"):
                 from mlx_lm.models.cache import (
                     BatchKVCache as _BatchKVCache,
                     KVCache as _KVCache,

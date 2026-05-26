@@ -992,7 +992,10 @@ class MLLMBatchGenerator:
                 layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
                 layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
                 layer_cache._idx = layer_cache.max_size
-            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
+                # Only clamp offset when we trimmed an oversized buffer — the
+                # buffer was larger than max_size, so total_tokens and offset
+                # were not yet reliable. After trim, clamp to the new size.
+                layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
             # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
             # Prefix cache trimming can create offset > keys.shape[2] when
             # a supersequence/LCP trim crosses the max_size boundary.

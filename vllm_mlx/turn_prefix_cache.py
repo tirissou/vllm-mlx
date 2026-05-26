@@ -404,6 +404,10 @@ class TurnPrefixCache:
 
                 lin_keys = _linearize(raw_keys)
                 lin_values = _linearize(raw_values)
+                # _update_concat leaves buffer at max_size-1+S; clip before storing
+                if lin_keys.shape[2] > max_size_r:
+                    lin_keys = lin_keys[..., -max_size_r:, :]
+                    lin_values = lin_values[..., -max_size_r:, :]
                 if state.get("trim_last") and lin_keys.shape[2] > 0:
                     lin_keys = lin_keys[..., :-1, :]
                     lin_values = lin_values[..., :-1, :]
@@ -411,7 +415,7 @@ class TurnPrefixCache:
                     mx.quantize(mx.contiguous(lin_keys), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
                     mx.quantize(mx.contiguous(lin_values), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
                 )
-                rotating_kv_meta[len(kv)] = (max_size_r, keep_r)
+                rotating_kv_meta[len(kv)] = (max_size_r, keep_r, offset_r)
                 kv.append(q_state)
                 kv_indices.append(i)
             elif "KVCache" in class_name:
@@ -454,7 +458,7 @@ class TurnPrefixCache:
         kv_indices = tuple(kv_indices)
         recurrent_indices = tuple(recurrent_indices)
 
-        def reconstruct(kv, recurrent):
+        def reconstruct(kv, recurrent, total_tokens=None):
             rval: list[Any] = [None] * n
             assert len(kv) == len(kv_indices)
             assert len(recurrent) == len(recurrent_indices)
@@ -462,10 +466,13 @@ class TurnPrefixCache:
                 q_keys, q_values = kv[i]
                 n_tokens = q_keys[0].shape[2]  # packed array; axis=2 is token dim
                 if i in rotating_kv_meta:
-                    max_size_r, keep_r = rotating_kv_meta[i]
+                    max_size_r, keep_r, offset_r = rotating_kv_meta[i]
+                    # total_tokens (from the trie node) is authoritative for offset;
+                    # offset_r (from extraction) is a fallback for standalone calls.
+                    actual_offset = total_tokens if total_tokens is not None else offset_r
                     rval[out_i] = {
                         "state": kv[i],
-                        "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS), str(max_size_r), str(keep_r)),
+                        "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS), str(max_size_r), str(keep_r), str(actual_offset)),
                         "class_name": "QuantizedRotatingKVCache",
                         "class_ref": None,
                     }
@@ -527,7 +534,8 @@ class TurnPrefixCache:
                 kv = []
                 logger.info("Rebuilding cache... (SSM-only, no KV layers)")
             recurrent = node.recurrent_state if node.recurrent_state is not None else []
-            rval = self._reassemble_cache_fn(kv, recurrent)
+            total_tokens = path[-1].n_tokens if path else 0
+            rval = self._reassemble_cache_fn(kv, recurrent, total_tokens)
             logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
             return rval
 
@@ -574,7 +582,7 @@ class TurnPrefixCache:
         acquire_lock: bool = True,
     ) -> TurnNode:
         with self._lock if acquire_lock else nullcontext():
-            if recurrent_state:
+            if recurrent_state is not None and not (isinstance(recurrent_state, list) and len(recurrent_state) == 0):
                 self.has_recurrent_state = True
             h = _context_hash(parent.context_hash, segment.token_ids)
 
@@ -1381,7 +1389,7 @@ class TurnPrefixCache:
             ntok = len(node.token_ids)
             ckpt = "✓" if node.is_permanent_checkpoint else " "
             has_kv = "K" if node.kv_arrays else " "
-            has_state = "S" if node.recurrent_state else " "
+            has_state = "S" if node.recurrent_state is not None and node.recurrent_state != [] else " "
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
             if node.token_ids:
@@ -1474,6 +1482,8 @@ def reconstruct_cache_from_states(extracted_states):
                 bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
                 max_size = int(meta_state[3]) if meta_state and len(meta_state) > 3 else n_tokens
                 keep = int(meta_state[4]) if meta_state and len(meta_state) > 4 else 0
+                # meta_state[5] is the total tokens seen (true offset); n_tokens is buffer size.
+                total_offset = int(meta_state[5]) if meta_state and len(meta_state) > 5 else n_tokens
                 keys = mx.dequantize(w_k, s_k, b_k, group_size=group_size, bits=bits)
                 values = mx.dequantize(w_v, s_v, b_v, group_size=group_size, bits=bits)
                 # Trim to max_size if concatenation across turns exceeded the window
@@ -1483,7 +1493,7 @@ def reconstruct_cache_from_states(extracted_states):
                 cache = _RotatingKVCache(max_size, keep)
                 cache.keys = keys
                 cache.values = values
-                cache.offset = min(n_tokens, max_size)
+                cache.offset = total_offset
                 cache._idx = keys.shape[2]
             elif cache_cls is not None and hasattr(cache_cls, "from_state"):
                 from mlx_lm.models.cache import (
