@@ -101,8 +101,8 @@ Shared across all requests. Built lazily on first call to either `update_n_minus
 - `extracted_cache` is the N-state extracted state dicts passed into `store()`
 - Uses `self._cache_index_map` to interleave sources back into original layer order:
   - KV positions: taken from `extracted_cache` with `meta_state[0]` (offset) decremented by 1
-  - Rotating positions: extracted from shadow `RotatingKVCache` instances in `_cache_state.n_minus_one_state`
-  - Recurrent positions: taken from saved `mx.array` refs in `_cache_state.n_minus_one_state`
+  - Rotating positions: extracted from `_cache_state.n_minus_one_state["rotating"]` shadow instances
+  - Recurrent positions: taken from `_cache_state.n_minus_one_state["recurrent"]` saved `mx.array` refs
 - Returns complete N-1 cache list in original layer order, ready for `_split_cache_arrays`
 - Replaces `compose_n_minus_1_cache`
 
@@ -112,9 +112,9 @@ Shared across all requests. Built lazily on first call to either `update_n_minus
 
 Overrides `update_n_minus_one`:
 1. Calls `_ensure_cache_index_map(prompt_cache)`
-2. If `_cache_state.n_minus_one_state` is None, initialises it as `{"rotating_shadows": [...], "recurrent_refs": None}` with one shadow `RotatingKVCache` per rotating layer (same `max_size`/`keep` as live instances)
+2. If `_cache_state.n_minus_one_state` is None, initialises it as `{"rotating": [...], "recurrent": None}` with one shadow `RotatingKVCache` per rotating layer (same `max_size`/`keep` as live instances)
 3. **RotatingKV layers:** reads K/V from the live `BatchRotatingKVCache` at position `_idx - 1` for this `uid_idx` (`_idx - 1` is always the last-written slot, regardless of wrap) and mirrors it into the shadow instance, advancing shadow's metadata identically — O(1) per layer. Since `update_n_minus_one` is called before `next()`, this mirrors the write from the *previous* step; after `next()` runs, the shadow is one full step behind the live instance
-4. **Recurrent layers:** saves Python refs to current `ArraysCache.cache` lists as `recurrent_refs` in `_cache_state.n_minus_one_state` — valid because `ArraysCache` updates replace references rather than mutate in-place
+4. **Recurrent layers:** saves Python refs to current `ArraysCache.cache` lists into `_cache_state.n_minus_one_state["recurrent"]` — valid because `ArraysCache` updates replace references rather than mutate in-place
 5. **Standard KV layers:** skip
 
 **`store(request, cache)`:**
