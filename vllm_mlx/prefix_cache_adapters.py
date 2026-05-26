@@ -14,7 +14,111 @@ from .kv_cache import CacheHit, PrefixCache
 # logger.setLevel(logging.DEBUG)
 
 
-class MemoryCacheAdapter:
+class CacheManager:
+    """Mixin providing per-step N-1 tracking machinery for prefix cache adapters."""
+
+    _cache_index_map = None  # CacheIndexMap | None, per-instance (lazily initialized)
+
+    def _ensure_cache_index_map(self, layers: list):
+        """Classify layer indices into KV, RotatingKV, and recurrent buckets.
+
+        Accepts either live prompt_cache objects (from update_n_minus_one)
+        or extracted state dicts (from store()). Lazy-initializes once.
+        """
+        if self._cache_index_map is not None:
+            return self._cache_index_map
+
+        from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES
+        from mlx_lm.models.cache import BatchRotatingKVCache, ArraysCache
+
+        kv_indices = []
+        rotating_indices = []
+        recurrent_indices = []
+
+        for i, layer in enumerate(layers):
+            if isinstance(layer, dict):
+                # Extracted state dict
+                name = layer.get("class_name", "")
+                if "Rotating" in name:
+                    rotating_indices.append(i)
+                elif "KV" in name or "Quantized" in name:
+                    kv_indices.append(i)
+                else:
+                    recurrent_indices.append(i)
+            else:
+                # Live cache object
+                if isinstance(layer, BatchRotatingKVCache):
+                    rotating_indices.append(i)
+                elif isinstance(layer, _BATCH_KV_TYPES):
+                    kv_indices.append(i)
+                else:
+                    recurrent_indices.append(i)
+
+        self._cache_index_map = CacheIndexMap(
+            kv_indices=kv_indices,
+            rotating_indices=rotating_indices,
+            recurrent_indices=recurrent_indices,
+        )
+        return self._cache_index_map
+
+    def update_n_minus_one(self, request, prompt_cache: list, uid_idx: int) -> None:
+        """Default no-op. Override in adapters that track N-1 state."""
+        pass
+
+    def _reconstruct(self, request, extracted_cache: list) -> list:
+        """Build N-1 state dict list from extracted N-state and per-step tracking.
+
+        Replaces compose_n_minus_1_cache. Returns a list of state dicts in
+        original layer order, ready for TurnPrefixCache._split_cache_arrays.
+        """
+        from .kv_cache import extract_layer_state
+
+        idx_map = self._cache_index_map
+        cs = request._cache_state
+        n_minus_one = cs.n_minus_one_state  # {"rotating": [...], "recurrent": [...]}
+
+        result = [None] * len(extracted_cache)
+
+        # Standard KV: offset - 1
+        for i in idx_map.kv_indices:
+            layer = extracted_cache[i]
+            meta = layer.get("meta_state")
+            if meta and len(meta) > 0:
+                new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
+                result[i] = {**layer, "meta_state": new_meta}
+            else:
+                result[i] = layer
+
+        # RotatingKV: use shadow instances
+        shadows = n_minus_one["rotating"] if n_minus_one else []
+        for shadow_idx, layer_idx in enumerate(idx_map.rotating_indices):
+            if shadow_idx < len(shadows):
+                shadow = shadows[shadow_idx]
+                state_dict = extract_layer_state(shadow)
+                if state_dict is not None:
+                    result[layer_idx] = state_dict
+                else:
+                    result[layer_idx] = extracted_cache[layer_idx]
+            else:
+                result[layer_idx] = extracted_cache[layer_idx]
+
+        # Recurrent: use saved ArraysCache refs
+        saved_recurrent = (n_minus_one or {}).get("recurrent") or []
+        for rec_idx, layer_idx in enumerate(idx_map.recurrent_indices):
+            if rec_idx < len(saved_recurrent):
+                saved = saved_recurrent[rec_idx]
+                state_dict = extract_layer_state(saved)
+                if state_dict is not None:
+                    result[layer_idx] = state_dict
+                else:
+                    result[layer_idx] = extracted_cache[layer_idx]
+            else:
+                result[layer_idx] = extracted_cache[layer_idx]
+
+        return result
+
+
+class MemoryCacheAdapter(CacheManager):
     """Adapts MemoryAwarePrefixCache to the PrefixCache / PersistableCache protocol."""
 
     def __init__(self, inner, mid_prefill_save_interval: int = 0):
@@ -95,7 +199,7 @@ class MemoryCacheAdapter:
         return self._inner.load_from_disk(cache_dir)
 
 
-class TurnCacheAdapter:
+class TurnCacheAdapter(CacheManager):
     """Adapts TurnPrefixCache to the PrefixCache / PersistableCache protocol."""
 
     def __init__(self, inner: TurnPrefixCache):
@@ -184,6 +288,52 @@ class TurnCacheAdapter:
             prefill_boundaries=prefill_boundaries,
         )
 
+    def update_n_minus_one(self, request, prompt_cache: list, uid_idx: int) -> None:
+        """Capture N-1 state before each decode step.
+
+        On first call: initialize shadow RotatingKVCache instances.
+        On subsequent calls: mirror the previous step's write into shadows,
+        and save recurrent refs.
+        """
+        from mlx_lm.models.cache import RotatingKVCache, BatchRotatingKVCache, ArraysCache
+
+        cs = getattr(request, "_cache_state", None)
+        if cs is None:
+            return
+
+        idx_map = self._ensure_cache_index_map(prompt_cache)
+        just_initialized = (cs.n_minus_one_state is None)
+
+        if just_initialized:
+            # Initialize one shadow RotatingKVCache per rotating layer
+            shadows = []
+            for i in idx_map.rotating_indices:
+                live = prompt_cache[i]  # BatchRotatingKVCache
+                shadow = RotatingKVCache(max_size=live.max_size, keep=0)
+                shadows.append(shadow)
+            cs.n_minus_one_state = {"rotating": shadows, "recurrent": None}
+            # No mirroring on first call — no previous decode step yet
+            return
+
+        # Mirror previous step's RotatingKV write into shadow
+        shadows = cs.n_minus_one_state["rotating"]
+        for shadow_idx, layer_idx in enumerate(idx_map.rotating_indices):
+            live = prompt_cache[layer_idx]  # BatchRotatingKVCache
+            shadow = shadows[shadow_idx]
+            # _idx-1 is always the last-written slot after the previous next() call
+            prev_slot = live._idx - 1
+            k_prev = live.keys[uid_idx:uid_idx+1, :, prev_slot:prev_slot+1, :]
+            v_prev = live.values[uid_idx:uid_idx+1, :, prev_slot:prev_slot+1, :]
+            shadow.update_and_fetch(k_prev, v_prev)
+
+        # Save recurrent refs (valid because ArraysCache uses reference replacement)
+        if idx_map.recurrent_indices:
+            saved = []
+            for layer_idx in idx_map.recurrent_indices:
+                live = prompt_cache[layer_idx]  # ArraysCache (batched)
+                saved.append(live.extract(uid_idx))
+            cs.n_minus_one_state["recurrent"] = saved
+
     def store(self, request, cache: list) -> bool:
         from .turn_prefix_cache import Segment
 
@@ -200,16 +350,21 @@ class TurnCacheAdapter:
         if not new_segments:
             return False
 
-        # Intermediate turns (all but the last) were eagerly inserted during prefill
-        # via on_prefill_checkpoint; adapter_state already reflects those nodes.
-        # Only the final response segment remains to be inserted here.
-
         response_tokens = list(segments[-1].token_ids) + list(request.output_token_ids)
         # Normalize to dict form if raw KV layer objects were passed
         if cache and not isinstance(cache[0], dict):
             from .kv_cache import extract_layer_state
             cache = [d for layer in cache if (d := extract_layer_state(layer)) is not None]
+
         resp_state = cache if cache else None
+
+        if resp_state is not None:
+            self._ensure_cache_index_map(resp_state)
+            n_minus_one = cs.n_minus_one_state if cs is not None else None
+            if n_minus_one is not None:
+                # Decode steps occurred — use per-step N-1 tracking
+                resp_state = self._reconstruct(request, resp_state)
+
         resp_kv, resp_recur = (
             self._inner._split_cache_arrays(resp_state, parent.n_tokens)
             if resp_state is not None else ([], None)
@@ -284,7 +439,7 @@ class TurnCacheAdapter:
         return 0
 
 
-class PagedCacheAdapter:
+class PagedCacheAdapter(CacheManager):
     """Adapts BlockAwarePrefixCache to the PrefixCache protocol.
 
     Maintains an internal {request_id → block_table} mapping so the protocol
@@ -341,7 +496,7 @@ class PagedCacheAdapter:
         pass
 
 
-class LegacyCacheAdapter:
+class LegacyCacheAdapter(CacheManager):
     """Adapts PrefixCacheManager (entry-count based cache) to the PrefixCache protocol."""
 
     def __init__(self, inner):

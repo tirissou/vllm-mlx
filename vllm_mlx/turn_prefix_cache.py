@@ -520,6 +520,7 @@ class TurnPrefixCache:
                 logger.info("Rebuilding cache... (SSM-only, no KV layers)")
             recurrent = node.recurrent_state if node.recurrent_state is not None else []
             rval = self._reassemble_cache_fn(kv, recurrent)
+            __import__('pdb').set_trace()
             logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
             return rval
 

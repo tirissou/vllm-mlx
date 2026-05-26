@@ -45,7 +45,7 @@ class RequestCacheState:
     # Written by Scheduler before calling store()
     store_tokens: list | None = None        # N-1 token key
     decoded_cache: list | None = None       # composed N-1 cache (extracted state dicts)
-    prev_recurrent: list | None = None      # recurrent-only snapshot before last decode step
+    n_minus_one_state: Any = None           # per-step N-1 tracking state (set by update_n_minus_one)
 
     # Written by MemoryCacheAdapter.on_prefill_checkpoint()
     mid_prefill_last_save: int = 0
@@ -53,6 +53,17 @@ class RequestCacheState:
 
     # Opaque per-adapter slot (e.g. turn_cache_path for TurnCacheAdapter)
     adapter_state: Any = None
+
+
+@dataclass
+class CacheIndexMap:
+    """Index classification for a model's cache layer list.
+
+    Designed for future save/load: plain index lists, cleanly serializable.
+    """
+    kv_indices: list[int]
+    rotating_indices: list[int]
+    recurrent_indices: list[int]
 
 
 @dataclass
@@ -86,6 +97,12 @@ class PrefixCache(Protocol):
         a no-op; MemoryCacheAdapter stores prefix entries, TurnCacheAdapter
         captures boundary states.
         """
+        ...
+
+    def update_n_minus_one(
+        self, request: Any, prompt_cache: list, uid_idx: int
+    ) -> None:
+        """Called before each decode step. Default: no-op."""
         ...
 
 
@@ -243,50 +260,6 @@ def _is_kv_extracted(layer: dict) -> bool:
     """True if an extracted state dict represents a KV (not recurrent) layer."""
     name = layer.get("class_name", "")
     return "KV" in name or "Quantized" in name or name == "RotatingKVCache"
-
-
-def compose_n_minus_1_cache(
-    decoded_cache: list, prev_recurrent_extracted: list
-) -> list:
-    """Build the N-1 cache from extracted state dicts.
-
-    KV layers: offset (meta_state[0]) trimmed by 1.
-    Recurrent layers: replaced with prev_recurrent_extracted snapshot.
-
-    decoded_cache: extracted state dicts at offset N (from extract_cache_states).
-    prev_recurrent_extracted: extracted recurrent-only state dicts at offset N-1.
-    """
-    if not decoded_cache:
-        return []
-
-    result = []
-    recurrent_idx = 0
-    for layer in decoded_cache:
-        if not isinstance(layer, dict):
-            result.append(layer)
-            continue
-
-        if _is_kv_extracted(layer):
-            class_name = layer.get("class_name", "")
-            if "Rotating" in class_name:
-                # RotatingKVCache meta[0] is `keep`, not `offset` — don't touch it.
-                # Signal _split_cache_arrays to trim the last temporal token instead.
-                result.append({**layer, "trim_last": True})
-            else:
-                meta = layer.get("meta_state")
-                if meta and len(meta) > 0:
-                    new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
-                    result.append({**layer, "meta_state": new_meta})
-                else:
-                    result.append(layer)
-        else:
-            if recurrent_idx < len(prev_recurrent_extracted):
-                result.append(prev_recurrent_extracted[recurrent_idx])
-                recurrent_idx += 1
-            else:
-                result.append(layer)
-
-    return result
 
 
 def extract_cache_states(raw_cache: list) -> list:

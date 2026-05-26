@@ -35,9 +35,7 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .kv_cache import (
     RequestCacheState,
     _BATCH_KV_TYPES,
-    compose_n_minus_1_cache,
     extract_cache_states,
-    extract_recurrent_state,
     reconstruct_cache_from_states,
     reconstruct_ssd_layers,
     validate_cache,
@@ -70,7 +68,6 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
-# extract_recurrent_state, compose_n_minus_1_cache and related helpers live in kv_cache.py
 
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
@@ -1417,12 +1414,7 @@ class Scheduler:
                             request._cache_state.decoded_cache
                         )
 
-                    # Compose N-1 cache (trim KV by 1, replace recurrent with snapshot)
                     if request._cache_state.decoded_cache:
-                        _prev_recur = request._cache_state.prev_recurrent or []
-                        request._cache_state.decoded_cache = compose_n_minus_1_cache(
-                            request._cache_state.decoded_cache, _prev_recur
-                        )
                         _full_tokens = (
                             list(request.prompt_token_ids) + list(request.output_token_ids)
                         )
@@ -1641,29 +1633,18 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    # Snapshot recurrent state before this decode step (gives N-1 snapshot).
-                    # Only recurrent (non-KV) layers need snapshotting; KV layers are
-                    # monotonically extended and never need a "previous step" copy.
-                    # ArraysCache.extract() is lazy (no .item()); BatchKVCache.extract()
-                    # calls .item() per layer — skipping KV layers eliminates those syncs.
                     _gb = getattr(self.batch_generator, "_generation_batch", None)
                     if _gb is not None and _gb.uids:
-                        _recurrent_indices = [
-                            i for i, c in enumerate(_gb.prompt_cache)
-                            if not isinstance(c, _BATCH_KV_TYPES)
-                        ]
-                        if _recurrent_indices:
-                            for _e, _uid in enumerate(_gb.uids):
-                                _rid = self.uid_to_request_id.get(_uid)
-                                _req = self.running.get(_rid) if _rid else None
-                                if _req is not None:
-                                    _recur_caches = [_gb.prompt_cache[i].extract(_e) for i in _recurrent_indices]
-                                    _req._cache_state.prev_recurrent = extract_cache_states(_recur_caches)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        for req in self.running.values():
-                            all_ids = list(req.prompt_token_ids) + list(req.output_token_ids)
-                            text = self.tokenizer.decode(all_ids)
-                            logger.debug(f"[decode_step] request_id={req.request_id}\n{text}")
+                        for _e, _uid in enumerate(_gb.uids):
+                            _rid = self.uid_to_request_id.get(_uid)
+                            _req = self.running.get(_rid) if _rid else None
+                            if _req is not None and self._prefix_cache is not None:
+                                self._prefix_cache.update_n_minus_one(_req, _gb.prompt_cache, _e)
+                    # if logger.isEnabledFor(logging.DEBUG):
+                    #     for req in self.running.values():
+                    #         all_ids = list(req.prompt_token_ids) + list(req.output_token_ids)
+                    #         text = self.tokenizer.decode(all_ids)
+                    #         logger.debug(f"[decode_step] request_id={req.request_id}\n{text}")
                     result = self.batch_generator.next()
                     output.has_work = True
 

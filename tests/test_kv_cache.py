@@ -829,6 +829,7 @@ class TestSpillableCacheProtocol:
             def get_stats(self): ...
             def clear(self): ...
             def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def update_n_minus_one(self, request, prompt_cache, uid_idx): ...
             def set_spill_delegate(self, on_spill, on_promote): ...
 
         assert isinstance(MinimalSpillable(), SpillableCache)
@@ -844,3 +845,104 @@ class TestSpillableCacheProtocol:
             def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
             # No set_spill_delegate
         assert not isinstance(NoDelegate(), SpillableCache)
+
+
+class TestArraysCacheReferenceSemantics:
+    """ArraysCache updates replace references; saved refs remain valid after decode steps."""
+
+    def test_setitem_replaces_reference_not_mutates(self):
+        from mlx_lm.models.cache import ArraysCache
+        cache = ArraysCache(2)
+        old_array = mx.zeros((1, 4))
+        cache[0] = old_array
+        saved_ref = cache.cache[0]
+        new_array = mx.ones((1, 4))
+        cache[0] = new_array
+        assert saved_ref is old_array
+        assert cache.cache[0] is new_array
+        mx.eval(saved_ref, cache.cache[0])
+        assert float(saved_ref[0, 0]) == 0.0
+        assert float(cache.cache[0][0, 0]) == 1.0
+
+    def test_saved_refs_survive_multiple_steps(self):
+        from mlx_lm.models.cache import ArraysCache
+        cache = ArraysCache(3)
+        step0 = [mx.full((1, 4), float(i)) for i in range(3)]
+        step1 = [mx.full((1, 4), float(i + 10)) for i in range(3)]
+        step2 = [mx.full((1, 4), float(i + 20)) for i in range(3)]
+        for i, v in enumerate(step0): cache[i] = v
+        saved_after_step0 = list(cache.cache)
+        for i, v in enumerate(step1): cache[i] = v
+        saved_after_step1 = list(cache.cache)
+        for i, v in enumerate(step2): cache[i] = v
+        mx.eval(*saved_after_step0)
+        assert all(float(a[0, 0]) == float(i) for i, a in enumerate(saved_after_step0))
+        mx.eval(*saved_after_step1)
+        assert all(float(a[0, 0]) == float(i + 10) for i, a in enumerate(saved_after_step1))
+
+
+class TestRotatingKVShadowCorrectness:
+    """Shadow RotatingKVCache mirrors live instance one step behind."""
+
+    def test_shadow_mirrors_live_unwrapped(self):
+        from mlx_lm.models.cache import RotatingKVCache
+        max_size, n_heads, head_dim = 8, 2, 4
+        live = RotatingKVCache(max_size=max_size, keep=0)
+        shadow = RotatingKVCache(max_size=max_size, keep=0)
+        for step in range(4):
+            if step > 0:
+                shadow.update_and_fetch(
+                    mx.full((1, n_heads, 1, head_dim), float(step - 1)),
+                    mx.full((1, n_heads, 1, head_dim), float(step - 1 + 100)),
+                )
+            live.update_and_fetch(
+                mx.full((1, n_heads, 1, head_dim), float(step)),
+                mx.full((1, n_heads, 1, head_dim), float(step + 100)),
+            )
+        mx.eval(live.keys, shadow.keys)
+        assert live.offset == 4
+        assert shadow.offset == 3
+
+    def test_shadow_mirrors_live_wrapped(self):
+        from mlx_lm.models.cache import RotatingKVCache
+        max_size, n_heads, head_dim = 4, 2, 4
+        live = RotatingKVCache(max_size=max_size, keep=0)
+        shadow = RotatingKVCache(max_size=max_size, keep=0)
+        for step in range(8):
+            if step > 0:
+                shadow.update_and_fetch(
+                    mx.full((1, n_heads, 1, head_dim), float(step - 1)),
+                    mx.full((1, n_heads, 1, head_dim), float(step - 1 + 100)),
+                )
+            live.update_and_fetch(
+                mx.full((1, n_heads, 1, head_dim), float(step)),
+                mx.full((1, n_heads, 1, head_dim), float(step + 100)),
+            )
+        assert live.offset == 8
+        assert shadow.offset == 7
+        mx.eval(live.keys, shadow.keys)
+        assert live.keys.shape[2] == max_size
+        assert shadow.keys.shape[2] == max_size
+
+    def test_shadow_n_minus_one_has_correct_last_token(self):
+        import pytest
+        from mlx_lm.models.cache import RotatingKVCache
+        max_size, n_heads, head_dim = 8, 1, 4
+        live = RotatingKVCache(max_size=max_size, keep=0)
+        shadow = RotatingKVCache(max_size=max_size, keep=0)
+        for step in range(3):
+            if step > 0:
+                shadow.update_and_fetch(
+                    mx.full((1, n_heads, 1, head_dim), float(step - 1)),
+                    mx.zeros((1, n_heads, 1, head_dim)),
+                )
+            live.update_and_fetch(
+                mx.full((1, n_heads, 1, head_dim), float(step)),
+                mx.zeros((1, n_heads, 1, head_dim)),
+            )
+        shadow_keys, _ = shadow.state
+        live_keys, _ = live.state
+        mx.eval(shadow_keys, live_keys)
+        assert shadow.offset == 2
+        assert float(shadow_keys[0, 0, -1, 0]) == pytest.approx(1.0)
+        assert float(live_keys[0, 0, -1, 0]) == pytest.approx(2.0)
