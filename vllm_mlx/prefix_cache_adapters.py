@@ -213,8 +213,6 @@ class TurnCacheAdapter(CacheManager):
         cs = getattr(request, "_cache_state", None)
         if cs is not None:
             cs.turn_path = path
-        else:
-            request._turn_cache_path = path
 
         ancestor = self._inner.find_checkpoint_ancestor(path)
         if ancestor is None:
@@ -282,7 +280,7 @@ class TurnCacheAdapter(CacheManager):
             return False
 
         cs = getattr(request, "_cache_state", None)
-        path = (cs.turn_path if cs is not None else None) or getattr(request, "_turn_cache_path", None) or []
+        path = cs.turn_path if cs is not None else []
         matched_depth = len(path)
         parent = path[-1] if path else self._inner.root
         new_segments = segments[matched_depth:]
@@ -327,18 +325,14 @@ class TurnCacheAdapter(CacheManager):
         pass
 
     def on_prefill_checkpoint(
-        self, request, processed_tokens: int, extracted_cache: list
+        self, request, total_tokens_prefilled: int, extracted_cache: list
     ) -> None:
-        cs = getattr(request, "_cache_state", None)
-        total_cached = ((cs.cached_tokens if cs is not None else None) or 0) + processed_tokens
         _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-
-        # insert_segments() fires end_of_segment AT boundary B (not B-1).
-        if total_cached not in _turn_boundaries:
+        if total_tokens_prefilled not in _turn_boundaries:
             return
 
         try:
-            abs_idx = _turn_boundaries.index(total_cached)
+            abs_idx = _turn_boundaries.index(total_tokens_prefilled)
         except ValueError:
             return
 
@@ -346,28 +340,21 @@ class TurnCacheAdapter(CacheManager):
         if abs_idx >= len(segments):
             return
 
-        adapter_state = (cs.turn_path if cs is not None else None) or getattr(request, "_turn_cache_path", None) or []
+        cs = getattr(request, "_cache_state", None)
+        turn_path = cs.turn_path if cs is not None else []
 
-        # Guard: skip if this boundary was already inserted (e.g. duplicate callback).
-        if len(adapter_state) > abs_idx:
-            return
+        if len(turn_path) > abs_idx:
+            return  # already inserted (duplicate callback guard)
 
-        parent = adapter_state[-1] if adapter_state else self._inner.root
+        parent = turn_path[-1] if turn_path else self._inner.root
         segment = segments[abs_idx]
         is_sys = segment.role == "system" and abs_idx == 0
 
         kv_slice, recur = self._inner.split_cache_arrays(extracted_cache, parent.n_tokens)
         new_node = self._inner.insert(parent, segment, kv_slice, None, recur, is_system_prompt=is_sys)
 
-        # Record the new node so store() and subsequent checkpoints can chain off it.
         if cs is not None:
-            if not isinstance(cs.turn_path, list):
-                cs.turn_path = list(cs.turn_path or [])
             cs.turn_path.append(new_node)
-        else:
-            if not isinstance(getattr(request, "_turn_cache_path", None), list):
-                request._turn_cache_path = []
-            request._turn_cache_path.append(new_node)
 
     # PersistableCache extension
     def save(self, cache_dir: str) -> bool:
