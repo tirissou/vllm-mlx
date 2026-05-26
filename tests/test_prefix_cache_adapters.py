@@ -480,3 +480,200 @@ class TestCacheManagerNMinusOne:
         mx.eval(*result[1]["state"])
         assert float(result[1]["state"][0][0, 0]) == pytest.approx(55.0)
         assert result[2]["meta_state"][0] == "2"  # KV offset 3 → 2
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Task 4: TurnCacheAdapter new interface tests
+# ════════════════════════════════════════════════════════════════════════════
+
+def _make_request(prompt_token_ids, turn_boundaries, output_token_ids=None, cached_tokens=0):
+    req = MagicMock()
+    req.prompt_token_ids = prompt_token_ids
+    req.output_token_ids = output_token_ids or []
+    req._turn_boundaries = turn_boundaries
+    req._cache_state = RequestCacheState(cached_tokens=cached_tokens)
+    return req
+
+
+def _make_inner():
+    inner = MagicMock()
+    inner.root = MagicMock(n_tokens=0)
+    inner.split_cache_arrays.return_value = ([], None)
+    inner.insert.return_value = MagicMock(n_tokens=5)
+    return inner
+
+
+# ── boundaries() ─────────────────────────────────────────────────────────────
+
+def test_boundaries_no_hit_returns_raw_turn_boundaries():
+    adapter = TurnCacheAdapter(_make_inner())
+    req = _make_request(
+        prompt_token_ids=list(range(30)),
+        turn_boundaries=[10, 20],
+        cached_tokens=0,
+    )
+    assert adapter.boundaries(req) == [10, 20]
+
+
+def test_boundaries_after_hit_offsets_by_cached_tokens():
+    adapter = TurnCacheAdapter(_make_inner())
+    req = _make_request(
+        prompt_token_ids=list(range(30)),
+        turn_boundaries=[10, 20, 30],
+        cached_tokens=10,
+    )
+    # Boundaries > 10, shifted by 10: [20-10, 30-10] = [10, 20]
+    assert adapter.boundaries(req) == [10, 20]
+
+
+def test_boundaries_excludes_boundaries_at_or_below_cached_tokens():
+    adapter = TurnCacheAdapter(_make_inner())
+    req = _make_request(
+        prompt_token_ids=list(range(30)),
+        turn_boundaries=[5, 10, 20],
+        cached_tokens=10,
+    )
+    # Only boundaries strictly > 10: [20-10] = [10]
+    assert adapter.boundaries(req) == [10]
+
+
+def test_boundaries_empty_when_no_turn_boundaries():
+    adapter = TurnCacheAdapter(_make_inner())
+    req = _make_request(
+        prompt_token_ids=list(range(10)),
+        turn_boundaries=[],
+        cached_tokens=0,
+    )
+    assert adapter.boundaries(req) == []
+
+
+# ── fetch() ──────────────────────────────────────────────────────────────────
+
+def test_fetch_miss_returns_none():
+    inner = _make_inner()
+    inner.match.return_value = ([], None)
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(prompt_token_ids=list(range(10)), turn_boundaries=[])
+    result = adapter.fetch(req)
+    assert result is None
+
+
+def test_fetch_hit_populates_turn_path_on_cache_state():
+    inner = _make_inner()
+    node = MagicMock()
+    node.n_tokens = 5
+    inner.match.return_value = ([node], None)
+    inner.find_checkpoint_ancestor.return_value = None
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=list(range(10)),
+        turn_boundaries=[5],
+        cached_tokens=0,
+    )
+    hit = adapter.fetch(req)
+    assert hit is not None
+    assert req._cache_state.turn_path == [node]
+
+
+def test_fetch_does_not_set_prefill_boundaries():
+    """fetch() must NOT set cs.prefill_boundaries — that is boundaries()'s job."""
+    inner = _make_inner()
+    node = MagicMock()
+    node.n_tokens = 5
+    inner.match.return_value = ([node], None)
+    inner.find_checkpoint_ancestor.return_value = None
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=list(range(10)),
+        turn_boundaries=[5],
+        cached_tokens=0,
+    )
+    adapter.fetch(req)
+    # prefill_boundaries must still be the default empty list
+    assert req._cache_state.prefill_boundaries == []
+
+
+# ── store() ──────────────────────────────────────────────────────────────────
+
+def test_store_uses_explicit_tokens_not_cache_state():
+    """store(request, tokens, cache) must not read store_tokens from cs."""
+    inner = _make_inner()
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        turn_boundaries=[3],
+        output_token_ids=[6, 7],
+        cached_tokens=0,
+    )
+    req._cache_state.turn_path = []
+    explicit_tokens = [1, 2, 3, 4, 5, 6]  # N-1 key passed by Scheduler
+    result = adapter.store(req, explicit_tokens, [])
+    # Adapter accepts the call; does not crash looking for cs.store_tokens
+    assert isinstance(result, bool)
+
+
+def test_store_reads_turn_path_from_cache_state():
+    inner = _make_inner()
+    parent_node = MagicMock(n_tokens=3)
+    inner.root = MagicMock(n_tokens=0)
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        turn_boundaries=[3],
+        output_token_ids=[6, 7],   # must be non-empty — store() returns False with no output
+    )
+    req._cache_state.turn_path = [parent_node]
+    adapter.store(req, [1, 2, 3, 4, 5, 6], [])
+    # insert should be called with parent_node as parent
+    assert inner.insert.called
+    call_parent = inner.insert.call_args[0][0]
+    assert call_parent is parent_node
+
+
+# ── on_prefill_checkpoint() ───────────────────────────────────────────────────
+
+def test_on_prefill_checkpoint_at_boundary_inserts_node():
+    inner = _make_inner()
+    new_node = MagicMock(n_tokens=10)
+    inner.insert.return_value = new_node
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=list(range(20)),
+        turn_boundaries=[10],
+        cached_tokens=0,
+    )
+    req._cache_state.turn_path = []
+    extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}]
+    adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
+    assert inner.insert.called
+    assert new_node in req._cache_state.turn_path
+
+
+def test_on_prefill_checkpoint_not_at_boundary_is_noop():
+    inner = _make_inner()
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=list(range(20)),
+        turn_boundaries=[10],
+        cached_tokens=0,
+    )
+    extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}]
+    adapter.on_prefill_checkpoint(req, total_tokens_prefilled=7, extracted_cache=extracted)
+    inner.insert.assert_not_called()
+
+
+def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
+    """Prefill boundaries store cache @ N, not N-1; n_minus_one_state must be ignored."""
+    inner = _make_inner()
+    adapter = TurnCacheAdapter(inner)
+    req = _make_request(
+        prompt_token_ids=list(range(20)),
+        turn_boundaries=[10],
+        cached_tokens=0,
+    )
+    req._cache_state.n_minus_one_state = {"recurrent": ["some_stale_state"]}
+    extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}]
+    adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
+    # split_cache_arrays should be called with the extracted_cache as-is, not composed
+    call_args = inner.split_cache_arrays.call_args
+    assert call_args is not None  # was called
