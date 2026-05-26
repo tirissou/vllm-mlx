@@ -489,6 +489,8 @@ class TurnPrefixCache:
         if not hasattr(self, "_reassemble_cache_fn"):
             self._reassemble_cache_fn = reconstruct
 
+        self._rotating_kv_slots = set(rotating_kv_meta.keys())
+
         for log in logs:
             logger.debug(log)
 
@@ -504,14 +506,20 @@ class TurnPrefixCache:
             kv_slices = [n.kv_arrays for n in path if n.kv_arrays]
             if kv_slices:
                 # Each node's kv_arrays: list of per-layer ((pk,sk,bk),(pv,sv,bv)) quantized tuples.
-                # zip(*kv_slices) groups by layer; for each layer, zip(*arrs) groups by key/value;
-                # then concatenate each of the 3 components along the token axis (axis=2).
+                # Standard KV nodes store incremental tokens → concatenate across nodes.
+                # Rotating KV nodes store the full linearized buffer → use only the deepest node
+                # (each node's buffer already subsumes all earlier nodes' tokens).
+                rotating_slots = getattr(self, '_rotating_kv_slots', set())
                 kv = [
                     tuple(
-                        tuple(mx.concatenate([t[j] for t in kv_group], axis=2) for j in range(3))
+                        tuple(
+                            kv_group[-1][j] if slot_i in rotating_slots
+                            else mx.concatenate([t[j] for t in kv_group], axis=2)
+                            for j in range(3)
+                        )
                         for kv_group in zip(*arrs)
                     )
-                    for arrs in zip(*kv_slices)
+                    for slot_i, arrs in enumerate(zip(*kv_slices))
                 ]
                 n = max((kv[i][0][0].shape[2] for i in range(len(kv))))  # layer 0, q_keys, packed component, token dim
                 logger.info(f"Rebuilding KV cache... {n} tokens")
@@ -520,7 +528,6 @@ class TurnPrefixCache:
                 logger.info("Rebuilding cache... (SSM-only, no KV layers)")
             recurrent = node.recurrent_state if node.recurrent_state is not None else []
             rval = self._reassemble_cache_fn(kv, recurrent)
-            __import__('pdb').set_trace()
             logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
             return rval
 
