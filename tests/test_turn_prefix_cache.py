@@ -1170,8 +1170,6 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     req1.prompt_token_ids = sys_tokens + user_hi
     req1._turn_boundaries = [B_sys]
     req1._boundary_states = {B_sys: sys_state}
-    req1._turn_cache_path = []
-
     segs1 = TurnCacheAdapter.messages_to_segments(req1)
     parent = cache.root
     for i, segment in enumerate(segs1):
@@ -1351,7 +1349,6 @@ def test_multi_turn_conv_stored_after_turn2_new():
     req2 = MagicMock()
     req2.prompt_token_ids = sys_tokens + u1 + a1 + u2
     req2._turn_boundaries = [B_sys, B_1]
-    req2._turn_cache_path = [sys_node]
     req2._extracted_cache = _make_extracted_state(n_layers=1, n_tokens=B_1 + len(u2))
     req2.output_token_ids = [999]
     sys_node.ref_count += 1
