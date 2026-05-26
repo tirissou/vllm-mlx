@@ -27,3 +27,19 @@ Concrete changes:
 `Scheduler` loses `self.memory_aware_cache`, `self._ssd_tier`, and the eight cache coordination methods. `_schedule_waiting`'s cache section reduces to one `_prefix_cache.fetch(request)` call. `TurnPrefixCache` loses `SSDRef`, `_spill_to_ssd`, `_promote_from_ssd` — SSD-specific code has one home in `SSDOffloadedCache`.
 
 Do not re-propose `CacheOrchestrator`. The coordinator pattern adds a layer without adding depth — it would just wrap three objects that already compose correctly once the adapter is deepened.
+
+---
+
+## Addendum — 2026-05-26: Protocol deprecated in favour of `CacheManager` ABC
+
+### Context
+
+With `MemoryCacheAdapter`, `PagedCacheAdapter`, and `LegacyCacheAdapter` removed, only `TurnCacheAdapter` remains. One adapter equals a hypothetical seam, not a real one. The `PrefixCache` Protocol was earning its keep as a multi-adapter contract; with a single adapter it adds indirection without depth.
+
+### Amendment
+
+The `PrefixCache` and `SpillableCache` protocols in `kv_cache.py` are deprecated. `CacheManager` (in `prefix_cache_adapters.py`) is now the Scheduler-facing abstract base class. It declares `fetch()`, `store()`, and `boundaries()` as abstract methods and provides no-op defaults for `release()`, `get_stats()`, `clear()`, and `on_prefill_checkpoint()`.
+
+`boundaries(request) -> list[int]` is added as an `@abstractmethod`. The Scheduler calls it after `fetch()` (hit or miss) to populate `cs.prefill_boundaries`, replacing the two divergent `_turn_boundaries` reads in the old Scheduler code.
+
+The original decision — no `CacheOrchestrator` — stands. This amendment does not add a coordinator; it collapses a now-unnecessary abstraction layer.

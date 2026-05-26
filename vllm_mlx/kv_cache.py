@@ -76,7 +76,11 @@ class CacheHit:
 
 @runtime_checkable
 class PrefixCache(Protocol):
-    """Seam between Scheduler and all prefix cache backends."""
+    """DEPRECATED — use CacheManager (prefix_cache_adapters.py) instead.
+
+    Kept for SSDOffloadedCache compatibility until SpillableCache is migrated.
+    Do not introduce new usages of this protocol.
+    """
 
     def fetch(self, request) -> CacheHit | None: ...
     def store(self, request, cache: list) -> bool: ...
@@ -125,11 +129,7 @@ class CacheDiskStore(Protocol):
 
 @runtime_checkable
 class SpillableCache(PrefixCache, Protocol):
-    """PrefixCache that can delegate array storage to an external durable store.
-
-    Implemented by MemoryAwarePrefixCache (full eviction) and TurnPrefixCache
-    (intra-cache spilling). See CONTEXT.md for the distinction.
-    """
+    """DEPRECATED — see PrefixCache deprecation notice above."""
 
     def set_spill_delegate(
         self,
