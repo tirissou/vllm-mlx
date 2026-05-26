@@ -239,35 +239,7 @@ def test_request_cache_state_is_single_attribute():
 
 
 from vllm_mlx.scheduler import _build_prefix_cache, SchedulerConfig
-from vllm_mlx.ssd_offloaded_cache import SSDOffloadedCache
 from unittest.mock import MagicMock
-import tempfile
-
-
-class TestBuildPrefixCacheSSDWiring:
-    def test_no_ssd_does_not_wrap_with_ssd_offloaded_cache(self):
-        config = SchedulerConfig(
-            enable_prefix_cache=True,
-            use_memory_aware_cache=True,
-            ssd_cache_dir=None,
-        )
-        model = MagicMock()
-        model.layers = [MagicMock()] * 4
-        bundle = _build_prefix_cache(config, model)
-        assert not isinstance(bundle.adapter, SSDOffloadedCache)
-
-    def test_with_ssd_wraps_adapter_with_ssd_offloaded_cache(self):
-        with tempfile.TemporaryDirectory() as ssd_dir:
-            config = SchedulerConfig(
-                enable_prefix_cache=True,
-                use_memory_aware_cache=True,
-                ssd_cache_dir=ssd_dir,
-            )
-            model = MagicMock()
-            model.layers = [MagicMock()] * 4
-            bundle = _build_prefix_cache(config, model)
-            assert isinstance(bundle.adapter, SSDOffloadedCache)
-            bundle.adapter.close()
 
 
 def _make_mock_request_with_cache_state(n_minus_one_state=None):

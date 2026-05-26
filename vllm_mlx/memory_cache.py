@@ -1175,7 +1175,7 @@ class MemoryAwarePrefixCache:
     def on_prefill_checkpoint(
         self, request: Any, processed_tokens: int, extracted_cache: list
     ) -> None:
-        """No-op: mid-prefill checkpointing is handled by MemoryCacheAdapter."""
+        """No-op: mid-prefill checkpointing is handled by the cache adapter layer."""
 
     def check_ssd(self, tokens: list[int]) -> dict | None:
         """Check if tokens have an SSD cache hit (without reading data).

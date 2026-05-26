@@ -7,6 +7,7 @@ from vllm_mlx.turn_prefix_cache import (
     Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, TurnPrefixCache, _context_hash, _node_data_bytes,
     _quantize_kv, _dequantize_kv, _quantize_recurrent, _dequantize_recurrent,
 )
+from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
 
 
 def seg(token_ids, role="user"):
@@ -858,8 +859,8 @@ def test_messages_to_segments_uses_turn_boundaries():
     req1 = _make_request_with_boundaries(sys_tokens + user_tokens_hi, [B_sys])
     req2 = _make_request_with_boundaries(sys_tokens + user_tokens_yo, [B_sys])
 
-    segs1 = sched._messages_to_segments(req1)
-    segs2 = sched._messages_to_segments(req2)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
 
     # Both produce two segments
     assert len(segs1) == 2
@@ -890,14 +891,14 @@ def test_cross_session_hit_via_turn_boundaries():
 
     # Session 1 store: insert sys segment + user-hi segment
     req1 = _make_request_with_boundaries(sys_tokens + user_hi, [B_sys])
-    segs1 = sched._messages_to_segments(req1)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
     assert len(segs1) == 2
     n_sys = cache.insert(cache.root, segs1[0], [], [], None, is_system_prompt=True)
     cache.insert(n_sys, segs1[1], [], [], None)
 
     # Session 2 fetch: same system prompt, different user message
     req2 = _make_request_with_boundaries(sys_tokens + user_yo, [B_sys])
-    segs2 = sched._messages_to_segments(req2)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
     path, _ = cache.match(segs2)
 
     # Must hit the system-prompt segment
@@ -1039,7 +1040,7 @@ def test_fetch_reconstructs_dict_state_into_prompt_cache():
     req._turn_boundaries = [B_sys]
     req.request_id = "test-fetch"
 
-    segments = sched._messages_to_segments(req)
+    segments = TurnCacheAdapter.messages_to_segments(req)
     path, has_recurrent = cache.match(segments)
     assert path, "Expected a trie match on sys_tokens"
 
@@ -1171,7 +1172,7 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     req1._boundary_states = {B_sys: sys_state}
     req1._turn_cache_path = []
 
-    segs1 = sched._messages_to_segments(req1)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
     parent = cache.root
     for i, segment in enumerate(segs1):
         is_sys = segment.role == "system" and i == 0
@@ -1184,7 +1185,7 @@ def test_cross_session_system_prompt_cache_hit_with_real_state():
     req2._turn_boundaries = [B_sys]
     req2.request_id = "session2"
 
-    segs2 = sched._messages_to_segments(req2)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
     path, has_recurrent = cache.match(segs2)
 
     assert path, "Expected HIT on system segment"
@@ -1228,9 +1229,9 @@ def test_segment1_tokens_stable_across_turns_new():
     B_2 = B_1 + len(u2) + len(a2)
     req3 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2])
 
-    segs1 = sched._messages_to_segments(req1)
-    segs2 = sched._messages_to_segments(req2)
-    segs3 = sched._messages_to_segments(req3)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
+    segs3 = TurnCacheAdapter.messages_to_segments(req3)
 
     assert segs1[0].token_ids == sys_tokens
     assert segs2[0].token_ids == sys_tokens
@@ -1260,7 +1261,7 @@ def test_multi_turn_sys_hit_each_turn_new():
 
     # Turn 1 store
     req1 = _make_request_with_boundaries(sys_tokens + u1, [B_sys])
-    segs1 = sched._messages_to_segments(req1)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
     assert len(segs1) == 2
     sys_state = _make_extracted_state(n_layers=1, n_tokens=B_sys)
     sys_node = cache.insert(cache.root, segs1[0], [], [], sys_state, is_system_prompt=True)
@@ -1269,7 +1270,7 @@ def test_multi_turn_sys_hit_each_turn_new():
     # Turn 2 fetch: sys hit
     B_1 = B_sys + len(u1) + len(a1)
     req2 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2, [B_sys, B_1])
-    segs2 = sched._messages_to_segments(req2)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
     assert len(segs2) == 3
     path2, _ = cache.match(segs2)
     assert len(path2) >= 1
@@ -1280,7 +1281,7 @@ def test_multi_turn_sys_hit_each_turn_new():
     # Turn 3 fetch: sys hit
     B_2 = B_1 + len(u2) + len(a2)
     req3 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2])
-    segs3 = sched._messages_to_segments(req3)
+    segs3 = TurnCacheAdapter.messages_to_segments(req3)
     assert len(segs3) == 4
     path3, _ = cache.match(segs3)
     assert len(path3) >= 1
@@ -1305,8 +1306,8 @@ def test_conv_segment_grows_each_turn_new():
     req2 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2, [B_sys, B_1])
     req3 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2])
 
-    segs2 = sched._messages_to_segments(req2)
-    segs3 = sched._messages_to_segments(req3)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
+    segs3 = TurnCacheAdapter.messages_to_segments(req3)
 
     # Turn 2: [sys, conv, user]
     # Turn 3: [sys, conv, conv, user]
@@ -1341,7 +1342,7 @@ def test_multi_turn_conv_stored_after_turn2_new():
     # Turn 1 store
     sys_state = _make_extracted_state(n_layers=1, n_tokens=B_sys)
     req1 = _make_request_with_boundaries(sys_tokens + u1, [B_sys])
-    segs1 = sched._messages_to_segments(req1)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
     sys_node = cache.insert(cache.root, segs1[0], [], [], sys_state, is_system_prompt=True)
     cache.insert(sys_node, segs1[1], [], [], None)
 
@@ -1355,7 +1356,7 @@ def test_multi_turn_conv_stored_after_turn2_new():
     req2.output_token_ids = [999]
     sys_node.ref_count += 1
 
-    segs2 = sched._messages_to_segments(req2)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
     assert len(segs2) == 3
 
     matched_depth = 1
@@ -1388,7 +1389,7 @@ def test_multi_turn_conv_stored_after_turn2_new():
 
     # Cross-session turn-2: 3-deep HIT
     req_cross2 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2, [B_sys, B_1])
-    segs_cross2 = sched._messages_to_segments(req_cross2)
+    segs_cross2 = TurnCacheAdapter.messages_to_segments(req_cross2)
     path_cross2, _ = cache.match(segs_cross2)
     assert len(path_cross2) == 3
     assert path_cross2[1] is conv_node
@@ -1630,7 +1631,7 @@ def test_messages_to_segments_new_single_turn():
         prompt_token_ids=list(range(15)),
         turn_boundaries=[10],  # B_sys = 10
     )
-    segs = sched._messages_to_segments(req)
+    segs = TurnCacheAdapter.messages_to_segments(req)
 
     assert len(segs) == 2, f"Expected 2 segments, got {len(segs)}"
     assert segs[0].role == "system"
@@ -1649,7 +1650,7 @@ def test_messages_to_segments_new_two_boundaries():
         prompt_token_ids=list(range(20)),
         turn_boundaries=[10, 15],  # B_sys=10, B_1=15
     )
-    segs = sched._messages_to_segments(req)
+    segs = TurnCacheAdapter.messages_to_segments(req)
 
     assert len(segs) == 3, f"Expected 3 segments, got {len(segs)}"
     assert segs[0].role == "system"
@@ -1669,7 +1670,7 @@ def test_messages_to_segments_new_no_boundaries():
         prompt_token_ids=list(range(10)),
         turn_boundaries=[],
     )
-    segs = sched._messages_to_segments(req)
+    segs = TurnCacheAdapter.messages_to_segments(req)
 
     assert segs == []
 
@@ -1683,7 +1684,7 @@ def test_messages_to_segments_new_boundary_at_end():
         prompt_token_ids=list(range(10)),
         turn_boundaries=[10],  # B_sys == len(full_tokens)
     )
-    segs = sched._messages_to_segments(req)
+    segs = TurnCacheAdapter.messages_to_segments(req)
 
     assert segs == []
 
@@ -1698,7 +1699,7 @@ def test_messages_to_segments_new_three_boundaries():
         prompt_token_ids=list(range(20)),
         turn_boundaries=[5, 10, 15],  # B_sys=5, B_1=10, B_2=15
     )
-    segs = sched._messages_to_segments(req)
+    segs = TurnCacheAdapter.messages_to_segments(req)
 
     assert len(segs) == 4, f"Expected 4 segments, got {len(segs)}"
     assert segs[0].role == "system"
@@ -1729,8 +1730,8 @@ def test_messages_to_segments_new_sys_stable():
         turn_boundaries=[10],  # Same B_sys
     )
 
-    segs1 = sched._messages_to_segments(req1)
-    segs2 = sched._messages_to_segments(req2)
+    segs1 = TurnCacheAdapter.messages_to_segments(req1)
+    segs2 = TurnCacheAdapter.messages_to_segments(req2)
 
     assert len(segs1) == 2
     assert len(segs2) == 2
@@ -1748,6 +1749,7 @@ def test_messages_to_segments_new_sys_stable():
 def test_mid_prefill_eagerly_inserts_turn_at_boundary():
     """_make_mid_prefill_save_callback eagerly inserts the turn into the trie at boundary."""
     from unittest.mock import MagicMock, patch
+    from vllm_mlx.kv_cache import RequestCacheState
 
     sched = _make_minimal_scheduler_new()
     callback = sched._make_mid_prefill_save_callback(save_interval=512)
@@ -1760,6 +1762,7 @@ def test_mid_prefill_eagerly_inserts_turn_at_boundary():
     req.prompt_token_ids = list(range(100))  # 100 tokens; B_sys=50 → sys=[0-49], user=[50-99]
     req._turn_boundaries = [50]
     req._mid_prefill_last_save = 0
+    req._cache_state = RequestCacheState()
 
     sched.requests["test-1"] = req
     sched.uid_to_request_id[123] = "test-1"
@@ -1770,13 +1773,13 @@ def test_mid_prefill_eagerly_inserts_turn_at_boundary():
 
     # System turn eagerly inserted into trie
     assert len(sched.turn_cache.root.children) == 1
-    assert hasattr(req, "_turn_cache_path")
-    assert len(req._turn_cache_path) == 1
+    assert len(req._cache_state.turn_path) == 1
 
 
 def test_mid_prefill_does_not_insert_away_from_boundary():
     """Callback does nothing when processed position is not a turn boundary."""
     from unittest.mock import MagicMock, patch
+    from vllm_mlx.kv_cache import RequestCacheState
 
     sched = _make_minimal_scheduler_new()
     callback = sched._make_mid_prefill_save_callback(save_interval=512)
@@ -1789,6 +1792,7 @@ def test_mid_prefill_does_not_insert_away_from_boundary():
     req.prompt_token_ids = list(range(100))
     req._turn_boundaries = [50]  # boundary at 50, not at 30
     req._mid_prefill_last_save = 0
+    req._cache_state = RequestCacheState()
 
     sched.requests["test-2"] = req
     sched.uid_to_request_id[124] = "test-2"
@@ -1798,12 +1802,13 @@ def test_mid_prefill_does_not_insert_away_from_boundary():
         callback(124, 30, MagicMock())  # total=30, not in [50] → no insert
 
     assert len(sched.turn_cache.root.children) == 0
-    assert not getattr(req, "_turn_cache_path", None)
+    assert req._cache_state.turn_path == []
 
 
 def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
     """Callback inserts all turn nodes in sequence at each boundary."""
     from unittest.mock import MagicMock, patch
+    from vllm_mlx.kv_cache import RequestCacheState
 
     sched = _make_minimal_scheduler_new()
     callback = sched._make_mid_prefill_save_callback(save_interval=512)
@@ -1817,6 +1822,7 @@ def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
     req.prompt_token_ids = list(range(200))
     req._turn_boundaries = [50, 100, 150]
     req._mid_prefill_last_save = 0
+    req._cache_state = RequestCacheState()
 
     sched.requests["test-3"] = req
     sched.uid_to_request_id[125] = "test-3"
@@ -1827,7 +1833,7 @@ def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
             callback(125, boundary, MagicMock())
 
     # Three turns inserted, chained: root → sys → conv1 → conv2
-    assert len(req._turn_cache_path) == 3
+    assert len(req._cache_state.turn_path) == 3
     root_children = sched.turn_cache.root.children
     assert len(root_children) == 1
     sys_node = list(root_children.values())[0]
@@ -1836,8 +1842,8 @@ def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
     assert len(conv1_node.children) == 1
 
 
-def test_store_side_uses_adapter_state_from_eager_insertion():
-    """store() uses pre-populated adapter_state from eager prefill insertion."""
+def test_store_side_uses_turn_path_from_eager_insertion():
+    """store() uses pre-populated turn_path from eager prefill insertion."""
     from unittest.mock import MagicMock
     from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
     from vllm_mlx.kv_cache import RequestCacheState
@@ -1853,13 +1859,13 @@ def test_store_side_uses_adapter_state_from_eager_insertion():
     # Simulate eager insertion: sys node already in trie via on_prefill_checkpoint
     sys_state = _make_extracted_state(n_layers=2, n_tokens=10)
     sys_seg = Segment(role="system", token_ids=sys_tokens)
-    kv, recur = cache._split_cache_arrays(sys_state, 0)
+    kv, recur = cache.split_cache_arrays(sys_state, 0)
     sys_node = cache.insert(cache.root, sys_seg, kv, None, recur, is_system_prompt=True)
 
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + user_tokens
     req._turn_boundaries = [B_sys]
-    req._cache_state = RequestCacheState(cached_tokens=0, adapter_state=[sys_node])
+    req._cache_state = RequestCacheState(cached_tokens=0, turn_path=[sys_node])
     req.output_token_ids = [500, 501]
 
     final_state = _make_extracted_state(n_layers=2, n_tokens=15)
@@ -1893,17 +1899,17 @@ def test_store_side_two_turn_with_eager_insertion():
     conv_state = _make_extracted_state(n_layers=1, n_tokens=25)
 
     sys_seg = Segment(role="system", token_ids=sys_tokens)
-    kv_sys, recur_sys = cache._split_cache_arrays(sys_state, 0)
+    kv_sys, recur_sys = cache.split_cache_arrays(sys_state, 0)
     sys_node = cache.insert(cache.root, sys_seg, kv_sys, None, recur_sys, is_system_prompt=True)
 
     conv_seg = Segment(role="conversation", token_ids=conv_tokens)
-    kv_conv, recur_conv = cache._split_cache_arrays(conv_state, sys_node.n_tokens)
+    kv_conv, recur_conv = cache.split_cache_arrays(conv_state, sys_node.n_tokens)
     conv_node = cache.insert(sys_node, conv_seg, kv_conv, None, recur_conv)
 
     req = MagicMock()
     req.prompt_token_ids = sys_tokens + conv_tokens + user_tokens
     req._turn_boundaries = [B_sys, B_1]
-    req._cache_state = RequestCacheState(cached_tokens=0, adapter_state=[sys_node, conv_node])
+    req._cache_state = RequestCacheState(cached_tokens=0, turn_path=[sys_node, conv_node])
     req.output_token_ids = [999]
 
     final_state = _make_extracted_state(n_layers=1, n_tokens=27)
@@ -1996,7 +2002,7 @@ def test_split_cache_arrays_produces_quantized_tuples():
     """_split_cache_arrays should quantize bf16 KV slices into int4 (packed, scales, biases) 3-tuples."""
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    kv, _ = cache._split_cache_arrays(extracted, offset=0)
+    kv, _ = cache.split_cache_arrays(extracted, offset=0)
 
     assert len(kv) == 2  # 2 layers
     for layer_kv in kv:
@@ -2013,7 +2019,7 @@ def test_split_cache_arrays_respects_offset():
     """KV delta should only include tokens from offset to actual_end."""
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     extracted = _make_bf16_kvcache_extracted(n_layers=1, n_tokens=10)
-    kv, _ = cache._split_cache_arrays(extracted, offset=5)
+    kv, _ = cache.split_cache_arrays(extracted, offset=5)
 
     packed = kv[0][0][0]  # layer 0, q_keys, packed component
     assert packed.shape[2] == 5  # 10 - 5 = 5 tokens
@@ -2024,7 +2030,7 @@ def test_split_cache_arrays_uses_quantized_kvcache_class_ref():
     from mlx_lm.models.cache import QuantizedKVCache
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    kv, recurrent = cache._split_cache_arrays(extracted, offset=0)
+    kv, recurrent = cache.split_cache_arrays(extracted, offset=0)
 
     result = cache._reassemble_cache_fn(kv, recurrent)
     kv_layers = [d for d in result if "KVCache" in d["class_name"]]
@@ -2041,7 +2047,7 @@ def test_reconstruct_cache_from_quantized_state_gives_quantized_kvcache():
 
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     extracted = _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10)
-    kv, recurrent = cache._split_cache_arrays(extracted, offset=0)
+    kv, recurrent = cache.split_cache_arrays(extracted, offset=0)
     raw_state = cache._reassemble_cache_fn(kv, recurrent)
 
     prompt_cache = reconstruct_cache_from_states(raw_state)

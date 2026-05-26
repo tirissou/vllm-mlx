@@ -529,12 +529,7 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
     Encapsulates the four-way selection (paged / memory-aware / turn / legacy)
     so that Scheduler.__init__ is not responsible for cache-backend wiring.
     """
-    from .prefix_cache_adapters import (
-        LegacyCacheAdapter,
-        MemoryCacheAdapter,
-        PagedCacheAdapter,
-        TurnCacheAdapter,
-    )
+    from .prefix_cache_adapters import TurnCacheAdapter
 
     bundle = _PrefixCacheBundle()
 
@@ -549,10 +544,10 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
         )
         bundle.paged_cache_manager = paged_cache_manager
         bundle.block_aware_cache = block_aware_cache
-        bundle.adapter = PagedCacheAdapter(block_aware_cache)
-        logger.info(
-            f"Paged cache enabled: block_size={config.paged_cache_block_size}, "
-            f"max_blocks={config.max_cache_blocks}"
+        bundle.adapter = None
+        logger.warning(
+            "Paged cache is no longer supported; disabling prefix caching. "
+            f"(block_size={config.paged_cache_block_size}, max_blocks={config.max_cache_blocks})"
         )
 
     elif config.use_memory_aware_cache and not config.use_turn_cache:
@@ -566,44 +561,11 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
         )
         memory_aware_cache = MemoryAwarePrefixCache(model=model, config=cache_config)
         bundle.memory_aware_cache = memory_aware_cache
-        bundle.adapter = MemoryCacheAdapter(
-            memory_aware_cache,
-            mid_prefill_save_interval=config.mid_prefill_save_interval,
+        bundle.adapter = None
+        logger.warning(
+            "Memory-aware cache is no longer supported; disabling prefix caching. "
+            f"(limit would have been {memory_aware_cache.memory_limit_mb:.1f}MB)"
         )
-        logger.info(
-            f"Memory-aware cache enabled: "
-            f"limit={memory_aware_cache.memory_limit_mb:.1f}MB"
-        )
-
-        if config.ssd_cache_dir is not None:
-            ssd_config = SSDCacheConfig(
-                cache_dir=config.ssd_cache_dir,
-                max_size_gb=config.ssd_cache_max_gb,
-            )
-            ssd_tier = SSDCacheTier(ssd_config)
-            ssd_tier.start_writer()
-            ssd_tier.reconcile()
-            memory_aware_cache.set_ssd_tier(ssd_tier)
-            bundle.ssd_tier = ssd_tier
-            logger.info(
-                f"SSD cache tier enabled: dir={config.ssd_cache_dir}, "
-                f"max={config.ssd_cache_max_gb}GB"
-            )
-            from .ssd_offloaded_cache import SSDOffloadedCache
-            from .ssd_cache import FilesystemCacheDiskStore
-            disk_store = FilesystemCacheDiskStore(cache_dir=config.ssd_cache_dir)
-            bundle.adapter = SSDOffloadedCache(bundle.adapter, disk_store)
-            bundle.adapter.start()
-            bundle.ssd_offloaded_cache = bundle.adapter
-            # SSDOffloadedCache owns SSD I/O via FilesystemCacheDiskStore.
-            # Close the SSDCacheTier (stops its writer thread, closes SQLite) and
-            # clear the reference so the scheduler's close_ssd_tier path stays clean.
-            ssd_tier.close()
-            bundle.ssd_tier = None
-            # Clear _ssd_tier on the inner MemoryAwarePrefixCache — evictions now go
-            # through the SSDOffloadedCache delegate, not the old SSDCacheTier path.
-            if hasattr(memory_aware_cache, '_ssd_tier'):
-                memory_aware_cache._ssd_tier = None
 
     elif config.use_turn_cache:
         from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
@@ -625,9 +587,9 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             max_entries=config.prefix_cache_size,
         )
         bundle.prefix_cache = prefix_cache
-        bundle.adapter = LegacyCacheAdapter(prefix_cache)
+        bundle.adapter = None
         logger.info(
-            f"Prefix cache enabled with max_entries={config.prefix_cache_size}"
+            f"Legacy prefix cache disabled; no caching (max_entries={config.prefix_cache_size})"
         )
 
     return bundle
@@ -1998,8 +1960,4 @@ class Scheduler:
                 total = (request._cache_state.cached_tokens or 0) + processed
                 self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
 
-    def _messages_to_segments(self, request):
-        """Delegates to TurnCacheAdapter.messages_to_segments (kept for existing tests)."""
-        from .prefix_cache_adapters import TurnCacheAdapter
-        return TurnCacheAdapter.messages_to_segments(request)
 

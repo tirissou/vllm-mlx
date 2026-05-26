@@ -90,8 +90,7 @@ class PrefixCache(Protocol):
 
         extracted_cache is a list of dicts as returned by
         Scheduler._extract_cache_states(). Most adapters implement this as
-        a no-op; MemoryCacheAdapter stores prefix entries, TurnCacheAdapter
-        captures boundary states.
+        a no-op; TurnCacheAdapter captures boundary states.
         """
         ...
 
