@@ -359,7 +359,7 @@ class TestCacheManagerNMinusOne:
             "class_ref": None,
         }
         req = _make_mock_request_with_cache_state(
-            n_minus_one_state={"rotating": [], "recurrent": None}
+            n_minus_one_state={"recurrent": None}
         )
         result = adapter._reconstruct(req, [kv_state])
         assert result[0]["meta_state"][0] == "4"
@@ -381,7 +381,7 @@ class TestCacheManagerNMinusOne:
             "class_ref": None,
         }
         req = _make_mock_request_with_cache_state(
-            n_minus_one_state={"rotating": [], "recurrent": None}
+            n_minus_one_state={"recurrent": None}
         )
         result = adapter._reconstruct(req, [kv_state])
         assert int(result[0]["meta_state"][0]) == 0
