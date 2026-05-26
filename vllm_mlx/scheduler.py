@@ -886,7 +886,8 @@ class Scheduler:
                 return
             extracted = extract_cache_states(prompt_cache)
             if extracted:
-                self._prefix_cache.on_prefill_checkpoint(request, processed_tokens, extracted)
+                total = (request._cache_state.cached_tokens or 0) + processed_tokens
+                self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
         return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:
@@ -1066,10 +1067,10 @@ class Scheduler:
             # Release cache references so Metal buffers can be freed
             request._cache_state.cache = None
             request._cache_state.decoded_cache = None
-            turn_path = getattr(request._cache_state, "adapter_state", None)
-            if turn_path and self.turn_cache is not None:
-                self.turn_cache.release(turn_path)
-                request._cache_state.adapter_state = []
+            turn_path = request._cache_state.turn_path
+            if turn_path and self._prefix_cache is not None:
+                self._prefix_cache.release(turn_path)
+                request._cache_state.turn_path = []
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -1118,7 +1119,7 @@ class Scheduler:
                     request._cache_state.cache = hit.cache
                     request._cache_state.cached_tokens = hit.cached_tokens
                     request._cache_state.remaining_tokens = hit.remaining_tokens
-                    request._cache_state.prefill_boundaries = hit.prefill_boundaries
+                    request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
                     self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
                     logger.info(
                         f"[cache_fetch] request={request.request_id[:12]} HIT "
@@ -1127,7 +1128,7 @@ class Scheduler:
                 else:
                     request._cache_state.hit_type = "miss"
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = list(getattr(request, "_turn_boundaries", []))
+                    request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
                     self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
                     logger.info(
                         f"[cache_fetch] request={request.request_id[:12]} MISS "
@@ -1241,7 +1242,7 @@ class Scheduler:
                     request._cache_state.cache = None
                     request._cache_state.cached_tokens = 0
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = list(getattr(request, "_turn_boundaries", []))
+                    request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
                     tokens_to_process = request.prompt_token_ids
                     segments = _split_at_boundaries(tokens_to_process, request._cache_state.prefill_boundaries)
                     use_segments = len(segments) > 1
@@ -1418,7 +1419,6 @@ class Scheduler:
                         _full_tokens = (
                             list(request.prompt_token_ids) + list(request.output_token_ids)
                         )
-                        request._cache_state.store_tokens = _full_tokens[:-1]  # N-1 key
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
@@ -1440,22 +1440,19 @@ class Scheduler:
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids and self._prefix_cache is not None:
                 _store_cache = request._cache_state.decoded_cache
-                if _store_cache is not None:
-                    # Preserve N-1 key set by _process_batch_responses; fall back to full N
-                    if not request._cache_state.store_tokens:
-                        request._cache_state.store_tokens = (
-                            list(request.prompt_token_ids) + list(request.output_token_ids)
-                        )
+                if _store_cache:
+                    _full_tokens = list(request.prompt_token_ids) + list(request.output_token_ids)
+                    _store_tokens = _full_tokens[:-1]  # N-1 key; matches compose_n_minus_1_cache
                     try:
-                        self._prefix_cache.store(request, _store_cache)
+                        self._prefix_cache.store(request, _store_tokens, _store_cache)
                     except Exception as e:
                         logger.debug(f"[cache_store] store failed for {request_id}: {e}")
-                _handle = request._cache_state.adapter_state
+                _handle = request._cache_state.turn_path
                 try:
                     self._prefix_cache.release(_handle)
                 except Exception as e:
                     logger.debug(f"[cache_store] release failed for {request_id}: {e}")
-                request._cache_state.adapter_state = []
+                request._cache_state.turn_path = []
 
             # Evaluate stored cache tensors incrementally (per-layer) to prevent
             # a deferred batch evaluation spike when all lazy ops resolve at once.
@@ -1998,9 +1995,8 @@ class Scheduler:
             per_uid_cache = pb.extract_cache(idx)
             extracted = extract_cache_states(per_uid_cache)
             if extracted:
-                self._prefix_cache.on_prefill_checkpoint(
-                    request, processed, extracted
-                )
+                total = (request._cache_state.cached_tokens or 0) + processed
+                self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
 
     def _messages_to_segments(self, request):
         """Delegates to TurnCacheAdapter.messages_to_segments (kept for existing tests)."""
