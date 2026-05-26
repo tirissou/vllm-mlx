@@ -1,7 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # tests/test_prefix_cache_adapters.py
+import inspect
+from abc import ABC
+
 from vllm_mlx.kv_cache import RequestCacheState
 from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+
+
+def test_cache_manager_is_abstract():
+    from vllm_mlx.prefix_cache_adapters import CacheManager
+    assert issubclass(CacheManager, ABC)
+
+
+def test_cache_manager_abstract_methods():
+    from vllm_mlx.prefix_cache_adapters import CacheManager
+    abstract = {
+        name for name, val in inspect.getmembers(CacheManager)
+        if getattr(val, "__isabstractmethod__", False)
+    }
+    assert "boundaries" in abstract
+    assert "fetch" in abstract
+    assert "store" in abstract
+
+
+def test_cache_manager_cannot_be_instantiated():
+    from vllm_mlx.prefix_cache_adapters import CacheManager
+    try:
+        CacheManager()
+        assert False, "Expected TypeError"
+    except TypeError:
+        pass
 
 
 def test_request_cache_state_defaults():
@@ -42,7 +70,7 @@ def test_turn_cache_adapter_store_returns_true_on_success():
     """store() must return True now — the old stub returned False."""
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
-    inner._split_cache_arrays.return_value = ([], None)
+    inner.split_cache_arrays.return_value = ([], None)
     inner.insert.return_value = MagicMock(n_tokens=5)
 
     adapter = TurnCacheAdapter(inner)
@@ -60,7 +88,7 @@ def test_turn_cache_adapter_store_calls_inner_insert():
     """store() must call inner.insert() to build the trie node."""
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
-    inner._split_cache_arrays.return_value = ([], None)
+    inner.split_cache_arrays.return_value = ([], None)
     inner.insert.return_value = MagicMock(n_tokens=0)
 
     adapter = TurnCacheAdapter(inner)
@@ -105,7 +133,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
     new_node = MagicMock(n_tokens=5)
-    inner._split_cache_arrays.return_value = ([], None)
+    inner.split_cache_arrays.return_value = ([], None)
     inner.insert.return_value = new_node
     adapter = TurnCacheAdapter(inner)
 
@@ -127,7 +155,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
     from vllm_mlx.kv_cache import RequestCacheState
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
-    inner._split_cache_arrays.return_value = ([], None)
+    inner.split_cache_arrays.return_value = ([], None)
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
