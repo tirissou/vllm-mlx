@@ -71,27 +71,33 @@ def update_n_minus_one(self, request: Any, prompt_cache: list, uid_idx: int) -> 
 
 ---
 
-### `prefix_cache_adapters.py` — `TurnCacheAdapter`
+### `prefix_cache_adapters.py` — `CacheManager` (new base class)
 
-**Instance state:**
+A mixin base class providing N-1 tracking machinery. All adapters inherit from it. It does **not** implement the full `PrefixCache` protocol — `fetch`, `store`, `release`, `get_stats`, `clear`, and `on_prefill_checkpoint` remain adapter-specific.
+
+```
+CacheManager                  # N-1 tracking machinery only
+    ├── MemoryCacheAdapter    # implements full PrefixCache
+    ├── TurnCacheAdapter      # implements full PrefixCache, overrides update_n_minus_one
+    ├── PagedCacheAdapter     # implements full PrefixCache
+    └── LegacyCacheAdapter    # implements full PrefixCache
+```
+
+**Instance state (on `CacheManager`):**
 ```python
 self._cache_index_map: CacheIndexMap | None = None
 ```
 Shared across all requests. Built lazily on first call to either `update_n_minus_one` or `store()`.
 
-**`_ensure_cache_index_map(self, layers: list) -> CacheIndexMap`** (private):
+**`_ensure_cache_index_map(self, layers: list) -> CacheIndexMap`** (on `CacheManager`):
 - Accepts either live `prompt_cache` objects (from `update_n_minus_one`) or extracted state dicts (from `store()`) — both carry sufficient type information (`class_name` on dicts, `isinstance` checks on live objects)
 - Classifies indices into `kv_indices`, `rotating_indices`, `recurrent_indices`
 - Stores result in `self._cache_index_map` on first call; returns immediately on subsequent calls
 
-**`update_n_minus_one(self, request, prompt_cache, uid_idx)`:**
-1. Calls `_ensure_cache_index_map(prompt_cache)`
-2. If `_cache_state.n_minus_one_state` is None, initialises shadow `RotatingKVCache` instances (one per rotating layer, same `max_size`/`keep` as live instances)
-3. **RotatingKV layers:** reads K/V from the live instance at position `_idx - 1` (the slot written at the previous decode step, before this step's `next()` call overwrites it), writes into shadow instance via `_update_in_place` — O(1) per layer
-4. **Recurrent layers:** saves Python refs to current `ArraysCache.cache` lists into `_cache_state.n_minus_one_state`
-5. **Standard KV layers:** skip
+**`update_n_minus_one(self, request, prompt_cache, uid_idx) -> None`** (on `CacheManager`, default no-op):
+- `MemoryCacheAdapter`, `PagedCacheAdapter`, `LegacyCacheAdapter` inherit this default
 
-**`_reconstruct(self, request, prompt_cache) -> list`** (private):
+**`_reconstruct(self, request, prompt_cache) -> list`** (on `CacheManager`):
 - Uses `self._cache_index_map` to interleave sources back into original layer order:
   - KV positions: extracted from `prompt_cache` with `offset − 1`
   - Rotating positions: extracted from shadow instances in `_cache_state.n_minus_one_state`
@@ -99,12 +105,21 @@ Shared across all requests. Built lazily on first call to either `update_n_minus
 - Returns complete N-1 cache list in original layer order, ready for `_split_cache_arrays`
 - Replaces `compose_n_minus_1_cache`
 
+---
+
+### `prefix_cache_adapters.py` — `TurnCacheAdapter`
+
+Overrides `update_n_minus_one`:
+1. Calls `_ensure_cache_index_map(prompt_cache)`
+2. If `_cache_state.n_minus_one_state` is None, initialises shadow `RotatingKVCache` instances (one per rotating layer, same `max_size`/`keep` as live instances)
+3. **RotatingKV layers:** reads K/V from the live instance at position `_idx - 1` (the slot written at the previous decode step, before this step's `next()` call overwrites it), writes into shadow instance via `_update_in_place` — O(1) per layer
+4. **Recurrent layers:** saves Python refs to current `ArraysCache.cache` lists into `_cache_state.n_minus_one_state`
+5. **Standard KV layers:** skip
+
 **`store(request, cache)`:**
 - Calls `_ensure_cache_index_map(cache)` using the extracted state dicts (in case `update_n_minus_one` was never called, e.g. prefill-only requests)
 - If `_cache_state.n_minus_one_state` is None (no decode steps occurred), skips `_reconstruct` and stores `cache` as-is — prefill-only requests are already at the correct N-1 via `insert_segments`
 - Otherwise calls `_reconstruct` to get N-1 cache instead of `compose_n_minus_1_cache`
-
-**Other adapters** (`MemoryCacheAdapter`, `PagedCacheAdapter`, `LegacyCacheAdapter`): implement `update_n_minus_one` as a no-op pass-through.
 
 ---
 
