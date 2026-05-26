@@ -6,12 +6,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 from .kv_cache import CacheHit, PrefixCache
-
-# logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
 
 
 class CacheManager:
@@ -69,7 +67,7 @@ class CacheManager:
         """Build N-1 state dict list from extracted N-state and per-step tracking.
 
         Replaces compose_n_minus_1_cache. Returns a list of state dicts in
-        original layer order, ready for TurnPrefixCache._split_cache_arrays.
+        original layer order, ready for TurnPrefixCache.split_cache_arrays.
         """
         from .kv_cache import extract_layer_state
 
@@ -89,18 +87,9 @@ class CacheManager:
             else:
                 result[i] = layer
 
-        # RotatingKV: use shadow instances
-        shadows = n_minus_one["rotating"] if n_minus_one else []
-        for shadow_idx, layer_idx in enumerate(idx_map.rotating_indices):
-            if shadow_idx < len(shadows):
-                shadow = shadows[shadow_idx]
-                state_dict = extract_layer_state(shadow)
-                if state_dict is not None:
-                    result[layer_idx] = state_dict
-                else:
-                    result[layer_idx] = extracted_cache[layer_idx]
-            else:
-                result[layer_idx] = extracted_cache[layer_idx]
+        # RotatingKV: tag with trim_last — split_cache_arrays linearises then drops last token
+        for layer_idx in idx_map.rotating_indices:
+            result[layer_idx] = {**extracted_cache[layer_idx], "trim_last": True}
 
         # Recurrent: use saved ArraysCache refs
         saved_recurrent = (n_minus_one or {}).get("recurrent") or []
@@ -116,87 +105,6 @@ class CacheManager:
                 result[layer_idx] = extracted_cache[layer_idx]
 
         return result
-
-
-class MemoryCacheAdapter(CacheManager):
-    """Adapts MemoryAwarePrefixCache to the PrefixCache / PersistableCache protocol."""
-
-    def __init__(self, inner, mid_prefill_save_interval: int = 0):
-        self._inner = inner
-        self._save_interval = mid_prefill_save_interval
-
-    def fetch(self, request) -> CacheHit | None:
-        tokens = list(request.prompt_token_ids)
-        cache, remaining = self._inner.fetch(tokens)
-        if cache is None:
-            return None
-        cached_tokens = len(tokens) - len(remaining)
-        return CacheHit(
-            cache=cache,
-            cached_tokens=cached_tokens,
-            remaining_tokens=list(remaining),
-            handle=None,
-            hit_type=getattr(self._inner, "_last_match_type", "hit"),
-        )
-
-    def store(self, request, cache: list) -> bool:
-        cs = getattr(request, "_cache_state", None)
-        _st = (cs.store_tokens if cs is not None else None)
-        tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
-        # Memory cache requires live KV objects; reconstruct from dict form if needed
-        if cache and isinstance(cache[0], dict):
-            from .turn_prefix_cache import reconstruct_cache_from_states
-            cache = reconstruct_cache_from_states(cache) or []
-        if not cache:
-            return False
-        return self._inner.store(tokens, cache, evict_prefixes=False)
-
-    def release(self, handle: Any) -> None:
-        pass  # memory cache has no handle lifecycle
-
-    def get_stats(self) -> dict:
-        return self._inner.get_stats()
-
-    def clear(self) -> None:
-        self._inner.clear()
-
-    def on_prefill_checkpoint(
-        self, request, processed_tokens: int, extracted_cache: list
-    ) -> None:
-        from .turn_prefix_cache import reconstruct_cache_from_states
-
-        cs = getattr(request, "_cache_state", None)
-        total_cached = ((cs.cached_tokens if cs is not None else None) or 0) + processed_tokens
-        last_save = (cs.mid_prefill_last_save if cs is not None else 0)
-
-        interval = self._save_interval
-        if interval > 0 and total_cached - last_save < interval:
-            return
-
-        reconstructed = reconstruct_cache_from_states(extracted_cache)
-        if not reconstructed:
-            return
-
-        prefix_tokens = list((request.prompt_token_ids or [])[:total_cached])
-        old_key = (cs.mid_prefill_cache_key if cs is not None else None)
-        if old_key is not None:
-            self._inner.remove(list(old_key))
-
-        if self._inner.store(prefix_tokens, reconstructed):
-            if cs is not None:
-                cs.mid_prefill_last_save = total_cached
-                cs.mid_prefill_cache_key = tuple(prefix_tokens)
-
-    def set_spill_delegate(self, on_spill, on_promote) -> None:
-        """Forward spill delegate registration to the underlying SpillableCache."""
-        self._inner.set_spill_delegate(on_spill, on_promote)
-
-    # PersistableCache extension
-    def save(self, cache_dir: str) -> bool:
-        return self._inner.save_to_disk(cache_dir)
-
-    def load(self, cache_dir: str) -> int:
-        return self._inner.load_from_disk(cache_dir)
 
 
 class TurnCacheAdapter(CacheManager):
@@ -288,45 +196,21 @@ class TurnCacheAdapter(CacheManager):
             prefill_boundaries=prefill_boundaries,
         )
 
-    def update_n_minus_one(self, request, prompt_cache: list, uid_idx: int) -> None:
-        """Capture N-1 state before each decode step.
+    def update_n_minus_one(self, request: Request, prompt_cache: list, uid_idx: int) -> None:
+        """Capture N-1 recurrent state before each decode step.
 
-        On first call: initialize shadow RotatingKVCache instances.
-        On subsequent calls: mirror the previous step's write into shadows,
-        and save recurrent refs.
+        Called before every decode step. Only recurrent (ArraysCache) layers need
+        tracking here — rotating KV layers are handled at store time via trim_last.
         """
-        from mlx_lm.models.cache import RotatingKVCache, BatchRotatingKVCache, ArraysCache
-
         cs = getattr(request, "_cache_state", None)
         if cs is None:
             return
 
         idx_map = self._ensure_cache_index_map(prompt_cache)
-        just_initialized = (cs.n_minus_one_state is None)
 
-        if just_initialized:
-            # Initialize one shadow RotatingKVCache per rotating layer
-            shadows = []
-            for i in idx_map.rotating_indices:
-                live = prompt_cache[i]  # BatchRotatingKVCache
-                shadow = RotatingKVCache(max_size=live.max_size, keep=0)
-                shadows.append(shadow)
-            cs.n_minus_one_state = {"rotating": shadows, "recurrent": None}
-            # No mirroring on first call — no previous decode step yet
-            return
+        if cs.n_minus_one_state is None:
+            cs.n_minus_one_state = {"recurrent": None}
 
-        # Mirror previous step's RotatingKV write into shadow
-        shadows = cs.n_minus_one_state["rotating"]
-        for shadow_idx, layer_idx in enumerate(idx_map.rotating_indices):
-            live = prompt_cache[layer_idx]  # BatchRotatingKVCache
-            shadow = shadows[shadow_idx]
-            # _idx-1 is always the last-written slot after the previous next() call
-            prev_slot = live._idx - 1
-            k_prev = live.keys[uid_idx:uid_idx+1, :, prev_slot:prev_slot+1, :]
-            v_prev = live.values[uid_idx:uid_idx+1, :, prev_slot:prev_slot+1, :]
-            shadow.update_and_fetch(k_prev, v_prev)
-
-        # Save recurrent refs (valid because ArraysCache uses reference replacement)
         if idx_map.recurrent_indices:
             saved = []
             for layer_idx in idx_map.recurrent_indices:
@@ -366,7 +250,7 @@ class TurnCacheAdapter(CacheManager):
                 resp_state = self._reconstruct(request, resp_state)
 
         resp_kv, resp_recur = (
-            self._inner._split_cache_arrays(resp_state, parent.n_tokens)
+            self._inner.split_cache_arrays(resp_state, parent.n_tokens)
             if resp_state is not None else ([], None)
         )
         self._inner.insert(
@@ -416,7 +300,7 @@ class TurnCacheAdapter(CacheManager):
         segment = segments[abs_idx]
         is_sys = segment.role == "system" and abs_idx == 0
 
-        kv_slice, recur = self._inner._split_cache_arrays(extracted_cache, parent.n_tokens)
+        kv_slice, recur = self._inner.split_cache_arrays(extracted_cache, parent.n_tokens)
         new_node = self._inner.insert(parent, segment, kv_slice, None, recur, is_system_prompt=is_sys)
 
         # Record the new node so store() and subsequent checkpoints can chain off it.
@@ -437,105 +321,3 @@ class TurnCacheAdapter(CacheManager):
     def load(self, cache_dir: str) -> int:
         self._inner.load(cache_dir)
         return 0
-
-
-class PagedCacheAdapter(CacheManager):
-    """Adapts BlockAwarePrefixCache to the PrefixCache protocol.
-
-    Maintains an internal {request_id → block_table} mapping so the protocol
-    surface stays clean (no block_table on Request).
-    """
-
-    def __init__(self, inner):
-        self._inner = inner
-        self._block_tables: dict = {}
-
-    def fetch(self, request) -> CacheHit | None:
-        tokens = list(request.prompt_token_ids)
-        block_table, remaining = self._inner.fetch_cache(request.request_id, tokens)
-        if block_table is None:
-            return None
-
-        self._block_tables[request.request_id] = block_table
-        cache = self._inner.reconstruct_cache(block_table)
-        cached_tokens = block_table.num_tokens
-        return CacheHit(
-            cache=cache,
-            cached_tokens=cached_tokens,
-            remaining_tokens=list(remaining),
-            handle=request.request_id,
-            hit_type="hit",
-        )
-
-    def store(self, request, cache: list) -> bool:
-        cs = getattr(request, "_cache_state", None)
-        _st = (cs.store_tokens if cs is not None else None)
-        tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
-        self._inner.store_cache(request.request_id, tokens, cache)
-        return True
-
-    def release(self, handle) -> None:
-        if handle is None:
-            return
-        self._inner.release_cache(handle)
-        self._block_tables.pop(handle, None)
-
-    def get_stats(self) -> dict:
-        raw = self._inner.get_stats()
-        if isinstance(raw, dict):
-            return raw
-        return vars(raw) if hasattr(raw, "__dict__") else {}
-
-    def clear(self) -> None:
-        self._inner.clear()
-        self._block_tables.clear()
-
-    def on_prefill_checkpoint(
-        self, request, processed_tokens: int, extracted_cache: list
-    ) -> None:
-        pass
-
-
-class LegacyCacheAdapter(CacheManager):
-    """Adapts PrefixCacheManager (entry-count based cache) to the PrefixCache protocol."""
-
-    def __init__(self, inner):
-        self._inner = inner
-
-    def fetch(self, request) -> CacheHit | None:
-        tokens = list(request.prompt_token_ids)
-        cache, remaining = self._inner.fetch_cache(tokens)
-        if not cache:
-            return None
-        cached_tokens = len(tokens) - len(remaining)
-        return CacheHit(
-            cache=cache,
-            cached_tokens=cached_tokens,
-            remaining_tokens=list(remaining),
-            handle=None,
-            hit_type="hit",
-        )
-
-    def store(self, request, cache: list) -> bool:
-        cs = getattr(request, "_cache_state", None)
-        _st = (cs.store_tokens if cs is not None else None)
-        tokens = _st if isinstance(_st, list) else list(request.prompt_token_ids)
-        self._inner.store_cache(tokens, cache)
-        return True
-
-    def release(self, handle: Any) -> None:
-        pass
-
-    def get_stats(self) -> dict:
-        stats = self._inner.get_stats()
-        if isinstance(stats, dict):
-            return stats
-        return vars(stats) if hasattr(stats, "__dict__") else {}
-
-    def clear(self) -> None:
-        self._inner.clear()
-
-    def on_prefill_checkpoint(
-        self, request, processed_tokens: int, extracted_cache: list
-    ) -> None:
-        pass

@@ -363,7 +363,7 @@ class TurnPrefixCache:
         self._on_spill = on_spill
         self._on_promote = on_promote
 
-    def _split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
+    def split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
         """
         Process the output from Scheduler._extract_cache_states.
         KV arrays are quantized to int4 (group_size=64) before storage.
@@ -586,7 +586,7 @@ class TurnPrefixCache:
             node_tsc = 0 if is_permanent else tokens_since
 
             # Quantize KV to int8 if configured and not already quantized.
-            # Arrays from _split_cache_arrays are pre-quantized int4 tuples.
+            # Arrays from split_cache_arrays are pre-quantized int4 tuples.
             if self.config.kv_dtype == "int8" and kv_arrays and not isinstance(kv_arrays[0], tuple):
                 kv_arrays, kv_scales = _quantize_kv(kv_arrays)
 
