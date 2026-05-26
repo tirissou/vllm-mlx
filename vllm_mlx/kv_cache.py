@@ -35,24 +35,20 @@ class QuantizedArray(NamedTuple):
 class RequestCacheState:
     """All cache-related state for a single request. Lives at request._cache_state."""
 
-    # Written by PrefixCache.fetch()
+    # Set by Scheduler from CacheHit after fetch()
     hit_type: str = "miss"
     cache: list | None = None
     cached_tokens: int = 0
     remaining_tokens: list | None = None
     prefill_boundaries: list = field(default_factory=list)
 
-    # Written by Scheduler before calling store()
-    store_tokens: list | None = None        # N-1 token key
-    decoded_cache: list | None = None       # composed N-1 cache (extracted state dicts)
-    n_minus_one_state: Any = None           # per-step N-1 tracking state (set by update_n_minus_one)
+    # Set by Scheduler during decode / cleanup pipeline
+    decoded_cache: list | None = None
+    prev_recurrent: list | None = None   # N-1 recurrent snapshot; was set dynamically before
 
-    # Written by MemoryCacheAdapter.on_prefill_checkpoint()
-    mid_prefill_last_save: int = 0
-    mid_prefill_cache_key: tuple | None = None
-
-    # Opaque per-adapter slot (e.g. turn_cache_path for TurnCacheAdapter)
-    adapter_state: Any = None
+    # Owned by TurnCacheAdapter across the request lifecycle
+    turn_path: list = field(default_factory=list)   # list[TurnNode]; typed replacement for adapter_state
+    n_minus_one_state: Any = None                   # per-step N-1 tracking (set by update_n_minus_one)
 
 
 @dataclass

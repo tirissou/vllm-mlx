@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # tests/test_prefix_cache_adapters.py
 from vllm_mlx.kv_cache import RequestCacheState
-from vllm_mlx.prefix_cache_adapters import (
-    MemoryCacheAdapter, TurnCacheAdapter, PagedCacheAdapter, LegacyCacheAdapter,
-)
+from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
 
 
 def test_request_cache_state_defaults():
@@ -12,36 +10,16 @@ def test_request_cache_state_defaults():
     assert cs.cache is None
     assert cs.cached_tokens == 0
     assert cs.remaining_tokens is None
-    assert cs.store_tokens is None
+    assert cs.prefill_boundaries == []
     assert cs.decoded_cache is None
+    assert cs.prev_recurrent is None
+    assert cs.turn_path == []
     assert cs.n_minus_one_state is None
-    assert cs.mid_prefill_last_save == 0
-    assert cs.mid_prefill_cache_key is None
-    assert cs.adapter_state is None
-
-
-def _make_dummy_adapters():
-    return [
-        MemoryCacheAdapter(None),
-        TurnCacheAdapter(None),
-        PagedCacheAdapter(None),
-        LegacyCacheAdapter(None),
-    ]
-
-
-def test_all_adapters_implement_on_prefill_checkpoint():
-    for adapter in _make_dummy_adapters():
-        assert callable(getattr(adapter, "on_prefill_checkpoint", None)), (
-            f"{type(adapter).__name__} missing on_prefill_checkpoint"
-        )
-
-
-def test_on_prefill_checkpoint_no_op_does_not_raise():
-    """No-op implementations must not raise on None inputs."""
-    from unittest.mock import MagicMock
-    request = MagicMock()
-    for adapter in _make_dummy_adapters():
-        adapter.on_prefill_checkpoint(request, 100, [])
+    # Removed fields must not exist
+    assert not hasattr(cs, "adapter_state")
+    assert not hasattr(cs, "store_tokens")
+    assert not hasattr(cs, "mid_prefill_last_save")
+    assert not hasattr(cs, "mid_prefill_cache_key")
 
 
 from unittest.mock import MagicMock, call, patch
@@ -56,7 +34,7 @@ def _make_turn_cache_request(
     req.output_token_ids = output_token_ids
     req._turn_boundaries = turn_boundaries
     req._boundary_states = boundary_states or {}
-    req._cache_state = RequestCacheState(adapter_state=path or [])
+    req._cache_state = RequestCacheState(turn_path=path or [])
     return req
 
 
@@ -121,30 +99,6 @@ def test_turn_cache_adapter_release_noop_on_none():
     inner.release.assert_not_called()
 
 
-def test_memory_cache_adapter_on_prefill_checkpoint_stores_prefix():
-    """MemoryCacheAdapter must store a prefix entry on checkpoint."""
-    inner = MagicMock()
-    inner.store.return_value = True
-
-    adapter = MemoryCacheAdapter(inner)
-
-    from vllm_mlx.kv_cache import RequestCacheState
-    request = MagicMock()
-    request.prompt_token_ids = list(range(10))
-    request._cache_state = RequestCacheState(cached_tokens=0, mid_prefill_last_save=0, mid_prefill_cache_key=None)
-
-    extracted = [{"state": (None, None), "class_name": "KVCache", "class_ref": None}]
-    fake_reconstructed = [MagicMock()]
-    # The adapter does `from .turn_prefix_cache import reconstruct_cache_from_states`
-    # inside the method, so we patch the function in the turn_prefix_cache module.
-    with patch("vllm_mlx.turn_prefix_cache.reconstruct_cache_from_states", return_value=fake_reconstructed):
-        adapter.on_prefill_checkpoint(request, 5, extracted)
-
-    inner.store.assert_called_once()
-    stored_tokens = inner.store.call_args[0][0]
-    assert stored_tokens == list(range(5))
-
-
 def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     """TurnCacheAdapter.on_prefill_checkpoint eagerly inserts the turn into the trie."""
     from vllm_mlx.kv_cache import RequestCacheState
@@ -156,7 +110,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
-    cs = RequestCacheState(cached_tokens=0, adapter_state=[])
+    cs = RequestCacheState(cached_tokens=0, turn_path=[])
     request._cache_state = cs
     request.prompt_token_ids = list(range(10))  # 10 tokens; B_sys=5 → sys=[0-4], user=[5-9]
     request._turn_boundaries = [5]
@@ -165,8 +119,8 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     adapter.on_prefill_checkpoint(request, 5, extracted)
 
     inner.insert.assert_called_once()
-    assert len(cs.adapter_state) == 1
-    assert cs.adapter_state[0] is new_node
+    assert len(cs.turn_path) == 1
+    assert cs.turn_path[0] is new_node
 
 
 def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
@@ -177,7 +131,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
     adapter = TurnCacheAdapter(inner)
 
     request = MagicMock()
-    request._cache_state = RequestCacheState(cached_tokens=0, adapter_state=[])
+    request._cache_state = RequestCacheState(cached_tokens=0, turn_path=[])
     request._turn_boundaries = [5]
     request.prompt_token_ids = list(range(10))
 
@@ -229,34 +183,6 @@ class TestBuildPrefixCache:
         base.update(kwargs)
         return SchedulerConfig(**base)
 
-    def test_memory_aware_config_returns_memory_cache_adapter(self):
-        from unittest.mock import MagicMock, patch
-        from vllm_mlx.scheduler import _build_prefix_cache
-
-        mock_inner = MagicMock()
-        mock_inner.memory_limit_mb = 1000.0
-        with patch("vllm_mlx.scheduler.MemoryAwarePrefixCache", return_value=mock_inner):
-            bundle = _build_prefix_cache(self._config(use_memory_aware_cache=True), model=object())
-
-        assert isinstance(bundle.adapter, MemoryCacheAdapter)
-        assert bundle.memory_aware_cache is mock_inner
-        assert bundle.prefix_cache is None
-        assert bundle.turn_cache is None
-        assert bundle.ssd_tier is None
-
-    def test_legacy_config_returns_legacy_cache_adapter(self):
-        from unittest.mock import MagicMock, patch
-        from vllm_mlx.scheduler import _build_prefix_cache
-
-        mock_pm = MagicMock()
-        with patch("vllm_mlx.scheduler.PrefixCacheManager", return_value=mock_pm):
-            bundle = _build_prefix_cache(self._config(), model=object())
-
-        assert isinstance(bundle.adapter, LegacyCacheAdapter)
-        assert bundle.prefix_cache is mock_pm
-        assert bundle.memory_aware_cache is None
-        assert bundle.turn_cache is None
-
     def test_turn_cache_config_returns_turn_cache_adapter(self):
         from unittest.mock import MagicMock, patch
         from vllm_mlx.scheduler import _build_prefix_cache
@@ -270,20 +196,6 @@ class TestBuildPrefixCache:
         assert bundle.memory_aware_cache is None
         assert bundle.prefix_cache is None
 
-    def test_paged_cache_config_returns_paged_cache_adapter(self):
-        from unittest.mock import MagicMock, patch
-        from vllm_mlx.scheduler import _build_prefix_cache
-
-        mock_pcm = MagicMock()
-        mock_bac = MagicMock()
-        with patch("vllm_mlx.scheduler.PagedCacheManager", return_value=mock_pcm), \
-             patch("vllm_mlx.scheduler.BlockAwarePrefixCache", return_value=mock_bac):
-            bundle = _build_prefix_cache(self._config(use_paged_cache=True), model=object())
-
-        assert isinstance(bundle.adapter, PagedCacheAdapter)
-        assert bundle.paged_cache_manager is mock_pcm
-        assert bundle.block_aware_cache is mock_bac
-        assert bundle.memory_aware_cache is None
 
 
 def test_request_cache_state_is_single_attribute():
