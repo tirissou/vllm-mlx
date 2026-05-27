@@ -764,7 +764,7 @@ class Scheduler:
         """
         Decode token IDs to text, handling both tokenizers and processors.
         """
-        return self._actual_tokenizer.decode(token_ids)
+        return self._actual_tokenizer.decode(token_ids, skip_special_tokens=False)
 
     def _log_cache_key(self, op: str, request_id: str, tokens: List[int]) -> None:
         """Append a cache key event to _cache_key_log_path (if set)."""

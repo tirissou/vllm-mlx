@@ -174,6 +174,185 @@ from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Turn debug logging
+# ─────────────────────────────────────────────────────────────────────────────
+import re as _re
+
+_DBG_W = 100
+_DBG_ANSI_RE = _re.compile(r"\033\[[0-9;]*m")
+
+
+def _dbg_plain(s: str) -> str:
+    return _DBG_ANSI_RE.sub("", s)
+
+
+def _dbg_row(text: str = "") -> str:
+    pad = _DBG_W - 2 - len(_dbg_plain(text))
+    return f"│{text}{' ' * max(0, pad)}│"
+
+
+def _dbg_hdr(text: str = "") -> str:
+    pad = _DBG_W - 2 - len(_dbg_plain(text))
+    return f"┃{text}{' ' * max(0, pad)}┃"
+
+
+_DBG_TOP = "┏" + "━" * (_DBG_W - 2) + "┓"
+_DBG_MID = "┣" + "━" * (_DBG_W - 2) + "┫"
+_DBG_SEP = "├" + "─" * (_DBG_W - 2) + "┤"
+_DBG_BOT = "┗" + "━" * (_DBG_W - 2) + "┛"
+
+_DBG_C = {
+    "system": "\033[90m",
+    "user": "\033[94m",
+    "assistant": "\033[92m",
+    "tool": "\033[93m",
+}
+_DBG_RST = "\033[0m"
+_DBG_BOLD = "\033[1m"
+_DBG_DIM = "\033[2m"
+_DBG_YELLOW = "\033[33m"
+_DBG_CYAN = "\033[96m"
+_DBG_MAGENTA = "\033[95m"
+
+
+def _dbg_trunc(s: str, n: int = 140) -> str:
+    s = s.replace("\n", "↵").replace("\r", "").strip()
+    return s[:n] + "…" if len(s) > n else s
+
+
+def _dbg_msg_body(msg) -> str:
+    """Render a single message's body: content + tool calls + reasoning."""
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        tcs = msg.get("tool_calls")
+        rc = msg.get("reasoning_content")
+    else:
+        content = getattr(msg, "content", None)
+        tcs = getattr(msg, "tool_calls", None)
+        rc = getattr(msg, "reasoning_content", None)
+
+    if isinstance(content, list):
+        texts, n_media = [], 0
+        for p in content:
+            pt = p.get("type") if isinstance(p, dict) else getattr(p, "type", None)
+            if pt == "text":
+                t = (p.get("text") if isinstance(p, dict) else getattr(p, "text", "")) or ""
+                if t:
+                    texts.append(t)
+            elif pt in ("image_url", "image", "video_url", "video", "audio_url", "audio"):
+                n_media += 1
+        content = " ".join(texts) + (f" [{n_media} media]" if n_media else "")
+
+    parts = []
+    if rc:
+        parts.append(f"{_DBG_MAGENTA}<think>{_dbg_trunc(rc, 80)}</think>{_DBG_RST}")
+    if tcs:
+        for tc in tcs:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+            name = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "?")) or "?"
+            args = (fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")) or ""
+            parts.append(f"{_DBG_YELLOW}⚙ {name}({_dbg_trunc(str(args), 60)}){_DBG_RST}")
+    if content:
+        parts.append(_dbg_trunc(str(content), 110))
+
+    return "  ".join(parts) if parts else f"{_DBG_DIM}(empty){_DBG_RST}"
+
+
+def _log_turn_request(request: "ChatCompletionRequest") -> None:
+    n_msgs = len(request.messages)
+    n_tools = len(request.tools) if request.tools else 0
+    stream_label = "stream" if request.stream else "sync"
+    model = (request.model or "?")[:32]
+
+    hdr = (
+        f" {_DBG_BOLD}▶ REQUEST{_DBG_RST}"
+        f"  model={_DBG_CYAN}{model}{_DBG_RST}"
+        f"  {stream_label}"
+        f"  msgs={n_msgs}"
+        + (f"  tools={n_tools}" if n_tools else "")
+        + f"  max_tokens={request.max_tokens}"
+        + f"  temp={request.temperature}"
+    )
+    params = (
+        f" {_DBG_DIM}top_p={request.top_p}"
+        f"  top_k={getattr(request, 'top_k', 0)}"
+        f"  min_p={getattr(request, 'min_p', 0.0)}"
+        + (f"  response_format={request.response_format}" if request.response_format else "")
+        + _DBG_RST
+    )
+
+    lines = [_DBG_TOP, _dbg_hdr(hdr), _dbg_hdr(params), _DBG_MID]
+
+    for msg in request.messages:
+        role = msg.role if not isinstance(msg, dict) else msg.get("role", "?")
+        color = _DBG_C.get(role, "")
+        role_tag = f" {color}[{role}]{_DBG_RST}"
+        body = _dbg_msg_body(msg)
+        lines.append(_dbg_row(f"{role_tag:<22} {body}"))
+
+    if n_tools:
+        lines.append(_DBG_SEP)
+        tool_names = []
+        for t in request.tools:
+            fn = getattr(t, "function", None) if not isinstance(t, dict) else t.get("function", {})
+            name = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "?")) or "?"
+            tool_names.append(name)
+        lines.append(_dbg_row(f" {_DBG_DIM}tools: {', '.join(tool_names)}{_DBG_RST}"))
+
+    lines.append(_DBG_BOT)
+    print("\n".join(lines), flush=True)
+
+
+def _log_turn_response(
+    output: "GenerationOutput",
+    reasoning_text: "str | None",
+    cleaned_text: "str | None",
+    tool_calls: "list | None",
+    elapsed: float,
+    stream: bool = False,
+) -> None:
+    tok_s = output.completion_tokens / elapsed if elapsed > 0 else 0
+    label = "◀ STREAM" if stream else "◀ RESPONSE"
+
+    hdr = (
+        f" {_DBG_BOLD}{label}{_DBG_RST}"
+        f"  {_DBG_CYAN}{output.prompt_tokens}p + {output.completion_tokens}c tok{_DBG_RST}"
+        f"  {elapsed:.2f}s  {tok_s:.1f} tok/s"
+        f"  finish={output.finish_reason or '?'}"
+    )
+
+    lines = [_DBG_TOP, _dbg_hdr(hdr), _DBG_MID]
+
+    if reasoning_text:
+        lines.append(_dbg_row(
+            f" {_DBG_MAGENTA}[think]{_DBG_RST}  {_dbg_trunc(reasoning_text, 105)}"
+        ))
+
+    if tool_calls:
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", "?") if fn else "?"
+            args = getattr(fn, "arguments", "") if fn else ""
+            tc_id = getattr(tc, "id", "")
+            lines.append(_dbg_row(
+                f" {_DBG_YELLOW}[tool_call]{_DBG_RST}"
+                f"  {name}({_dbg_trunc(str(args), 75)})"
+                + (f"  {_DBG_DIM}id={tc_id}{_DBG_RST}" if tc_id else "")
+            ))
+
+    if cleaned_text:
+        lines.append(_dbg_row(
+            f" {_DBG_C['assistant']}[text]{_DBG_RST}  {_dbg_trunc(cleaned_text, 105)}"
+        ))
+
+    if not reasoning_text and not tool_calls and not cleaned_text:
+        lines.append(_dbg_row(f" {_DBG_DIM}(no output){_DBG_RST}"))
+
+    lines.append(_DBG_BOT)
+    print("\n".join(lines), flush=True)
+
+
 _IMPORTED_SIMPLE_ENGINE = SimpleEngine
 
 # Global engine instance
@@ -4472,47 +4651,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
     total_timeout, deadline = _start_request_budget(request.timeout)
 
-    # --- Detailed request logging ---
-    n_msgs = len(request.messages)
-    total_chars = 0
-    turn_previews = []
-    for m in request.messages:
-        if isinstance(m.content, str):
-            content = m.content
-        else:
-            content = " ".join(p.text for p in m.content if hasattr(p, "text") and p.text)
-        total_chars += len(content)
-        preview = " ".join(content.split()[:8])
-        turn_previews.append((m.role, preview))
-    n_tools = len(request.tools) if request.tools else 0
-    logger.info(
-        f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
-        f"model={request.model!r} max_tokens={request.max_tokens} "
-        f"temp={request.temperature} top_p={request.top_p} "
-        f"top_k={request.top_k} min_p={request.min_p} "
-        f"presence_penalty={request.presence_penalty} "
-        f"repetition_penalty={request.repetition_penalty} "
-        f"msgs={n_msgs} total_chars={total_chars} tools={n_tools} "
-        f"response_format={request.response_format}"
-    )
-    _role_colors = {"system": "\033[90m", "user": "\033[94m", "assistant": "\033[92m"}
-    _reset = "\033[0m"
-    lines = [f"\033[1m┌── conversation ({n_msgs} turns) ──\033[0m"]
-    for role, preview in turn_previews:
-        color = _role_colors.get(role, "")
-        lines.append(f"│  {color}{role:<12}{_reset} {preview!r}")
-    lines.append("└" + "─" * 36)
-    print("\n".join(lines), flush=True)
-
-    try:
-        import json as _json, time as _t
-        _body = await raw_request.body()
-        _parsed = _json.loads(_body)
-        _record = {"ts": _t.time(), "messages": _parsed.get("messages", [])}
-        with open("USER_INPUT.log", "a") as _f:
-            _f.write(_json.dumps(_record) + "\n")
-    except Exception:
-        pass
+    _log_turn_request(request)
 
     engine = await _acquire_default_engine_for_request(
         raw_request,
@@ -4570,10 +4709,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             return Response(status_code=499)  # Client closed request
 
         elapsed = time.perf_counter() - start_time
-        tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(
-            f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
-        )
 
         reasoning_text, cleaned_text, tool_calls = _extract_reasoning_and_tool_calls(
             output.text,
@@ -4581,6 +4716,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             allow_reasoning=(getattr(request, "enable_thinking", None) is not False),
             engine=engine,
         )
+
+        _log_turn_response(output, reasoning_text, cleaned_text, tool_calls, elapsed)
 
         # Process response_format if specified (after reasoning parser cleaned the text)
         if prepared.response_format and not tool_calls:
@@ -5959,12 +6096,33 @@ async def stream_chat_completion(
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("Streaming JSON validation raised: %s", exc)
 
-        # Log throughput
         elapsed = time.perf_counter() - start_time
-        tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
-        logger.info(
-            f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
-        )
+        if last_output is not None:
+            from .engine.base import GenerationOutput as _GO
+            _stream_out = _GO(
+                text=accumulated_text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                finish_reason=last_output.finish_reason if last_output else "stop",
+            )
+            _stream_tool_calls = None
+            if tool_calls_detected and "final_parse_result" in dir():
+                _fpr = locals().get("final_parse_result")
+                if _fpr and getattr(_fpr, "tools_called", False):
+                    from .api.models import ToolCall as _TC, FunctionCall as _FC
+                    _stream_tool_calls = [
+                        _TC(
+                            id=f"call_{i}",
+                            function=_FC(
+                                name=tc.name,
+                                arguments=json.dumps(tc.parameters),
+                            ),
+                        )
+                        for i, tc in enumerate(getattr(_fpr, "tool_calls", []))
+                    ]
+            _log_turn_response(
+                _stream_out, None, accumulated_text or None, _stream_tool_calls, elapsed, stream=True
+            )
 
         # Send final chunk with usage if requested
         if include_usage:
