@@ -408,9 +408,6 @@ class TurnPrefixCache:
                 if lin_keys.shape[2] > max_size_r:
                     lin_keys = lin_keys[..., -max_size_r:, :]
                     lin_values = lin_values[..., -max_size_r:, :]
-                if state.get("trim_last") and lin_keys.shape[2] > 0:
-                    lin_keys = lin_keys[..., :-1, :]
-                    lin_values = lin_values[..., :-1, :]
                 q_state = (
                     mx.quantize(mx.contiguous(lin_keys), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
                     mx.quantize(mx.contiguous(lin_values), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),

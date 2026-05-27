@@ -48,7 +48,6 @@ class RequestCacheState:
 
     # Owned by TurnCacheAdapter across the request lifecycle
     turn_path: list = field(default_factory=list)   # list[TurnNode]; typed replacement for adapter_state
-    n_minus_one_state: Any = None                   # per-step N-1 tracking (set by update_n_minus_one)
 
 
 @dataclass

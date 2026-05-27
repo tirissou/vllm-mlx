@@ -44,11 +44,7 @@ class CacheManager(ABC):
 
     @abstractmethod
     def store(self, request, tokens: list[int], cache: list) -> bool:
-        """Store the completed request's N-1 cache.
-
-        tokens — the N-1 token key (prompt + output[:-1]), computed by Scheduler.
-        cache  — already composed N-1 cache (compose_n_minus_1_cache applied by Scheduler).
-        """
+        """Store the completed request's cache keyed on the full token sequence."""
         ...
 
     # ── Default no-ops (override as needed) ──────────────────────────────────
@@ -73,15 +69,7 @@ class CacheManager(ABC):
         """
         pass
 
-    # ── Concrete n-minus-one machinery (do not override) ─────────────────────
-
     def update_n_minus_one(self, request, prompt_cache: list, uid_idx: int) -> None:
-        """Capture recurrent layer snapshots before each decode step.
-
-        Called by the Scheduler before every decode step. Only recurrent
-        (ArraysCache) layers need tracking here — rotating KV layers are
-        handled at store time via trim_last.
-        """
         pass
 
     def _ensure_cache_index_map(self, layers: list) -> "CacheIndexMap":
@@ -117,40 +105,6 @@ class CacheManager(ABC):
             recurrent_indices=recurrent_indices,
         )
         return self._cache_index_map
-
-    def _reconstruct(self, request, extracted_cache: list) -> list:
-        """Build N-1 state dict list from extracted N-state and per-step tracking."""
-        from .kv_cache import extract_layer_state
-
-        idx_map = self._cache_index_map
-        cs = request._cache_state
-        n_minus_one = cs.n_minus_one_state
-
-        result = [None] * len(extracted_cache)
-
-        for i in idx_map.kv_indices:
-            layer = extracted_cache[i]
-            meta = layer.get("meta_state")
-            if meta and len(meta) > 0:
-                new_meta = (str(max(0, int(meta[0]) - 1)),) + meta[1:]
-                result[i] = {**layer, "meta_state": new_meta}
-            else:
-                result[i] = layer
-
-        for layer_idx in idx_map.rotating_indices:
-            result[layer_idx] = {**extracted_cache[layer_idx], "trim_last": True}
-
-        saved_recurrent = (n_minus_one or {}).get("recurrent") or []
-        for rec_idx, layer_idx in enumerate(idx_map.recurrent_indices):
-            if rec_idx < len(saved_recurrent):
-                saved = saved_recurrent[rec_idx]
-                state_dict = extract_layer_state(saved)
-                result[layer_idx] = state_dict if state_dict is not None else extracted_cache[layer_idx]
-            else:
-                result[layer_idx] = extracted_cache[layer_idx]
-
-        return result
-
 
 class TurnCacheAdapter(CacheManager):
     """Adapts TurnPrefixCache to the PrefixCache / PersistableCache protocol."""
@@ -243,28 +197,6 @@ class TurnCacheAdapter(CacheManager):
             prefill_boundaries=prefill_boundaries,
         )
 
-    def update_n_minus_one(self, request: Request, prompt_cache: list, uid_idx: int) -> None:
-        """Capture N-1 recurrent state before each decode step.
-
-        Called before every decode step. Only recurrent (ArraysCache) layers need
-        tracking here — rotating KV layers are handled at store time via trim_last.
-        """
-        cs = getattr(request, "_cache_state", None)
-        if cs is None:
-            return
-
-        idx_map = self._ensure_cache_index_map(prompt_cache)
-
-        if cs.n_minus_one_state is None:
-            cs.n_minus_one_state = {"recurrent": None}
-
-        if idx_map.recurrent_indices:
-            saved = []
-            for layer_idx in idx_map.recurrent_indices:
-                live = prompt_cache[layer_idx]  # ArraysCache (batched)
-                saved.append(live.extract(uid_idx))
-            cs.n_minus_one_state["recurrent"] = saved
-
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:
         from .turn_prefix_cache import Segment
 
@@ -295,13 +227,6 @@ class TurnCacheAdapter(CacheManager):
             cache = [d for layer in cache if (d := extract_layer_state(layer)) is not None]
 
         resp_state = cache if cache else None
-
-        if resp_state is not None:
-            self._ensure_cache_index_map(resp_state)
-            n_minus_one = cs.n_minus_one_state if cs is not None else None
-            if n_minus_one is not None:
-                # Decode steps occurred — use per-step N-1 tracking
-                resp_state = self._reconstruct(request, resp_state)
 
         resp_kv, resp_recur = (
             self._inner.split_cache_arrays(resp_state, parent.n_tokens)

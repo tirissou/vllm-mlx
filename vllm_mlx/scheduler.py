@@ -224,6 +224,48 @@ class _InstrumentedBatchGenerator(BatchGenerator):
         ]
 
 
+class _InstrumentedBatchGenerator(BatchGenerator):
+    """BatchGenerator subclass that fires a mid-prefill callback after each chunk.
+
+    After every _next() call, for each sequence still in the prompt batch
+    (end_of_prompt=False), calls mid_prefill_callback(uid, processed, cache)
+    where cache is the per-sequence KV state extracted from the shared batch
+    cache.  Throttled by save_interval: only fires when at least save_interval
+    new tokens have been processed since the last save for that uid.
+    """
+
+    def __init__(self, *args, mid_prefill_callback=None, save_interval=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._mid_prefill_callback = mid_prefill_callback
+        self._save_interval = save_interval
+        self._uid_last_saved: dict = {}
+
+    def _next(self):
+        prompt_responses, gen_responses = super()._next()
+
+        if self._mid_prefill_callback and prompt_responses:
+            uid_to_idx = {uid: i for i, uid in enumerate(self._prompt_batch.uids)}
+            for resp in prompt_responses:
+                if resp.end_of_prompt or resp.uid not in uid_to_idx:
+                    continue
+                processed = resp.progress[0]
+                last = self._uid_last_saved.get(resp.uid, 0)
+                if self._save_interval > 0 and (processed - last) < self._save_interval:
+                    continue
+                idx = uid_to_idx[resp.uid]
+                per_uid_cache = self._prompt_batch.extract_cache(idx)
+                self._mid_prefill_callback(resp.uid, processed, per_uid_cache)
+                self._uid_last_saved[resp.uid] = processed
+
+        # Remove tracking for sequences that have left the prompt batch
+        active = set(self._prompt_batch.uids)
+        for uid in list(self._uid_last_saved):
+            if uid not in active:
+                del self._uid_last_saved[uid]
+
+        return prompt_responses, gen_responses
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -1404,7 +1446,7 @@ class Scheduler:
                 _store_cache = request._cache_state.decoded_cache
                 if _store_cache:
                     _full_tokens = list(request.prompt_token_ids) + list(request.output_token_ids)
-                    _store_tokens = _full_tokens[:-1]  # N-1 key; matches compose_n_minus_1_cache
+                    _store_tokens = _full_tokens
                     try:
                         self._prefix_cache.store(request, _store_tokens, _store_cache)
                     except Exception as e:
