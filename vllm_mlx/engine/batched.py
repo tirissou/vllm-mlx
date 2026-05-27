@@ -1015,21 +1015,25 @@ class BatchedEngine(BaseEngine):
             if not full_tokens:
                 return []
 
-            im_end_id = None
+            turn_end_id = None
             if hasattr(tokenizer, "convert_tokens_to_ids"):
-                im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                unk_id = getattr(tokenizer, "unk_token_id", None)
+                for candidate in ("<|im_end|>", "<turn|>"):
+                    cid = tokenizer.convert_tokens_to_ids(candidate)
+                    if cid is not None and cid != unk_id:
+                        turn_end_id = cid
+                        break
 
-            # Try im_end scan for Qwen3-like tokenizers
-            if im_end_id is not None and im_end_id != getattr(tokenizer, "unk_token_id", None):
+            # Fast path: scan for the turn-end token (works for Qwen3 <|im_end|>
+            # and Gemma 4 <turn|> alike).
+            if turn_end_id is not None:
                 boundaries = []
                 for i, tok in enumerate(full_tokens):
-                    if tok == im_end_id:
-                        # Boundary points AT the \n after <|im_end|>, not past it.
-                        # This means each segment ends with <|im_end|> (no trailing \n),
-                        # and the \n becomes the first token of the next segment.
-                        # This is required for insert/match consistency: output_token_ids
-                        # ends at <|im_end|> (the model's EOS), so response_tokens must
-                        # also end at <|im_end|> for the next-turn segment to match.
+                    if tok == turn_end_id:
+                        # Boundary is the position immediately after the turn-end token.
+                        # The trailing \n (if any) becomes the first token of the next segment.
+                        # Required for insert/match consistency: output_token_ids ends at the
+                        # turn-end token (model EOS), so response_tokens must too.
                         boundaries.append(i + 1)
 
                 logger.info(
@@ -1043,10 +1047,26 @@ class BatchedEngine(BaseEngine):
             boundaries = []
             try:
                 for i in range(1, len(messages) + 1):
-                    prefix = list(messages[:i])
+                    current_role = messages[i - 1].get("role") if i <= len(messages) else None
+
+                    should_add = (i == 1) or (current_role == "assistant")
+                    if not should_add:
+                        continue
+
+                    # For assistant messages with tool_calls, the template forward-scans
+                    # subsequent role:tool messages and renders them inline. We must include
+                    # those tool messages in the check prefix so the template produces a
+                    # proper closed turn (with <turn|>) that will match the full sequence.
+                    check_prefix = list(messages[:i])
+                    if current_role == "assistant" and messages[i - 1].get("tool_calls"):
+                        j = i
+                        while j < len(messages) and messages[j].get("role") == "tool":
+                            check_prefix.append(messages[j])
+                            j += 1
+
                     try:
                         prefix_prompt = self._apply_chat_template(
-                            prefix,
+                            check_prefix,
                             tools=tools,
                             num_images=num_images,
                             num_audios=num_audios,
@@ -1060,23 +1080,9 @@ class BatchedEngine(BaseEngine):
 
                     # Check if prefix matches the start of full tokens
                     if len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]:
-                        # Add boundary only for:
-                        # 1. System message (first message, i==1)
-                        # 2. Completed assistant turns (when current message is assistant)
-                        current_role = messages[i - 1].get("role") if i <= len(messages) else None
-
-                        should_add = False
-                        if i == 1:
-                            # Always add system boundary
-                            should_add = True
-                        elif current_role == "assistant":
-                            # Add boundary after assistant messages
-                            should_add = True
-
-                        if should_add:
-                            boundary = len(prefix_tokens)
-                            if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
-                                boundaries.append(boundary)
+                        boundary = len(prefix_tokens)
+                        if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
+                            boundaries.append(boundary)
 
             except Exception as e:
                 logger.debug(f"[turn_cache] fallback boundary detection error: {e}")
