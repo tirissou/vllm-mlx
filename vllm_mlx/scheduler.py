@@ -1404,7 +1404,7 @@ class Scheduler:
                 _store_cache = request._cache_state.decoded_cache
                 if _store_cache:
                     _full_tokens = list(request.prompt_token_ids) + list(request.output_token_ids)
-                    _store_tokens = _full_tokens[:-1]  # N-1 key; matches compose_n_minus_1_cache
+                    _store_tokens = _full_tokens
                     try:
                         self._prefix_cache.store(request, _store_tokens, _store_cache)
                     except Exception as e:
