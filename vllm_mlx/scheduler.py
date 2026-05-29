@@ -36,8 +36,6 @@ from .kv_cache import (
     RequestCacheState,
     _BATCH_KV_TYPES,
     extract_cache_states,
-    reconstruct_cache_from_states,
-    reconstruct_ssd_layers,
     validate_cache,
 )
 from .utils.mamba_cache import ensure_mamba_support
@@ -617,7 +615,11 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             ssd_max_gb=config.turn_cache_ssd_gb,
         ))
         bundle.turn_cache = turn_cache
-        bundle.adapter = TurnCacheManager(turn_cache)
+        bundle.adapter = TurnCacheManager(
+            turn_cache,
+            kv_bits=config.kv_cache_quantization_bits,
+            kv_group_size=config.kv_cache_quantization_group_size,
+        )
         logger.info(
             f"TurnPrefixCache enabled: stride={config.turn_cache_stride} "
             f"memory={config.turn_cache_memory_gb}GB"

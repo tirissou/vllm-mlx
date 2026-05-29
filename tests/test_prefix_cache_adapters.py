@@ -130,7 +130,8 @@ def test_turn_cache_adapter_release_noop_on_none():
 def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     """TurnCacheManager.on_prefill_checkpoint eagerly inserts the turn into the trie."""
     from vllm_mlx.kv_cache import RequestCacheState
-    from vllm_mlx.cache_types import StaticKVData
+    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.kv_cache import QuantizedArray
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
     new_node = MagicMock(n_tokens=5)
@@ -144,7 +145,11 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     request._turn_boundaries = [5]
 
     # Patch _segment so it returns empty sparse lists without needing real arrays
-    kv_placeholder = StaticKVData(arrays=[], metadata={'layer_index': 0})
+    import mlx.core as mx
+    qa = QuantizedArray(packed=mx.zeros((1,1,1,1), dtype=mx.uint32),
+                        scales=mx.zeros((1,1,1,1), dtype=mx.bfloat16),
+                        biases=mx.zeros((1,1,1,1), dtype=mx.bfloat16))
+    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={'layer_index': 0})
     with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])):
         extracted = [{"state": (None, None), "class_name": "KVCache"}]
         adapter.on_prefill_checkpoint(request, 5, extracted)
@@ -440,7 +445,8 @@ def test_store_reads_turn_path_from_cache_state():
 # ── on_prefill_checkpoint() ───────────────────────────────────────────────────
 
 def test_on_prefill_checkpoint_at_boundary_inserts_node():
-    from vllm_mlx.cache_types import StaticKVData
+    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.kv_cache import QuantizedArray
     inner = _make_inner()
     new_node = MagicMock(n_tokens=10)
     inner.insert.return_value = new_node
@@ -452,7 +458,11 @@ def test_on_prefill_checkpoint_at_boundary_inserts_node():
     )
     req._cache_state.turn_path = []
     extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}]
-    kv_placeholder = StaticKVData(arrays=[], metadata={'layer_index': 0})
+    import mlx.core as mx
+    qa = QuantizedArray(packed=mx.zeros((1,1,1,1), dtype=mx.uint32),
+                        scales=mx.zeros((1,1,1,1), dtype=mx.bfloat16),
+                        biases=mx.zeros((1,1,1,1), dtype=mx.bfloat16))
+    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={'layer_index': 0})
     with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])):
         adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
     assert inner.insert.called
@@ -474,7 +484,8 @@ def test_on_prefill_checkpoint_not_at_boundary_is_noop():
 
 def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     """Prefill boundaries store cache @ N, not N-1; n_minus_one_state must be ignored."""
-    from vllm_mlx.cache_types import StaticKVData
+    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.kv_cache import QuantizedArray
     inner = _make_inner()
     adapter = TurnCacheManager(inner)
     req = _make_request(
@@ -484,10 +495,14 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     )
     extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}]
     # Verify that on_prefill_checkpoint delegates to _segment (not inner.split_cache_arrays)
-    kv_placeholder = StaticKVData(arrays=[], metadata={'layer_index': 0})
+    import mlx.core as mx
+    qa = QuantizedArray(packed=mx.zeros((1,1,1,1), dtype=mx.uint32),
+                        scales=mx.zeros((1,1,1,1), dtype=mx.bfloat16),
+                        biases=mx.zeros((1,1,1,1), dtype=mx.bfloat16))
+    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={'layer_index': 0})
     with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])) as mock_seg:
         adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
-    # _segment should have been called with extracted_cache
-    mock_seg.assert_called_once_with(extracted)
+    # _segment should have been called with extracted_cache plus group_size and bits
+    mock_seg.assert_called_once_with(extracted, adapter._kv_group_size, adapter._kv_bits)
     # inner.split_cache_arrays must NOT be called (it was the old API)
     inner.split_cache_arrays.assert_not_called()

@@ -33,6 +33,18 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 
 ---
 
+## Trie storage types
+
+**KVLayerSegment** — immutable snapshot of one transformer layer's KV state stored in a `TurnNode`. Holds `keys: QuantizedArray` and `values: QuantizedArray` in mlx-lm's native group-quantized format (`packed: uint32`, `scales: bfloat16`, `biases: bfloat16`), plus a metadata dict (`layer_index`, `merge_strategy`, and rotating-cache fields `max_size`/`keep`/`offset`). Not a decode buffer — callers must not treat it as one. Compare with `BatchQuantizedKVCache` (live, mutable) and `QuantizedKVCache` (live, single-sequence).
+
+`KVLayerSegment.concat(layers)` — classmethod. Concatenates a list of same-layer segments along the sequence axis (`axis=-2`) by concatenating `packed`, `scales`, and `biases` arrays independently. Called by `collect_path_data()` for `merge_strategy='concatenate'` (standard KV) layers; rotating layers use `layers[-1]` directly.
+
+**RecurrentLayerSegment** — immutable snapshot of one recurrent layer's state stored in a `TurnNode`. Holds raw arrays plus `class_ref` (the concrete mlx-lm class) so `_assemble()` can call `class_ref.from_state(arrays, meta_state)` at reconstruction time without a class-name dispatch table.
+
+**merge_strategy** — metadata field on `KVLayerSegment`. `'concatenate'`: incremental KV slices are concatenated across the trie path (standard `KVCache`). `'last'`: only the deepest node's segment is used (rotating `RotatingKVCache` — ring buffer, not an accumulation).
+
+---
+
 ## Scheduler
 
 **step()** — synchronous. Must remain synchronous: MLX lazy ops (dequantize, reconstruct) are enqueued on a stream tied to the worker thread that runs `step()`. Any await in the scheduling path would land reconstruction on the event loop thread, violating the MLX stream constraint.

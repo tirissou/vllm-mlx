@@ -13,8 +13,14 @@ from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 from .kv_cache import CacheHit, CacheIndexMap, _BATCH_KV_TYPES
-from .cache_types import StaticKVData, StaticRecurrentData
-from .cache_translator import CacheTranslator
+from .cache_types import KVLayerSegment, RecurrentLayerSegment
+
+
+def _linearize(tensor: "mx.array", offset: int, max_size: int) -> "mx.array":
+    """Unwrap a RotatingKVCache ring buffer into a contiguous linear sequence."""
+    if offset == max_size:
+        return tensor[..., :offset, :]
+    return mx.concatenate([tensor[..., offset:, :], tensor[..., :offset, :]], axis=-2)
 
 
 class CacheManager(ABC):
@@ -114,8 +120,10 @@ class CacheManager(ABC):
 class TurnCacheManager(CacheManager):
     """Adapts TurnPrefixCache to the CacheManager protocol."""
 
-    def __init__(self, inner: TurnPrefixCache):
+    def __init__(self, inner: TurnPrefixCache, kv_bits: int = 8, kv_group_size: int = 64):
         self._inner = inner
+        self._kv_bits = kv_bits
+        self._kv_group_size = kv_group_size
 
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state
@@ -149,15 +157,15 @@ class TurnCacheManager(CacheManager):
 
     @staticmethod
     def _segment(
-        live_states: list[dict[str, Any]]
-    ) -> tuple[list[StaticKVData | None], list[StaticRecurrentData | None]]:
-        """Transform live cache states into normalized static format.
+        live_states: list[dict],
+        group_size: int = 64,
+        bits: int = 8,
+    ) -> tuple[list, list]:
+        """Transform live cache states into KVLayerSegment / RecurrentLayerSegment."""
+        from .kv_cache import QuantizedArray
 
-        Returns two sparse lists parallel to live_states: kv_data_list and rec_data_list.
-        Exactly one of kv_data_list[i] / rec_data_list[i] is non-None for each i.
-        """
-        kv_data_list: list[StaticKVData | None] = [None] * len(live_states)
-        rec_data_list: list[StaticRecurrentData | None] = [None] * len(live_states)
+        kv_list = [None] * len(live_states)
+        rec_list = [None] * len(live_states)
 
         for i, state_dict in enumerate(live_states):
             class_name = state_dict['class_name']
@@ -172,21 +180,22 @@ class TurnCacheManager(CacheManager):
                     offset = max_size
                     keep = 0
 
-                raw_keys, raw_values = state
-                lin_keys = CacheTranslator.linearize(raw_keys, offset, max_size)
-                lin_values = CacheTranslator.linearize(raw_values, offset, max_size)
-                q_arrays, q_scales = CacheTranslator.quantize_kv([lin_keys, lin_values])
+                lin_keys = _linearize(state[0], offset, max_size)
+                lin_values = _linearize(state[1], offset, max_size)
+                q_keys = QuantizedArray(*mx.quantize(lin_keys, group_size=group_size, bits=bits))
+                q_values = QuantizedArray(*mx.quantize(lin_values, group_size=group_size, bits=bits))
 
-                kv_data_list[i] = StaticKVData(
-                    arrays=q_arrays,
+                kv_list[i] = KVLayerSegment(
+                    keys=q_keys,
+                    values=q_values,
                     metadata={
                         'class_name': 'RotatingKVCache',
                         'layer_index': i,
                         'merge_strategy': 'last',
+                        'n_tokens': lin_keys.shape[-2],
                         'max_size': max_size,
                         'keep': keep,
                         'offset': offset,
-                        'scales': q_scales,
                     },
                 )
 
@@ -196,75 +205,90 @@ class TurnCacheManager(CacheManager):
                 except (TypeError, ValueError, IndexError):
                     actual_end = state[0].shape[2]
 
-                sliced = [arr[:, :, :actual_end, :] for arr in state[:2]]
-                q_arrays, q_scales = CacheTranslator.quantize_kv(sliced)
+                sliced_keys = state[0][:, :, :actual_end, :]
+                sliced_values = state[1][:, :, :actual_end, :]
+                q_keys = QuantizedArray(*mx.quantize(sliced_keys, group_size=group_size, bits=bits))
+                q_values = QuantizedArray(*mx.quantize(sliced_values, group_size=group_size, bits=bits))
 
-                kv_data_list[i] = StaticKVData(
-                    arrays=q_arrays,
+                kv_list[i] = KVLayerSegment(
+                    keys=q_keys,
+                    values=q_values,
                     metadata={
                         'class_name': class_name,
                         'layer_index': i,
                         'merge_strategy': 'concatenate',
-                        'actual_end': actual_end,
-                        'scales': q_scales,
+                        'n_tokens': actual_end,
                     },
                 )
 
             else:
-                rec_data_list[i] = StaticRecurrentData(
+                rec_list[i] = RecurrentLayerSegment(
                     arrays=state,
-                    metadata={'class_name': class_name, 'layer_index': i},
+                    metadata={
+                        'class_name': class_name,
+                        'layer_index': i,
+                        'class_ref': state_dict.get('class_ref'),
+                    },
                 )
 
-        return kv_data_list, rec_data_list
+        return kv_list, rec_list
 
     @staticmethod
     def _assemble(
-        kv_data: list[StaticKVData],
-        recurrent_data: list[StaticRecurrentData],
-    ) -> list[dict[str, Any]]:
-        """Reconstruct live cache states from compact static data lists.
+        kv_layers: list,
+        recurrent_layers: list,
+        group_size: int = 64,
+        bits: int = 8,
+    ) -> list:
+        """Reconstruct live cache objects from KVLayerSegment and RecurrentLayerSegment lists."""
+        from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
+        from .batch_quantized_kv_cache import BatchQuantizedKVCache
 
-        Input lists are non-sparse (no None entries). Output is ordered by layer_index.
-        """
-        all_states: dict[int, dict[str, Any]] = {}
+        result: dict[int, Any] = {}
 
-        for kv in kv_data:
-            li = kv.metadata['layer_index']
-            class_name = kv.metadata['class_name']
-            scales = kv.metadata['scales']
-            dq = CacheTranslator.dequantize_kv(kv.arrays, scales)
-
-            if class_name == 'RotatingKVCache':
-                all_states[li] = {
-                    'class_name': class_name,
-                    'state': (dq[0], dq[1]),
-                    'meta_state': (
-                        kv.metadata['max_size'],
-                        kv.metadata['keep'],
-                        kv.metadata['offset'],
-                    ),
-                }
+        for layer in kv_layers:
+            li = layer.metadata['layer_index']
+            if layer.metadata['class_name'] == 'RotatingKVCache':
+                dq_keys = mx.dequantize(
+                    layer.keys.packed, layer.keys.scales, layer.keys.biases,
+                    group_size=group_size, bits=bits,
+                )
+                dq_values = mx.dequantize(
+                    layer.values.packed, layer.values.scales, layer.values.biases,
+                    group_size=group_size, bits=bits,
+                )
+                max_size = layer.metadata['max_size']
+                if dq_keys.shape[-2] > max_size:
+                    dq_keys = dq_keys[..., -max_size:, :]
+                    dq_values = dq_values[..., -max_size:, :]
+                cache = _RotatingKVCache(max_size, layer.metadata.get('keep', 0))
+                cache.keys = dq_keys
+                cache.values = dq_values
+                cache.offset = layer.metadata.get('offset', dq_keys.shape[-2])
+                cache._idx = dq_keys.shape[-2]
             else:
-                all_states[li] = {
-                    'class_name': class_name,
-                    'state': tuple(dq),
-                    'meta_state': (kv.metadata.get('actual_end', dq[0].shape[-2]),),
-                }
+                cache = BatchQuantizedKVCache.from_quantized_arrays(
+                    keys=layer.keys,
+                    values=layer.values,
+                    n_tokens=layer.metadata.get('n_tokens', layer.keys.packed.shape[-2]),
+                    group_size=group_size,
+                    bits=bits,
+                ).extract(0)
+            result[li] = cache
 
-        for rec in recurrent_data:
-            li = rec.metadata['layer_index']
-            all_states[li] = {
-                'class_name': rec.metadata['class_name'],
-                'state': rec.arrays,
-                'meta_state': (),
-            }
+        for layer in recurrent_layers:
+            li = layer.metadata['layer_index']
+            cache_cls = layer.metadata.get('class_ref')
+            if cache_cls is not None and hasattr(cache_cls, 'from_state'):
+                result[li] = cache_cls.from_state(layer.arrays, ())
+            else:
+                from mlx_lm.models.cache import ArraysCache
+                cache = ArraysCache.from_state(layer.arrays, ())
+                result[li] = cache
 
-        return [all_states[li] for li in sorted(all_states)]
+        return [result[li] for li in sorted(result)]
 
     def fetch(self, request) -> CacheHit | None:
-        from .turn_prefix_cache import reconstruct_cache_from_states
-
         segments = self.messages_to_segments(request)
         if not segments:
             return None
@@ -289,21 +313,24 @@ class TurnCacheManager(CacheManager):
             )
 
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
-        assembled = self._assemble(kv_data, rec_data)
-        del kv_data  # free merged bf16 intermediates; graph still rooted in assembled
-        reconstructed = reconstruct_cache_from_states(assembled)
-        del assembled  # Python wrappers released; graph now rooted only in reconstructed
+        reconstructed = self._assemble(kv_data, rec_data, self._kv_group_size, self._kv_bits)
+        del kv_data, rec_data
         # Materialize the KVCache arrays now so the lazy computation graph
-        # (int8 trie arrays → dequantize → concat → cast) is freed before decode
-        # starts.  Without this every intermediate stays pinned in Metal memory
-        # until BatchGenerator happens to touch the cache.
+        # is freed before decode starts.
+        arrays_to_eval = []
         for _layer in (reconstructed or []):
-            _k = getattr(_layer, "keys", None)
-            _v = getattr(_layer, "values", None)
-            if _k is not None and not callable(_k):
-                mx.eval(_k)
-            if _v is not None and not callable(_v):
-                mx.eval(_v)
+            for attr in ('keys', 'values'):
+                v = getattr(_layer, attr, None)
+                if v is None or callable(v):
+                    continue
+                if isinstance(v, mx.array):
+                    arrays_to_eval.append(v)
+                else:
+                    for comp in (v if isinstance(v, (list, tuple)) else []):
+                        if isinstance(comp, mx.array):
+                            arrays_to_eval.append(comp)
+        if arrays_to_eval:
+            mx.eval(*arrays_to_eval)
         cached_tokens = ancestor.n_tokens
         remaining = list(request.prompt_token_ids[cached_tokens:])
         _turn_boundaries = getattr(request, '_turn_boundaries', None) or []
@@ -349,7 +376,7 @@ class TurnCacheManager(CacheManager):
         if cache:
             prev_end = path[-1].n_tokens if path else 0
             cache = self._slice_kv_to_delta(cache, prev_end)
-            kv_sparse, rec_sparse = self._segment(cache)
+            kv_sparse, rec_sparse = self._segment(cache, self._kv_group_size, self._kv_bits)
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
         else:
@@ -428,7 +455,7 @@ class TurnCacheManager(CacheManager):
                 ]
             prev_end = _turn_boundaries[abs_idx - 1] if abs_idx > 0 else 0
             extracted_cache = self._slice_kv_to_delta(extracted_cache, prev_end)
-            kv_sparse, rec_sparse = self._segment(extracted_cache)
+            kv_sparse, rec_sparse = self._segment(extracted_cache, self._kv_group_size, self._kv_bits)
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
         else:

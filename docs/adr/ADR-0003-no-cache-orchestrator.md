@@ -43,3 +43,17 @@ The `PrefixCache` and `SpillableCache` protocols in `kv_cache.py` are deprecated
 `boundaries(request) -> list[int]` is added as an `@abstractmethod`. The Scheduler calls it after `fetch()` (hit or miss) to populate `cs.prefill_boundaries`, replacing the two divergent `_turn_boundaries` reads in the old Scheduler code.
 
 The original decision — no `CacheOrchestrator` — stands. This amendment does not add a coordinator; it collapses a now-unnecessary abstraction layer.
+
+---
+
+## Addendum — 2026-05-29: `TurnCacheAdapter` absorbed into `TurnCacheManager`
+
+### Context
+
+`TurnCacheAdapter` was a stateless two-method class (`segment`, `assemble`) used exclusively inside `TurnCacheManager.__init__` as `self._orchestrator`. One caller, no external interface, no second implementation — deletion test passed immediately. The "Adapter" name also collided with the `CacheManager` concept that had just been established.
+
+### Amendment
+
+`TurnCacheAdapter` (`turn_cache_adapter.py`) is deleted. `segment` and `assemble` are now `_segment` and `_assemble` — private `@staticmethod`s on `TurnCacheManager`. `test_turn_cache_adapter.py` is deleted; coverage comes from `test_turn_prefix_cache_integration.py`, which tests the full `_segment → trie → collect_path_data → _assemble` round-trip for all three layer types (KVCache, RotatingKVCache, recurrent).
+
+`TurnCacheManager` is now the single module for the Scheduler-facing cache protocol: it owns fetch, store, boundaries, checkpoint insertion, and the live↔static format translation.

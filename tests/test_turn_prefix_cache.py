@@ -93,7 +93,7 @@ def test_config_defaults():
 def test_node_data_bytes_counts_dict_format_recurrent_state():
     """_node_data_bytes correctly accounts for dict-format recurrent_state tensor sizes."""
     from mlx_lm.models.cache import KVCache
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
 
     # 2 layers, each with keys+values of shape [1, 4, 10, 32] in float32 = 4 bytes/elem
     # Each tensor: 1*4*10*32 = 1280 elements * 4 bytes = 5120 bytes
@@ -119,7 +119,7 @@ def test_node_data_bytes_counts_dict_format_recurrent_state():
         },
     ]
 
-    recurrent_data = [StaticRecurrentData(arrays=extracted, metadata={})]
+    recurrent_data = [RecurrentLayerSegment(arrays=extracted, metadata={})]
 
     node = TurnNode(
         token_ids=[1],
@@ -168,19 +168,19 @@ def test_has_recurrent_state_not_set_for_kv_only_insert():
 
 
 def test_has_recurrent_state_set_on_hybrid_insert():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((2, 3))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     cache.insert(cache.root, seg([1, 2, 3]), kv_data=[], recurrent_data=rec, is_system_prompt=True)
     assert cache.has_recurrent_state
 
 
 def test_has_recurrent_state_survives_clear():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((2, 3))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     cache.insert(cache.root, seg([1]), kv_data=[], recurrent_data=rec, is_system_prompt=True)
     assert cache.has_recurrent_state
     cache.clear()
@@ -188,10 +188,10 @@ def test_has_recurrent_state_survives_clear():
 
 
 def test_load_sets_has_recurrent_state_for_hybrid_cache(tmp_path):
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache1 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     state = mx.zeros((2, 3))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     cache1.insert(cache1.root, seg([1, 2, 3], role="system"), kv_data=[], recurrent_data=rec, is_system_prompt=True)
     cache1.save(str(tmp_path))
 
@@ -213,10 +213,8 @@ def test_load_leaves_has_recurrent_state_false_for_kv_only_cache(tmp_path):
 
 def test_find_checkpoint_ancestor_kv_only_returns_deepest_kv_node():
     """In KV-only mode, find_checkpoint_ancestor returns the deepest node with kv_data."""
-    from vllm_mlx.cache_types import StaticKVData
     cache = make_cache(stride=0)
-    kv_item = StaticKVData(arrays=_make_kv(), metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'actual_end': 1})
-    kv_data = [kv_item]
+    kv_data = _make_kv_data()
     n1 = cache.insert(cache.root, seg([1], role="system"), kv_data=kv_data, recurrent_data=None, is_system_prompt=True)
     n2 = cache.insert(n1, seg([2]), kv_data=kv_data, recurrent_data=None)
     assert not cache.has_recurrent_state  # confirm KV-only mode
@@ -288,19 +286,19 @@ def test_insert_context_hash_differs_at_different_depths():
 
 
 def test_leaf_gets_recurrent_state():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     node = cache.insert(cache.root, seg(list(range(50))), recurrent_data=rec)
     assert node.recurrent_data is not None
 
 
 def test_temp_recurrent_pruned_on_non_stride_inner():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     n1 = cache.insert(cache.root, seg(list(range(50))), recurrent_data=rec)
     # n1 is leaf with temp recurrent (50 < 100)
     assert n1.recurrent_data is not None
@@ -310,10 +308,10 @@ def test_temp_recurrent_pruned_on_non_stride_inner():
 
 
 def test_permanent_checkpoint_at_stride():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     # 120 tokens >= stride → permanent
     n1 = cache.insert(cache.root, seg(list(range(120))), recurrent_data=rec)
     assert n1.is_permanent_checkpoint
@@ -323,10 +321,10 @@ def test_permanent_checkpoint_at_stride():
 
 
 def test_system_prompt_always_permanent():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=10000)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     # Only 50 tokens but is_system_prompt=True
     n = cache.insert(cache.root, seg(list(range(50)), role="system"), recurrent_data=rec,
                      is_system_prompt=True)
@@ -336,10 +334,10 @@ def test_system_prompt_always_permanent():
 
 
 def test_tokens_since_resets_after_permanent():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     # 120 tokens → permanent checkpoint
     n1 = cache.insert(cache.root, seg(list(range(120))), recurrent_data=rec)
     assert n1.is_permanent_checkpoint
@@ -349,10 +347,10 @@ def test_tokens_since_resets_after_permanent():
 
 
 def test_stride_zero_makes_every_node_permanent():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     n1 = cache.insert(cache.root, seg([1, 2]), recurrent_data=rec)
     assert n1.is_permanent_checkpoint
     n2 = cache.insert(n1, seg([3]), recurrent_data=rec)
@@ -394,10 +392,10 @@ def test_match_updates_last_used():
 
 
 def test_match_reports_has_recurrent():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     node = cache.insert(cache.root, seg([1]), recurrent_data=rec)
     _, has_recurrent = cache.match([seg([1])])
     assert has_recurrent
@@ -433,10 +431,10 @@ def test_release_all_nodes_in_path():
 
 
 def test_find_checkpoint_ancestor_returns_self_if_has_recurrent():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     n = cache.insert(cache.root, seg([1]), recurrent_data=rec)
     path = [n]
     ancestor = cache.find_checkpoint_ancestor(path)
@@ -452,10 +450,10 @@ def test_find_checkpoint_ancestor_returns_none_when_no_checkpoint():
 
 
 def test_find_checkpoint_ancestor_returns_leaf_if_leaf_has_recurrent():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=10000)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     n = cache.insert(cache.root, seg([1]), recurrent_data=rec)
     # n is a leaf → has temp recurrent
     assert n.recurrent_data is not None
@@ -464,10 +462,10 @@ def test_find_checkpoint_ancestor_returns_leaf_if_leaf_has_recurrent():
 
 
 def test_find_checkpoint_ancestor_skips_ssdref_nodes():
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     n1 = cache.insert(cache.root, seg([1]), recurrent_data=rec)
     n2 = cache.insert(n1, seg([2]), recurrent_data=rec)
     # Simulate n1's state being spilled to SSD
@@ -478,16 +476,22 @@ def test_find_checkpoint_ancestor_skips_ssdref_nodes():
 
 
 def _make_kv(n_tokens=1):
-    """Small real KV arrays for memory-tracked tests."""
-    return [mx.zeros((1, 4, n_tokens, 256), dtype=mx.bfloat16)]
+    """Small real KV arrays for memory-tracked tests (head_dim=256, divisible by group_size=64)."""
+    return mx.zeros((1, 4, n_tokens, 256), dtype=mx.bfloat16)
 
 
 def _make_kv_data(n_tokens=1):
-    """Small StaticKVData for memory-tracked tests."""
-    from vllm_mlx.cache_types import StaticKVData
-    return [StaticKVData(
-        arrays=_make_kv(n_tokens),
-        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'actual_end': n_tokens},
+    """Small KVLayerSegment for memory-tracked tests."""
+    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.kv_cache import QuantizedArray
+    keys = _make_kv(n_tokens)
+    values = _make_kv(n_tokens)
+    q_keys = QuantizedArray(*mx.quantize(keys, group_size=64, bits=8))
+    q_values = QuantizedArray(*mx.quantize(values, group_size=64, bits=8))
+    return [KVLayerSegment(
+        keys=q_keys,
+        values=q_values,
+        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'n_tokens': n_tokens},
     )]
 
 
@@ -553,10 +557,10 @@ def test_evicted_node_removed_from_parent_children():
 
 
 def test_save_and_load_roundtrip(tmp_path):
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((2, 3))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     seg1 = seg(list(range(10)), role="system")
     cache.insert(cache.root, seg1, kv_data=[], recurrent_data=rec, is_system_prompt=True)
 
@@ -578,12 +582,8 @@ def test_load_version_mismatch(tmp_path):
 
 
 def test_load_missing_kv_file_skips_node(tmp_path):
-    from vllm_mlx.cache_types import StaticKVData
     cache = make_cache(stride=0)
-    kv_data = [StaticKVData(
-        arrays=[mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)],
-        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'actual_end': 3},
-    )]
+    kv_data = _make_kv_data(n_tokens=3)
     cache.insert(cache.root, seg([1, 2, 3]), kv_data=kv_data)
     cache.save(str(tmp_path))
 
@@ -607,12 +607,8 @@ def make_ssd_cache(tmp_path, stride=512):
 
 
 def test_spill_replaces_kv_with_ssdref(tmp_path):
-    from vllm_mlx.cache_types import StaticKVData
     cache = make_ssd_cache(tmp_path)
-    kv_data = [StaticKVData(
-        arrays=[mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)],
-        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'actual_end': 3},
-    )]
+    kv_data = _make_kv_data(n_tokens=3)
     node = cache.insert(cache.root, seg([1, 2, 3]), kv_data=kv_data)
     cache._spill_to_ssd(node)
     assert isinstance(node.kv_data, SSDRef)
@@ -627,12 +623,8 @@ def test_spill_trie_still_matchable(tmp_path):
 
 
 def test_promote_restores_arrays(tmp_path):
-    from vllm_mlx.cache_types import StaticKVData
     cache = make_ssd_cache(tmp_path)
-    kv_data = [StaticKVData(
-        arrays=[mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)],
-        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'actual_end': 3},
-    )]
+    kv_data = _make_kv_data(n_tokens=3)
     node = cache.insert(cache.root, seg([1, 2, 3]), kv_data=kv_data)
     cache._spill_to_ssd(node)
     assert isinstance(node.kv_data, SSDRef)
@@ -651,13 +643,10 @@ def test_promote_returns_false_on_missing_file(tmp_path):
 
 def test_promote_restores_recurrent_state(tmp_path):
     """Regression test: recurrent state is properly reconstructed from SSD."""
-    from vllm_mlx.cache_types import StaticKVData, StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_ssd_cache(tmp_path)
-    kv_data = [StaticKVData(
-        arrays=[mx.ones((1, 4, 3, 16), dtype=mx.bfloat16)],
-        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'actual_end': 3},
-    )]
-    rec_data = [StaticRecurrentData(arrays=[mx.ones((2, 3)), mx.ones((4, 5))], metadata={})]
+    kv_data = _make_kv_data(n_tokens=3)
+    rec_data = [RecurrentLayerSegment(arrays=[mx.ones((2, 3)), mx.ones((4, 5))], metadata={})]
     node = cache.insert(cache.root, seg([1, 2, 3]), kv_data=kv_data, recurrent_data=rec_data)
 
     # Verify before spill
@@ -672,7 +661,7 @@ def test_promote_restores_recurrent_state(tmp_path):
     success = cache._promote_from_ssd(node)
     assert success
 
-    # Verify recurrent data is restored as list of StaticRecurrentData
+    # Verify recurrent data is restored as list of RecurrentLayerSegment
     assert isinstance(node.recurrent_data, list)
 
 
@@ -681,10 +670,10 @@ from unittest.mock import MagicMock
 
 def test_scheduler_integration_fetch_hits_cache():
     """Verify that matching path and recurrent state are set on the request."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     sys_seg = seg(list(range(20)), role="system")
     cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
 
@@ -701,10 +690,10 @@ def test_scheduler_integration_fetch_hits_cache():
 
 def test_scheduler_integration_store_extends_trie():
     """Verify that inserting new segments after match extends the trie."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     sys_seg = seg(list(range(10)), role="system")
     n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
 
@@ -735,10 +724,10 @@ def test_concurrent_ref_counts():
 
 def test_scheduler_stores_and_serves_cache():
     """Verify that segments are stored and served correctly in a realistic flow."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
 
     # Session 1: Build the cache
     sys_seg = seg(list(range(10)), role="system")
@@ -776,10 +765,10 @@ def test_scheduler_stores_and_serves_cache():
 
 def test_multiturn_continuation():
     """Session A stores [sys, u1, a1]; session A extended gets full hit on all three."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
 
     sys_seg = seg(list(range(50)), role="system")
     u1_seg = seg([100, 101, 102])
@@ -801,10 +790,10 @@ def test_multiturn_continuation():
 
 def test_cross_session_system_prompt_reuse():
     """Session B with same system prompt gets immediate recurrent state hit."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=10000)  # high stride so only sys_prompt gets permanent checkpoint
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
 
     sys_seg = seg(list(range(50)), role="system")
     n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
@@ -819,10 +808,10 @@ def test_cross_session_system_prompt_reuse():
 
 def test_mid_session_branching():
     """Two sessions share [sys, u1, a1] but diverge at u2."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
 
     sys_seg = seg(list(range(10)), role="system")
     u1_seg = seg([100])
@@ -1030,11 +1019,11 @@ def _make_extracted_state(n_layers=2, n_tokens=10):
 
 
 def test_save_and_load_recurrent_data_roundtrip(tmp_path):
-    """TurnNode with StaticRecurrentData survives a save/load round-trip."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    """TurnNode with RecurrentLayerSegment survives a save/load round-trip."""
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     state = mx.zeros((2, 3))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     mx.eval(state)
 
     seg_sys = Segment(role="system", token_ids=list(range(10)))
@@ -1779,14 +1768,14 @@ def test_find_checkpoint_ancestor_rejects_empty_recurrent_data():
 
 def test_find_checkpoint_ancestor_accepts_nonempty_recurrent_data():
     """Sanity check: nodes with actual recurrent data are still selected."""
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     cache.has_recurrent_state = True
     node = TurnNode(
         token_ids=[1, 2],
         context_hash=1,
         kv_data=[],
-        recurrent_data=[StaticRecurrentData(arrays=[mx.zeros((1, 16))], metadata={})],
+        recurrent_data=[RecurrentLayerSegment(arrays=[mx.zeros((1, 16))], metadata={})],
         parent=cache.root,
     )
     result = cache.find_checkpoint_ancestor([node])
@@ -1801,9 +1790,9 @@ def test_save_load_multi_node_parent_child(tmp_path):
     cache = make_cache(stride=0)
     s_sys = seg(list(range(10)), role="system")
     s_usr = seg([100, 101], role="user")
-    from vllm_mlx.cache_types import StaticRecurrentData
+    from vllm_mlx.cache_types import RecurrentLayerSegment
     state = mx.zeros((2,))
-    rec = [StaticRecurrentData(arrays=[state], metadata={})]
+    rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     n_sys = cache.insert(cache.root, s_sys, kv_data=[], recurrent_data=rec, is_system_prompt=True)
     cache.insert(n_sys, s_usr, kv_data=[], recurrent_data=rec)
 

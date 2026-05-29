@@ -1,6 +1,7 @@
-"""Integration tests: full segment → Trie → collect_path_data → assemble round-trip.
+"""Integration tests: full segment → Trie → collect_path_data → _assemble round-trip.
 
-Tests the spec's invariant: TurnCacheManager._assemble(trie.collect_path_data(node)) ≈ original_live_states
+Tests the spec's invariant:
+  TurnCacheManager._assemble(trie.collect_path_data(node)) ≈ reconstructed live cache objects
 (within quantization epsilon).
 """
 import math
@@ -11,7 +12,7 @@ from vllm_mlx.turn_prefix_cache import (
     TurnPrefixCache, TurnPrefixCacheConfig, Segment
 )
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
-from vllm_mlx.cache_types import StaticKVData, StaticRecurrentData
+from vllm_mlx.cache_types import KVLayerSegment, RecurrentLayerSegment
 
 
 @pytest.fixture
@@ -20,12 +21,12 @@ def trie():
     return TurnPrefixCache(cfg)
 
 
-def _make_kvcache_states(n_tokens: int, n_layers: int = 2, head_dim: int = 4):
-    """Create a list of KVCache state dicts."""
+def _make_kvcache_states(n_tokens: int, n_layers: int = 2, head_dim: int = 64):
+    """Create a list of KVCache state dicts. head_dim must be divisible by group_size=64."""
     states = []
     for i in range(n_layers):
-        keys = mx.ones((1, 1, n_tokens, head_dim), dtype=mx.float32) * (i + 1)
-        values = mx.ones((1, 1, n_tokens, head_dim), dtype=mx.float32) * (i + 10)
+        keys = mx.ones((1, 1, n_tokens, head_dim), dtype=mx.bfloat16) * (i + 1)
+        values = mx.ones((1, 1, n_tokens, head_dim), dtype=mx.bfloat16) * (i + 10)
         states.append({
             'class_name': 'KVCache',
             'state': (keys, values),
@@ -35,9 +36,10 @@ def _make_kvcache_states(n_tokens: int, n_layers: int = 2, head_dim: int = 4):
 
 
 def _make_rotating_states(n_tokens: int, max_size: int = 4, keep: int = 0):
-    """Create a single RotatingKVCache state dict."""
-    keys = mx.arange(n_tokens, dtype=mx.float32).reshape(1, 1, n_tokens, 1)
-    values = keys * 2
+    """Create a single RotatingKVCache state dict. head_dim=1 for simplicity."""
+    # Use head_dim=64 for group_size compatibility
+    keys = mx.ones((1, 1, n_tokens, 64), dtype=mx.bfloat16)
+    values = mx.ones((1, 1, n_tokens, 64), dtype=mx.bfloat16) * 2
     offset = n_tokens % max_size if n_tokens <= max_size else max_size
     return [{
         'class_name': 'RotatingKVCache',
@@ -48,6 +50,7 @@ def _make_rotating_states(n_tokens: int, max_size: int = 4, keep: int = 0):
 
 def test_kvcache_round_trip(trie):
     """KVCache: _segment → insert → match → collect_path_data → _assemble restores shape."""
+    from mlx_lm.models.cache import QuantizedKVCache
     live_states = _make_kvcache_states(n_tokens=4, n_layers=2)
 
     kv_sparse, rec_sparse = TurnCacheManager._segment(live_states)
@@ -64,11 +67,10 @@ def test_kvcache_round_trip(trie):
     assembled = TurnCacheManager._assemble(kv_out, rec_out)
 
     assert len(assembled) == 2  # 2 KV layers
-    for i, state in enumerate(assembled):
-        assert state['class_name'] == 'KVCache'
-        keys, values = state['state']
-        assert keys.shape == (1, 1, 4, 4)
-        assert values.shape == (1, 1, 4, 4)
+    for cache in assembled:
+        # Each assembled layer should be a QuantizedKVCache
+        assert isinstance(cache, QuantizedKVCache)
+        assert cache.offset == 4
     trie.release(path)
 
 
@@ -88,12 +90,14 @@ def test_kvcache_concatenates_across_two_nodes(trie):
     kv_out, _ = trie.collect_path_data(node2)
     assembled = TurnCacheManager._assemble(kv_out, [])
 
-    keys, values = assembled[0]['state']
-    assert keys.shape[-2] == 3 + 5, f"Expected 8 tokens, got {keys.shape[-2]}"
+    # After concat: offset should be 3 + 5 = 8
+    assert len(assembled) == 1
+    assert assembled[0].offset == 3 + 5
 
 
 def test_rotating_kvcache_uses_last_node(trie):
     """RotatingKVCache: collect_path_data uses only the deepest node's buffer."""
+    from mlx_lm.models.cache import RotatingKVCache
     states1 = _make_rotating_states(n_tokens=4, max_size=4)
     states2 = _make_rotating_states(n_tokens=4, max_size=4)
 
@@ -110,17 +114,18 @@ def test_rotating_kvcache_uses_last_node(trie):
     assert kv_out[0].metadata['layer_index'] == 0
     assert kv_out[0].metadata['merge_strategy'] == 'last'
 
-    # Verify full round-trip: _assemble reconstructs a RotatingKVCache state
+    # Verify full round-trip: _assemble reconstructs a RotatingKVCache
     assembled = TurnCacheManager._assemble(kv_out, [])
     assert len(assembled) == 1
-    assert assembled[0]['class_name'] == 'RotatingKVCache'
-    keys, values = assembled[0]['state']
-    assert keys.shape[-2] == 4  # max_size tokens after linearize
+    assert isinstance(assembled[0], RotatingKVCache)
+    # RotatingKVCache is dequantized, max_size=4
+    assert assembled[0].keys.shape[-2] == 4  # max_size tokens after linearize
 
 
 def test_recurrent_comes_from_leaf(trie):
     """Recurrent state is taken from the deepest node (not concatenated)."""
-    rec_state = [{'state': (mx.array([[[[1.0]]]], dtype=mx.bfloat16),), 'class_name': 'MambaLayer'}]
+    from mlx_lm.models.cache import ArraysCache
+    rec_state = (mx.array([[[[1.0]]]], dtype=mx.bfloat16),)
     live_states = [{'class_name': 'MambaLayer', 'state': rec_state, 'meta_state': ()}]
 
     _, rec_sparse = TurnCacheManager._segment(live_states)
@@ -136,15 +141,16 @@ def test_recurrent_comes_from_leaf(trie):
     assembled = TurnCacheManager._assemble([], rec_out)
 
     assert len(assembled) == 1
-    assert assembled[0]['class_name'] == 'MambaLayer'
+    assert isinstance(assembled[0], ArraysCache)
     trie.release(path)
 
 
 def test_collect_path_data_layer_ordering(trie):
     """Mixed KV + recurrent layers: _assemble output is ordered by layer_index."""
-    # Simulate: layer 0 = KVCache, layer 1 = Recurrent
-    kv_state = mx.ones((1, 1, 2, 4), dtype=mx.float32)
-    rec_raw = [{'state': (mx.ones((1, 1, 1, 4), dtype=mx.bfloat16),), 'class_name': 'Mamba'}]
+    from mlx_lm.models.cache import QuantizedKVCache, ArraysCache
+    # layer 0 = KVCache, layer 1 = Recurrent
+    kv_state = mx.ones((1, 1, 2, 64), dtype=mx.bfloat16)
+    rec_raw = (mx.ones((1, 1, 1, 64), dtype=mx.bfloat16),)
     live_states = [
         {'class_name': 'KVCache', 'state': (kv_state, kv_state), 'meta_state': (2,)},
         {'class_name': 'Mamba', 'state': rec_raw, 'meta_state': ()},
@@ -161,6 +167,6 @@ def test_collect_path_data_layer_ordering(trie):
     assembled = TurnCacheManager._assemble(kv_out, rec_out)
 
     assert len(assembled) == 2
-    # layer 0 = KVCache, layer 1 = Mamba
-    assert assembled[0]['class_name'] == 'KVCache'
-    assert assembled[1]['class_name'] == 'Mamba'
+    # layer 0 = KVCache (QuantizedKVCache), layer 1 = recurrent (ArraysCache)
+    assert isinstance(assembled[0], QuantizedKVCache)
+    assert isinstance(assembled[1], ArraysCache)

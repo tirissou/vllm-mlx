@@ -20,12 +20,12 @@ import mlx.core as mx
 from mlx.nn.utils import checkpoint
 import numpy as np
 
-from vllm_mlx.cache_types import StaticKVData, StaticRecurrentData
+from vllm_mlx.cache_types import KVLayerSegment, RecurrentLayerSegment
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-_CACHE_FORMAT_VERSION = 4
+_CACHE_FORMAT_VERSION = 5
 
 
 @dataclass
@@ -44,8 +44,8 @@ class SSDRef:
 class TurnNode:
     token_ids: list[int]
     context_hash: int
-    kv_data: list[StaticKVData] | SSDRef | None   # None for root sentinel
-    recurrent_data: list[StaticRecurrentData] | SSDRef | None
+    kv_data: list[KVLayerSegment] | SSDRef | None   # None for root sentinel
+    recurrent_data: list[RecurrentLayerSegment] | SSDRef | None
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
     ref_count: int = 0
@@ -109,8 +109,7 @@ def _node_data_bytes(node: TurnNode) -> int:
     total = 0
     if isinstance(node.kv_data, list):
         for kv in node.kv_data:
-            for arr in kv.arrays:
-                total += _arr_bytes(arr)
+            total += kv.keys.nbytes + kv.values.nbytes
     if isinstance(node.recurrent_data, list):
         for rec in node.recurrent_data:
             arrays = rec.arrays
@@ -182,8 +181,8 @@ class TurnPrefixCache:
         self,
         parent: TurnNode,
         segment: Segment,
-        kv_data: list[StaticKVData] | None = None,
-        recurrent_data: list[StaticRecurrentData] | None = None,
+        kv_data: list[KVLayerSegment] | None = None,
+        recurrent_data: list[RecurrentLayerSegment] | None = None,
         is_system_prompt: bool = False,
         acquire_lock: bool = True,
     ) -> TurnNode:
@@ -197,8 +196,8 @@ class TurnPrefixCache:
         self,
         parent: TurnNode,
         segment: Segment,
-        kv_data: list[StaticKVData] | None,
-        recurrent_data: list[StaticRecurrentData] | None,
+        kv_data: list[KVLayerSegment] | None,
+        recurrent_data: list[RecurrentLayerSegment] | None,
         is_system_prompt: bool = False,
         acquire_lock: bool = True,
     ) -> TurnNode:
@@ -302,52 +301,36 @@ class TurnPrefixCache:
 
     def collect_path_data(
         self, node: TurnNode
-    ) -> tuple[list[StaticKVData], list[StaticRecurrentData]]:
+    ) -> tuple[list[KVLayerSegment], list[RecurrentLayerSegment]]:
         """Walk from root to node and merge KV data per layer.
 
-        KVCache layers are concatenated across nodes (incremental).
-        RotatingKVCache layers use only the deepest node (full ring buffer).
-        Recurrent data comes from the leaf node only.
+        KVCache layers: concatenated via KVLayerSegment.concat() (incremental).
+        RotatingKVCache layers: deepest node only (full ring buffer).
+        Recurrent data: leaf node only.
         """
         path = self._inorder_path(node)
 
-        # Group per layer_index across path
-        kv_by_layer: dict[int, list[StaticKVData]] = {}
+        kv_by_layer: dict[int, list[KVLayerSegment]] = {}
         for n in path:
             if isinstance(n.kv_data, list):
                 for item in n.kv_data:
                     li = item.metadata['layer_index']
                     kv_by_layer.setdefault(li, []).append(item)
 
-        merged_kv: list[StaticKVData] = []
+        merged_kv: list[KVLayerSegment] = []
         for li in sorted(kv_by_layer):
             items = kv_by_layer[li]
-            strategy = items[0].metadata.get('merge_strategy', 'concatenate')
-            if strategy == 'last':
+            if items[0].metadata.get('merge_strategy', 'concatenate') == 'last':
                 merged_kv.append(items[-1])
             else:
-                from vllm_mlx.cache_translator import CacheTranslator
-                dq_keys_chunks = []
-                dq_values_chunks = []
-                for item in items:
-                    scales = item.metadata.get('scales', [1.0, 1.0])
-                    dq = CacheTranslator.dequantize_kv(item.arrays, scales)
-                    dq_keys_chunks.append(dq[0])
-                    dq_values_chunks.append(dq[1])
-                merged_keys = mx.concatenate(dq_keys_chunks, axis=-2)
-                merged_values = mx.concatenate(dq_values_chunks, axis=-2)
-                last_meta = dict(items[-1].metadata)
-                last_meta['actual_end'] = merged_keys.shape[-2]
-                last_meta['scales'] = [1.0, 1.0]  # already dequantized
-                merged_kv.append(StaticKVData(arrays=[merged_keys, merged_values], metadata=last_meta))
+                merged_kv.append(KVLayerSegment.concat(items))
 
         leaf = path[-1] if path else None
-        recurrent: list[StaticRecurrentData] = (
+        recurrent: list[RecurrentLayerSegment] = (
             leaf.recurrent_data
             if leaf and isinstance(leaf.recurrent_data, list)
             else []
         )
-
         return merged_kv, recurrent
 
     def _walk_nodes(self, node: TurnNode) -> list[TurnNode]:
@@ -438,15 +421,17 @@ class TurnPrefixCache:
                 kv_path = os.path.join(persist_dir, f"kv_{i}.safetensors")
                 rec_path: str | None = None
 
-                # Save kv_data: list[StaticKVData] — one safetensors file + JSON sidecar per item
+                # Save kv_data: list[KVLayerSegment] — one safetensors file + JSON sidecar per item
                 if isinstance(node.kv_data, list) and node.kv_data:
                     tensors: dict[str, np.ndarray] = {}
                     all_meta: list[dict] = []
                     for j, kv_item in enumerate(node.kv_data):
-                        for k, arr in enumerate(kv_item.arrays):
-                            if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
-                                arr = arr.astype(mx.float32)
-                            tensors[f"layer_{j}_arr_{k}"] = np.array(arr)
+                        tensors[f"layer_{j}_keys_packed"] = np.array(kv_item.keys.packed)
+                        tensors[f"layer_{j}_keys_scales"] = np.array(kv_item.keys.scales.astype(mx.float32))
+                        tensors[f"layer_{j}_keys_biases"] = np.array(kv_item.keys.biases.astype(mx.float32))
+                        tensors[f"layer_{j}_values_packed"] = np.array(kv_item.values.packed)
+                        tensors[f"layer_{j}_values_scales"] = np.array(kv_item.values.scales.astype(mx.float32))
+                        tensors[f"layer_{j}_values_biases"] = np.array(kv_item.values.biases.astype(mx.float32))
                         all_meta.append(kv_item.metadata)
                     tmp = kv_path + ".tmp"
                     st_save(tensors, tmp)
@@ -455,7 +440,7 @@ class TurnPrefixCache:
                     with open(meta_path_kv, "w") as mf:
                         json.dump(all_meta, mf)
 
-                # Save recurrent_data: list[StaticRecurrentData]
+                # Save recurrent_data: list[RecurrentLayerSegment]
                 if isinstance(node.recurrent_data, list) and node.recurrent_data:
                     rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
                     rec_tensors: dict[str, np.ndarray] = {}
@@ -536,8 +521,8 @@ class TurnPrefixCache:
 
             token_ids = list(np.frombuffer(tok_blob, dtype=np.int32))
 
-            # Load kv_data: list[StaticKVData]
-            kv_data: list[StaticKVData] | None = None
+            # Load kv_data: list[KVLayerSegment]
+            kv_data: list[KVLayerSegment] | None = None
             if os.path.exists(kv_path):
                 try:
                     tensors = st_load(kv_path)
@@ -545,21 +530,27 @@ class TurnPrefixCache:
                     if os.path.exists(meta_path_kv):
                         with open(meta_path_kv) as mf:
                             all_meta = json.load(mf)
-                        kv_items: list[StaticKVData] = []
+                        from vllm_mlx.kv_cache import QuantizedArray
+                        kv_items: list[KVLayerSegment] = []
                         for j, item_meta in enumerate(all_meta):
-                            arrays: list[mx.array] = []
-                            k = 0
-                            while f"layer_{j}_arr_{k}" in tensors:
-                                arrays.append(mx.array(tensors[f"layer_{j}_arr_{k}"]))
-                                k += 1
-                            kv_items.append(StaticKVData(arrays=arrays, metadata=item_meta))
+                            keys = QuantizedArray(
+                                packed=mx.array(tensors[f"layer_{j}_keys_packed"]),
+                                scales=mx.array(tensors[f"layer_{j}_keys_scales"]).astype(mx.bfloat16),
+                                biases=mx.array(tensors[f"layer_{j}_keys_biases"]).astype(mx.bfloat16),
+                            )
+                            values = QuantizedArray(
+                                packed=mx.array(tensors[f"layer_{j}_values_packed"]),
+                                scales=mx.array(tensors[f"layer_{j}_values_scales"]).astype(mx.bfloat16),
+                                biases=mx.array(tensors[f"layer_{j}_values_biases"]).astype(mx.bfloat16),
+                            )
+                            kv_items.append(KVLayerSegment(keys=keys, values=values, metadata=item_meta))
                         kv_data = kv_items if kv_items else None
                 except Exception as e:
                     logger.warning(f"[turn_cache] skipping node {ctx_hash}: {e}")
                     continue
 
-            # Load recurrent_data: list[StaticRecurrentData]
-            recurrent_data: list[StaticRecurrentData] | None = None
+            # Load recurrent_data: list[RecurrentLayerSegment]
+            recurrent_data: list[RecurrentLayerSegment] | None = None
             if rec_path and os.path.exists(rec_path):
                 try:
                     rec_tensors = st_load(rec_path)
@@ -567,7 +558,7 @@ class TurnPrefixCache:
                     if os.path.exists(rec_meta_path):
                         with open(rec_meta_path) as mf:
                             rec_meta_list = json.load(mf)
-                        rec_items: list[StaticRecurrentData] = []
+                        rec_items: list[RecurrentLayerSegment] = []
                         for j, item_meta in enumerate(rec_meta_list):
                             scales = item_meta.pop('_scales', None)
                             arrays_list: list[mx.array] = []
@@ -575,7 +566,7 @@ class TurnPrefixCache:
                             while f"rec_{j}_arr_{k}" in rec_tensors:
                                 arrays_list.append(mx.array(rec_tensors[f"rec_{j}_arr_{k}"]))
                                 k += 1
-                            rec_items.append(StaticRecurrentData(
+                            rec_items.append(RecurrentLayerSegment(
                                 arrays=arrays_list,
                                 metadata=item_meta,
                                 scales=scales,
@@ -651,10 +642,12 @@ class TurnPrefixCache:
             tensors: dict[str, np.ndarray] = {}
             all_meta: list[dict] = []
             for j, kv_item in enumerate(node.kv_data):
-                for k, arr in enumerate(kv_item.arrays):
-                    if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
-                        arr = arr.astype(mx.float32)
-                    tensors[f"layer_{j}_arr_{k}"] = np.array(arr)
+                tensors[f"layer_{j}_keys_packed"] = np.array(kv_item.keys.packed)
+                tensors[f"layer_{j}_keys_scales"] = np.array(kv_item.keys.scales.astype(mx.float32))
+                tensors[f"layer_{j}_keys_biases"] = np.array(kv_item.keys.biases.astype(mx.float32))
+                tensors[f"layer_{j}_values_packed"] = np.array(kv_item.values.packed)
+                tensors[f"layer_{j}_values_scales"] = np.array(kv_item.values.scales.astype(mx.float32))
+                tensors[f"layer_{j}_values_biases"] = np.array(kv_item.values.biases.astype(mx.float32))
                 all_meta.append(kv_item.metadata)
             tmp = path + ".tmp"
             st_save(tensors, tmp)
@@ -711,14 +704,20 @@ class TurnPrefixCache:
                 if os.path.exists(meta_path):
                     with open(meta_path) as mf:
                         all_meta = json.load(mf)
-                    kv_items: list[StaticKVData] = []
+                    from vllm_mlx.kv_cache import QuantizedArray
+                    kv_items: list[KVLayerSegment] = []
                     for j, item_meta in enumerate(all_meta):
-                        arrays: list[mx.array] = []
-                        k = 0
-                        while f"layer_{j}_arr_{k}" in tensors:
-                            arrays.append(mx.array(tensors[f"layer_{j}_arr_{k}"]))
-                            k += 1
-                        kv_items.append(StaticKVData(arrays=arrays, metadata=item_meta))
+                        keys = QuantizedArray(
+                            packed=mx.array(tensors[f"layer_{j}_keys_packed"]),
+                            scales=mx.array(tensors[f"layer_{j}_keys_scales"]).astype(mx.bfloat16),
+                            biases=mx.array(tensors[f"layer_{j}_keys_biases"]).astype(mx.bfloat16),
+                        )
+                        values = QuantizedArray(
+                            packed=mx.array(tensors[f"layer_{j}_values_packed"]),
+                            scales=mx.array(tensors[f"layer_{j}_values_scales"]).astype(mx.bfloat16),
+                            biases=mx.array(tensors[f"layer_{j}_values_biases"]).astype(mx.bfloat16),
+                        )
+                        kv_items.append(KVLayerSegment(keys=keys, values=values, metadata=item_meta))
                     node.kv_data = kv_items if kv_items else None
                 else:
                     node.kv_data = None
@@ -735,7 +734,7 @@ class TurnPrefixCache:
                     if os.path.exists(meta_path):
                         with open(meta_path) as mf:
                             rec_meta_list = json.load(mf)
-                        rec_items: list[StaticRecurrentData] = []
+                        rec_items: list[RecurrentLayerSegment] = []
                         for j, item_meta in enumerate(rec_meta_list):
                             scales = item_meta.pop('_scales', None)
                             arrays_list: list[mx.array] = []
@@ -743,7 +742,7 @@ class TurnPrefixCache:
                             while f"rec_{j}_arr_{k}" in rec_tensors:
                                 arrays_list.append(mx.array(rec_tensors[f"rec_{j}_arr_{k}"]))
                                 k += 1
-                            rec_items.append(StaticRecurrentData(
+                            rec_items.append(RecurrentLayerSegment(
                                 arrays=arrays_list,
                                 metadata=item_meta,
                                 scales=scales,
@@ -835,103 +834,3 @@ class TurnPrefixCache:
         return count
 
 
-def reconstruct_cache_from_states(extracted_states):
-    """Reconstruct cache objects from extracted cache states.
-
-    Inverse of Scheduler._extract_cache_states(). Pure function — no scheduler
-    state needed. Uses mlx-lm's _BaseCache.from_state() to reconstruct any
-    cache type (KVCache, MambaCache, etc.) from its state/meta_state.
-    """
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
-
-    if not extracted_states:
-        return None
-
-    try:
-        caches = []
-        for layer_state in extracted_states:
-            state = layer_state.get("state")
-            meta_state = layer_state.get("meta_state")
-            cache_cls = layer_state.get("class_ref")
-            if state is None:
-                return None
-
-            if layer_state.get("class_name") == "QuantizedRotatingKVCache":
-                from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
-                (w_k, s_k, b_k), (w_v, s_v, b_v) = state
-                n_tokens = int(meta_state[0]) if meta_state else 0
-                group_size = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
-                bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
-                max_size = int(meta_state[3]) if meta_state and len(meta_state) > 3 else n_tokens
-                keep = int(meta_state[4]) if meta_state and len(meta_state) > 4 else 0
-                # meta_state[5] is the total tokens seen (true offset); n_tokens is buffer size.
-                total_offset = int(meta_state[5]) if meta_state and len(meta_state) > 5 else n_tokens
-                keys = mx.dequantize(w_k, s_k, b_k, group_size=group_size, bits=bits)
-                values = mx.dequantize(w_v, s_v, b_v, group_size=group_size, bits=bits)
-                # Trim to max_size if concatenation across turns exceeded the window
-                if keys.shape[2] > max_size:
-                    keys = keys[..., -max_size:, :]
-                    values = values[..., -max_size:, :]
-                cache = _RotatingKVCache(max_size, keep)
-                cache.keys = keys
-                cache.values = values
-                cache.offset = total_offset
-                cache._idx = keys.shape[2]
-            elif layer_state.get("class_name") == "RotatingKVCache":
-                from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
-                keys, values = state[0], state[1]
-                max_size = int(meta_state[0]) if meta_state else keys.shape[2]
-                keep = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 0
-                offset = int(meta_state[2]) if meta_state and len(meta_state) > 2 else keys.shape[2]
-                # Trim to max_size if concatenation across turns exceeded the window
-                if keys.shape[2] > max_size:
-                    keys = keys[..., -max_size:, :]
-                    values = values[..., -max_size:, :]
-                cache = _RotatingKVCache(max_size, keep)
-                cache.keys = keys
-                cache.values = values
-                cache.offset = offset
-                cache._idx = keys.shape[2]
-            elif cache_cls is not None and hasattr(cache_cls, "from_state"):
-                from mlx_lm.models.cache import (
-                    BatchKVCache as _BatchKVCache,
-                    KVCache as _KVCache,
-                    QuantizedKVCache as _QuantizedKVCache,
-                )
-                if cache_cls is _BatchKVCache:
-                    keys, values = state[0], state[1]
-                    cache = _KVCache()
-                    cache.keys = keys
-                    cache.values = values
-                    cache.offset = keys.shape[2]
-                elif cache_cls is _QuantizedKVCache:
-                    # Keep int4 — VllmQuantizedKVCache.merge() → BatchQuantizedKVCache
-                    # so decode stays quantized (4× less KV bandwidth per step).
-                    # state = ((w_k, s_k, b_k), (w_v, s_v, b_v)); meta = (n, group, bits)
-                    from .batch_quantized_kv_cache import VllmQuantizedKVCache
-                    (w_k, s_k, b_k), (w_v, s_v, b_v) = state
-                    group_size = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
-                    bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
-                    n_tokens = int(meta_state[0]) if meta_state else w_k.shape[2]
-                    cache = VllmQuantizedKVCache(group_size=group_size, bits=bits)
-                    cache.keys = [w_k, s_k, b_k]
-                    cache.values = [w_v, s_v, b_v]
-                    cache.offset = n_tokens
-                else:
-                    cache = cache_cls.from_state(state, meta_state)
-            else:
-                from mlx_lm.models.cache import KVCache
-                if len(state) != 2:
-                    return None
-                cache = KVCache()
-                cache.keys, cache.values = state
-                cache.offset = int(meta_state[0]) if meta_state else cache.keys.shape[2]
-
-            caches.append(cache)
-
-        return caches
-
-    except Exception as e:
-        _log.info(f"[mid_prefill_cache] reconstruct EXCEPTION: {e}")
-        return None

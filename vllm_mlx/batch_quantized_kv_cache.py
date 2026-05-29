@@ -256,9 +256,8 @@ class BatchQuantizedKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def extract(self, idx: int) -> QuantizedKVCache:
-        cache = VllmQuantizedKVCache(group_size=self.group_size, bits=self.bits)
+        cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
         padding = self.left_padding[idx].item()
-        # QuantizedKVCache expects keys/values as a list of 3 arrays
         cache.keys = [
             mx.contiguous(k[idx : idx + 1, :, padding : self._idx, :])
             for k in self.keys
@@ -320,6 +319,23 @@ class BatchQuantizedKVCache(_BaseCache):
         return result
 
     @classmethod
+    def from_quantized_arrays(
+        cls,
+        keys: "QuantizedArray",
+        values: "QuantizedArray",
+        n_tokens: int,
+        group_size: int = 64,
+        bits: int = 8,
+    ) -> "BatchQuantizedKVCache":
+        """Construct from pre-merged QuantizedArrays without going through update_and_fetch."""
+        result = cls([0], group_size=group_size, bits=bits)
+        result.keys = keys
+        result.values = values
+        result._idx = n_tokens
+        result.offset = mx.array([n_tokens])
+        return result
+
+    @classmethod
     def from_batch_kvcache(
         cls, bkv, group_size: int = 64, bits: int = 4
     ) -> BatchQuantizedKVCache:
@@ -335,18 +351,6 @@ class BatchQuantizedKVCache(_BaseCache):
         result.keys = QuantizedArray(*mx.quantize(k, group_size=group_size, bits=bits))
         result.values = QuantizedArray(*mx.quantize(v, group_size=group_size, bits=bits))
         return result
-
-
-class VllmQuantizedKVCache(QuantizedKVCache):
-    """Single-sequence quantized KV cache returned by BatchQuantizedKVCache.extract().
-
-    Mirrors the mlx-lm pattern: KVCache.merge → BatchKVCache,
-    RotatingKVCache.merge → BatchRotatingKVCache.
-    """
-
-    @classmethod
-    def merge(cls, caches):
-        return BatchQuantizedKVCache.merge(caches)
 
 
 def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4):
@@ -385,5 +389,10 @@ def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64,
         return [BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers]
     return [BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
             for _ in model.layers]
+
+
+# Patch QuantizedKVCache.merge so that single-sequence caches extracted from a batch
+# merge back into BatchQuantizedKVCache — following the mlx-lm KVCache↔BatchKVCache pattern.
+QuantizedKVCache.merge = classmethod(lambda cls, caches: BatchQuantizedKVCache.merge(caches))
 
 

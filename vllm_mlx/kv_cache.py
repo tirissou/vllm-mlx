@@ -207,15 +207,35 @@ def extract_layer_state(layer) -> dict | None:
     Converts raw KVCache or BatchKVCache objects to normalized dict form with
     state, meta_state, class_name, and class_ref. Returns None if layer lacks
     the required .state and .meta_state attributes.
+
+    For QuantizedKVCache, state is dequantized to plain (keys, values) mx.arrays
+    so that _slice_kv_to_delta and _segment can treat all KV states uniformly.
     """
-    if hasattr(layer, "state") and hasattr(layer, "meta_state"):
-        return {
-            "state": layer.state,
-            "meta_state": layer.meta_state,
-            "class_name": type(layer).__name__,
-            "class_ref": type(layer),
-        }
-    return None
+    if not (hasattr(layer, "state") and hasattr(layer, "meta_state")):
+        return None
+
+    raw_state = layer.state
+
+    # QuantizedKVCache.state returns (tuple-of-3, tuple-of-3) rather than
+    # (mx.array, mx.array). Normalize to plain arrays so all downstream code
+    # (slicing, _segment) can assume a uniform (keys, values) structure.
+    if isinstance(raw_state[0], (list, tuple)):
+        from mlx_lm.models.cache import QuantizedKVCache
+        if isinstance(layer, QuantizedKVCache):
+            dq_keys = mx.dequantize(
+                *raw_state[0], group_size=layer.group_size, bits=layer.bits
+            )
+            dq_values = mx.dequantize(
+                *raw_state[1], group_size=layer.group_size, bits=layer.bits
+            )
+            raw_state = (dq_keys, dq_values)
+
+    return {
+        "state": raw_state,
+        "meta_state": layer.meta_state,
+        "class_name": type(layer).__name__,
+        "class_ref": type(layer),
+    }
 
 
 def _build_batch_kv_types() -> tuple:

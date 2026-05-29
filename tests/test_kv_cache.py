@@ -214,23 +214,23 @@ class TestBatchQuantizedKVCacheAlignment:
         mx.eval(cache.keys, cache.values)
         return cache
 
-    def test_extract_returns_vllm_quantized_kv_cache(self):
-        from vllm_mlx.batch_quantized_kv_cache import VllmQuantizedKVCache
+    def test_extract_returns_quantized_kv_cache(self):
+        from mlx_lm.models.cache import QuantizedKVCache
         cache = self._make_cache(B=2)
         extracted = cache.extract(0)
-        assert isinstance(extracted, VllmQuantizedKVCache)
+        assert isinstance(extracted, QuantizedKVCache)
 
-    def test_vllm_quantized_kv_cache_merge_returns_batch_quantized(self):
-        from vllm_mlx.batch_quantized_kv_cache import VllmQuantizedKVCache
+    def test_quantized_kv_cache_merge_returns_batch_quantized(self):
+        from mlx_lm.models.cache import QuantizedKVCache
         cache = self._make_cache(B=2, T=16)
         e0, e1 = cache.extract(0), cache.extract(1)
-        merged = VllmQuantizedKVCache.merge([e0, e1])
+        merged = QuantizedKVCache.merge([e0, e1])
         assert isinstance(merged, BatchQuantizedKVCache)
         assert merged._idx == 16
         assert merged.keys.packed.shape[0] == 2
 
     def test_polymorphic_merge_matches_engine_call_site(self):
-        """Engine calls extracted[0].merge(extracted) — must work via VllmQuantizedKVCache."""
+        """Engine calls extracted[0].merge(extracted) — must work via QuantizedKVCache.merge patch."""
         cache = self._make_cache(B=3)
         extracted = [cache.extract(i) for i in range(3)]
         merged = extracted[0].merge(extracted)
