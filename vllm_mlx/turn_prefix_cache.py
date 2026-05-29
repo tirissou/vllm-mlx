@@ -371,8 +371,8 @@ class TurnPrefixCache:
         it is restored as a plain RotatingKVCache for unquantized decoding.
         """
         from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
-        _KV_GROUP_SIZE = 64
-        _KV_BITS = 4
+        _KV_GROUP_SIZE = 32
+        _KV_BITS = 8
 
         kv = []
         kv_indices = []
