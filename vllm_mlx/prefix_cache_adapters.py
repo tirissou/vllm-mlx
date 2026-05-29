@@ -174,14 +174,18 @@ class TurnCacheManager(CacheManager):
 
             if class_name == 'RotatingKVCache':
                 try:
-                    keep, max_size, offset, _ = map(int, meta)
+                    keep, max_size, offset, _idx = map(int, meta)
                 except (TypeError, ValueError):
                     max_size = state[0].shape[2]
                     offset = max_size
+                    _idx = max_size
                     keep = 0
 
-                lin_keys = _linearize(state[0], offset, max_size)
-                lin_values = _linearize(state[1], offset, max_size)
+                # _idx is the ring write position (offset % max_size when wrapped,
+                # or max_size when the buffer just became full without wrapping).
+                # Using raw offset here would slice out-of-bounds when offset > max_size.
+                lin_keys = _linearize(state[0], _idx, max_size)
+                lin_values = _linearize(state[1], _idx, max_size)
                 q_keys = QuantizedArray(*mx.quantize(lin_keys, group_size=group_size, bits=bits))
                 q_values = QuantizedArray(*mx.quantize(lin_values, group_size=group_size, bits=bits))
 
@@ -196,6 +200,7 @@ class TurnCacheManager(CacheManager):
                         'max_size': max_size,
                         'keep': keep,
                         'offset': offset,
+                        '_idx': _idx,
                     },
                 )
 
@@ -261,11 +266,23 @@ class TurnCacheManager(CacheManager):
                 if dq_keys.shape[-2] > max_size:
                     dq_keys = dq_keys[..., -max_size:, :]
                     dq_values = dq_values[..., -max_size:, :]
+                _idx = layer.metadata.get('_idx', dq_keys.shape[-2])
+                # _segment stores keys in chronological (linearized) order.
+                # RotatingKVCache expects ring order: rotate back so the ring write
+                # position lands at _idx, matching the live cache layout.
+                if 0 < _idx < max_size and dq_keys.shape[-2] == max_size:
+                    split = max_size - _idx
+                    dq_keys = mx.concatenate(
+                        [dq_keys[..., split:, :], dq_keys[..., :split, :]], axis=-2
+                    )
+                    dq_values = mx.concatenate(
+                        [dq_values[..., split:, :], dq_values[..., :split, :]], axis=-2
+                    )
                 cache = _RotatingKVCache(max_size, layer.metadata.get('keep', 0))
                 cache.keys = dq_keys
                 cache.values = dq_values
                 cache.offset = layer.metadata.get('offset', dq_keys.shape[-2])
-                cache._idx = dq_keys.shape[-2]
+                cache._idx = _idx
             else:
                 cache = BatchQuantizedKVCache.from_quantized_arrays(
                     keys=layer.keys,

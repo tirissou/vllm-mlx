@@ -1240,12 +1240,17 @@ class Scheduler:
                     )
             except Exception as e:
                 if cache_to_use is not None:
+                    # Release the nodes to avoid refcount leaks if the insert fails
+                    if request._cache_state.turn_path:
+                        self._prefix_cache.release(request._cache_state.turn_path)
+
                     logger.warning(
                         f"[cache_insert_error] request={request.request_id[:12]} "
                         f"cache insert failed ({e}), retrying without cache"
                     )
                     cache_to_use = None
                     request._cache_state.cache = None
+                    request._cache_state.hit_type = "miss"
                     request._cache_state.cached_tokens = 0
                     request._cache_state.remaining_tokens = request.prompt_token_ids
                     request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
