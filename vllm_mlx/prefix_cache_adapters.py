@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adapters that bridge concrete prefix cache backends to the PrefixCache protocol."""
+"""Adapters that bridge concrete prefix cache backends to the CacheManager protocol."""
 
 from __future__ import annotations
 
@@ -7,10 +7,14 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+import mlx.core as mx
+
 from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 from .kv_cache import CacheHit, CacheIndexMap, _BATCH_KV_TYPES
+from .cache_types import StaticKVData, StaticRecurrentData
+from .cache_translator import CacheTranslator
 
 
 class CacheManager(ABC):
@@ -106,16 +110,12 @@ class CacheManager(ABC):
         )
         return self._cache_index_map
 
-class TurnCacheManager(CacheManager):
-    """Adapts TurnPrefixCache to the CacheManager protocol.
 
-    Wires TurnPrefixCache (index) + TurnCacheAdapter (orchestrator) together.
-    """
+class TurnCacheManager(CacheManager):
+    """Adapts TurnPrefixCache to the CacheManager protocol."""
 
     def __init__(self, inner: TurnPrefixCache):
-        from vllm_mlx.turn_cache_adapter import TurnCacheAdapter as Orchestrator
         self._inner = inner
-        self._orchestrator = Orchestrator()
 
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state
@@ -147,6 +147,121 @@ class TurnCacheManager(CacheManager):
             segments.append(Segment(role='user', token_ids=full_tokens[prev:]))
         return segments
 
+    @staticmethod
+    def _segment(
+        live_states: list[dict[str, Any]]
+    ) -> tuple[list[StaticKVData | None], list[StaticRecurrentData | None]]:
+        """Transform live cache states into normalized static format.
+
+        Returns two sparse lists parallel to live_states: kv_data_list and rec_data_list.
+        Exactly one of kv_data_list[i] / rec_data_list[i] is non-None for each i.
+        """
+        kv_data_list: list[StaticKVData | None] = [None] * len(live_states)
+        rec_data_list: list[StaticRecurrentData | None] = [None] * len(live_states)
+
+        for i, state_dict in enumerate(live_states):
+            class_name = state_dict['class_name']
+            state = state_dict['state']
+            meta = state_dict.get('meta_state', ())
+
+            if class_name == 'RotatingKVCache':
+                try:
+                    keep, max_size, offset, _ = map(int, meta)
+                except (TypeError, ValueError):
+                    max_size = state[0].shape[2]
+                    offset = max_size
+                    keep = 0
+
+                raw_keys, raw_values = state
+                lin_keys = CacheTranslator.linearize(raw_keys, offset, max_size)
+                lin_values = CacheTranslator.linearize(raw_values, offset, max_size)
+                q_arrays, q_scales = CacheTranslator.quantize_kv([lin_keys, lin_values])
+
+                kv_data_list[i] = StaticKVData(
+                    arrays=q_arrays,
+                    metadata={
+                        'class_name': 'RotatingKVCache',
+                        'layer_index': i,
+                        'merge_strategy': 'last',
+                        'max_size': max_size,
+                        'keep': keep,
+                        'offset': offset,
+                        'scales': q_scales,
+                    },
+                )
+
+            elif 'KVCache' in class_name:
+                try:
+                    actual_end = int(meta[0]) if meta else state[0].shape[2]
+                except (TypeError, ValueError, IndexError):
+                    actual_end = state[0].shape[2]
+
+                sliced = [arr[:, :, :actual_end, :] for arr in state[:2]]
+                q_arrays, q_scales = CacheTranslator.quantize_kv(sliced)
+
+                kv_data_list[i] = StaticKVData(
+                    arrays=q_arrays,
+                    metadata={
+                        'class_name': class_name,
+                        'layer_index': i,
+                        'merge_strategy': 'concatenate',
+                        'actual_end': actual_end,
+                        'scales': q_scales,
+                    },
+                )
+
+            else:
+                rec_data_list[i] = StaticRecurrentData(
+                    arrays=state,
+                    metadata={'class_name': class_name, 'layer_index': i},
+                )
+
+        return kv_data_list, rec_data_list
+
+    @staticmethod
+    def _assemble(
+        kv_data: list[StaticKVData],
+        recurrent_data: list[StaticRecurrentData],
+    ) -> list[dict[str, Any]]:
+        """Reconstruct live cache states from compact static data lists.
+
+        Input lists are non-sparse (no None entries). Output is ordered by layer_index.
+        """
+        all_states: dict[int, dict[str, Any]] = {}
+
+        for kv in kv_data:
+            li = kv.metadata['layer_index']
+            class_name = kv.metadata['class_name']
+            scales = kv.metadata['scales']
+            dq = CacheTranslator.dequantize_kv(kv.arrays, scales)
+
+            if class_name == 'RotatingKVCache':
+                all_states[li] = {
+                    'class_name': class_name,
+                    'state': (dq[0], dq[1]),
+                    'meta_state': (
+                        kv.metadata['max_size'],
+                        kv.metadata['keep'],
+                        kv.metadata['offset'],
+                    ),
+                }
+            else:
+                all_states[li] = {
+                    'class_name': class_name,
+                    'state': tuple(dq),
+                    'meta_state': (kv.metadata.get('actual_end', dq[0].shape[-2]),),
+                }
+
+        for rec in recurrent_data:
+            li = rec.metadata['layer_index']
+            all_states[li] = {
+                'class_name': rec.metadata['class_name'],
+                'state': rec.arrays,
+                'meta_state': (),
+            }
+
+        return [all_states[li] for li in sorted(all_states)]
+
     def fetch(self, request) -> CacheHit | None:
         from .turn_prefix_cache import reconstruct_cache_from_states
 
@@ -174,8 +289,21 @@ class TurnCacheManager(CacheManager):
             )
 
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
-        assembled = self._orchestrator.assemble(kv_data, rec_data)
+        assembled = self._assemble(kv_data, rec_data)
+        del kv_data  # free merged bf16 intermediates; graph still rooted in assembled
         reconstructed = reconstruct_cache_from_states(assembled)
+        del assembled  # Python wrappers released; graph now rooted only in reconstructed
+        # Materialize the KVCache arrays now so the lazy computation graph
+        # (int8 trie arrays → dequantize → concat → cast) is freed before decode
+        # starts.  Without this every intermediate stays pinned in Metal memory
+        # until BatchGenerator happens to touch the cache.
+        for _layer in (reconstructed or []):
+            _k = getattr(_layer, "keys", None)
+            _v = getattr(_layer, "values", None)
+            if _k is not None and not callable(_k):
+                mx.eval(_k)
+            if _v is not None and not callable(_v):
+                mx.eval(_v)
         cached_tokens = ancestor.n_tokens
         remaining = list(request.prompt_token_ids[cached_tokens:])
         _turn_boundaries = getattr(request, '_turn_boundaries', None) or []
@@ -221,7 +349,7 @@ class TurnCacheManager(CacheManager):
         if cache:
             prev_end = path[-1].n_tokens if path else 0
             cache = self._slice_kv_to_delta(cache, prev_end)
-            kv_sparse, rec_sparse = self._orchestrator.segment(cache)
+            kv_sparse, rec_sparse = self._segment(cache)
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
         else:
@@ -250,7 +378,7 @@ class TurnCacheManager(CacheManager):
                 state = s["state"]
                 meta = s.get("meta_state") or ()
                 actual_end = int(meta[0]) if meta else state[0].shape[2]
-                sliced_state = tuple(arr[:, :, prev_end:actual_end, :] for arr in state[:2])
+                sliced_state = tuple(mx.array(arr[:, :, prev_end:actual_end, :]) for arr in state[:2])
                 new_meta = (actual_end - prev_end,) + tuple(meta[1:])
                 s = {**s, "state": sliced_state, "meta_state": new_meta}
             result.append(s)
@@ -300,7 +428,7 @@ class TurnCacheManager(CacheManager):
                 ]
             prev_end = _turn_boundaries[abs_idx - 1] if abs_idx > 0 else 0
             extracted_cache = self._slice_kv_to_delta(extracted_cache, prev_end)
-            kv_sparse, rec_sparse = self._orchestrator.segment(extracted_cache)
+            kv_sparse, rec_sparse = self._segment(extracted_cache)
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
         else:
@@ -323,5 +451,3 @@ class TurnCacheManager(CacheManager):
     def load(self, cache_dir: str) -> int:
         self._inner.load(cache_dir)
         return 0
-
-

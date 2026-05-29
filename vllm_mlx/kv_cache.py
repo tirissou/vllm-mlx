@@ -46,7 +46,7 @@ class RequestCacheState:
     decoded_cache: list | None = None
     prev_recurrent: list | None = None   # N-1 recurrent snapshot; was set dynamically before
 
-    # Owned by TurnCacheAdapter across the request lifecycle
+    # Owned by TurnCacheManager across the request lifecycle
     turn_path: list = field(default_factory=list)   # list[TurnNode]; typed replacement for adapter_state
 
 
@@ -93,7 +93,7 @@ class PrefixCache(Protocol):
 
         extracted_cache is a list of dicts as returned by
         Scheduler._extract_cache_states(). Most adapters implement this as
-        a no-op; TurnCacheAdapter captures boundary states.
+        a no-op; TurnCacheManager captures boundary states.
         """
         ...
 

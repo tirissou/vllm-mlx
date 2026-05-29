@@ -147,14 +147,14 @@ class TurnPrefixCache:
 
     # ── SpillableCache / PrefixCache protocol stubs ─────────────────────────
     # TurnPrefixCache is a low-level trie; the PrefixCache protocol is
-    # implemented by TurnCacheAdapter.  These stubs exist solely so that
+    # implemented by TurnCacheManager.  These stubs exist solely so that
     # isinstance(cache, SpillableCache) returns True (runtime_checkable).
 
     def fetch(self, request) -> None:          # type: ignore[override]
-        raise NotImplementedError("Use TurnCacheAdapter.fetch()")
+        raise NotImplementedError("Use TurnCacheManager.fetch()")
 
     def store(self, request, cache: list) -> bool:  # type: ignore[override]
-        raise NotImplementedError("Use TurnCacheAdapter.store()")
+        raise NotImplementedError("Use TurnCacheManager.store()")
 
     def get_stats(self) -> dict:
         return {"memory_bytes": self._memory_bytes}
@@ -168,7 +168,7 @@ class TurnPrefixCache:
     def on_prefill_checkpoint(
         self, request: Any, processed_tokens: int, extracted_cache: list
     ) -> None:
-        pass  # no-op; handled by TurnCacheAdapter
+        pass  # no-op; handled by TurnCacheManager
 
     def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
         path = []

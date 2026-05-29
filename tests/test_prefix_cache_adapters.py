@@ -143,9 +143,9 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     request.prompt_token_ids = list(range(10))  # 10 tokens; B_sys=5 → sys=[0-4], user=[5-9]
     request._turn_boundaries = [5]
 
-    # Patch the orchestrator so segment() returns empty sparse lists without needing real arrays
+    # Patch _segment so it returns empty sparse lists without needing real arrays
     kv_placeholder = StaticKVData(arrays=[], metadata={'layer_index': 0})
-    with patch.object(adapter._orchestrator, 'segment', return_value=([kv_placeholder], [None])):
+    with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])):
         extracted = [{"state": (None, None), "class_name": "KVCache"}]
         adapter.on_prefill_checkpoint(request, 5, extracted)
 
@@ -453,7 +453,7 @@ def test_on_prefill_checkpoint_at_boundary_inserts_node():
     req._cache_state.turn_path = []
     extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}]
     kv_placeholder = StaticKVData(arrays=[], metadata={'layer_index': 0})
-    with patch.object(adapter._orchestrator, 'segment', return_value=([kv_placeholder], [None])):
+    with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])):
         adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
     assert inner.insert.called
     assert new_node in req._cache_state.turn_path
@@ -483,11 +483,11 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
         cached_tokens=0,
     )
     extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}]
-    # Verify that on_prefill_checkpoint delegates to _orchestrator.segment (not inner.split_cache_arrays)
+    # Verify that on_prefill_checkpoint delegates to _segment (not inner.split_cache_arrays)
     kv_placeholder = StaticKVData(arrays=[], metadata={'layer_index': 0})
-    with patch.object(adapter._orchestrator, 'segment', return_value=([kv_placeholder], [None])) as mock_seg:
+    with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])) as mock_seg:
         adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
-    # orchestrator.segment should have been called with extracted_cache
+    # _segment should have been called with extracted_cache
     mock_seg.assert_called_once_with(extracted)
     # inner.split_cache_arrays must NOT be called (it was the old API)
     inner.split_cache_arrays.assert_not_called()

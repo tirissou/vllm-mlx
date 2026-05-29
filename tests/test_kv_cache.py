@@ -354,9 +354,9 @@ class TestTurnCacheAdapterMessages:
     """_messages_to_segments is a pure function of request fields."""
 
     def _call(self, tokens, boundaries):
-        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.prefix_cache_adapters import TurnCacheManager
         req = _make_turn_request(tokens, boundaries)
-        return TurnCacheAdapter.messages_to_segments(req)
+        return TurnCacheManager.messages_to_segments(req)
 
     def test_no_boundaries_returns_empty(self):
         segs = self._call(list(range(50)), [])
@@ -382,13 +382,13 @@ class TestTurnCacheAdapterMessages:
 
 
 class TestTurnCacheAdapterFetch:
-    """TurnCacheAdapter.fetch path as handle; miss returns None."""
+    """TurnCacheManager.fetch path as handle; miss returns None."""
 
     def _make_adapter(self):
         from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
-        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.prefix_cache_adapters import TurnCacheManager
         inner = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
-        return TurnCacheAdapter(inner), inner
+        return TurnCacheManager(inner), inner
 
     def test_miss_returns_none(self):
         adapter, _ = self._make_adapter()
