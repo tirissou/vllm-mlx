@@ -20,10 +20,12 @@ import mlx.core as mx
 from mlx.nn.utils import checkpoint
 import numpy as np
 
+from vllm_mlx.cache_types import StaticKVData, StaticRecurrentData
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-_CACHE_FORMAT_VERSION = 2
+_CACHE_FORMAT_VERSION = 3
 
 
 @dataclass
@@ -42,16 +44,14 @@ class SSDRef:
 class TurnNode:
     token_ids: list[int]
     context_hash: int
-    kv_arrays: list[mx.array] | SSDRef | None   # None only for root sentinel
-    kv_scales: list[float] | None
-    recurrent_state: Any | SSDRef | None         # list of per-layer states, or SSDRef
-    recurrent_scales: list[list[float]] | None = None   # per-layer, per-tensor per-channel scales (int8 only)
+    kv_data: list[StaticKVData] | SSDRef | None   # None for root sentinel
+    recurrent_data: list[StaticRecurrentData] | SSDRef | None
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
     ref_count: int = 0
     last_used: float = field(default_factory=time.time)
     is_permanent_checkpoint: bool = False
-    tokens_since_checkpoint: int = 0  # cumulative tokens since last permanent checkpoint
+    tokens_since_checkpoint: int = 0
 
     @property
     def is_leaf(self) -> bool:
@@ -65,7 +65,8 @@ class TurnNode:
         if tstamp is None:
             tstamp = time.time()
         self.last_used = tstamp
-        if self.parent: self.parent.touch(tstamp)
+        if self.parent:
+            self.parent.touch(tstamp)
 
     @property
     def n_tokens(self) -> int:
@@ -104,205 +105,28 @@ def _arr_bytes(arr) -> int:
 
 
 def _node_data_bytes(node: TurnNode) -> int:
-    """Estimate bytes used by a node's kv_arrays and recurrent_state."""
-    kv_total = 0
-    rec_total = 0
-    if isinstance(node.kv_arrays, list):
-        for arr in node.kv_arrays:
-            if isinstance(arr, mx.array):
-                kv_total += _arr_bytes(arr)
-            elif isinstance(arr, (tuple, list)):
-                # nested format: (q_keys, q_values) where each is a (packed, scales, biases) 3-tuple
-                for item in arr:
-                    if isinstance(item, (tuple, list)):
-                        kv_total += sum(_arr_bytes(a) for a in item)
-                    elif isinstance(item, mx.array):
-                        kv_total += _arr_bytes(item)
-    if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
-        state = node.recurrent_state
-        if isinstance(state, mx.array):
-            rec_total += _arr_bytes(state)
-        elif isinstance(state, list):
-            for layer in state:
-                if isinstance(layer, dict):
-                    for arr in layer.get("state", ()):
-                        if hasattr(arr, "itemsize"):
-                            rec_total += _arr_bytes(arr)
-                elif isinstance(layer, mx.array):
-                    rec_total += _arr_bytes(layer)
-                elif isinstance(layer, (list, tuple)):
-                    for arr in layer:
-                        if hasattr(arr, "itemsize"):
-                            rec_total += _arr_bytes(arr)
-    return kv_total + rec_total
-
-
-def _quantize_kv(
-    kv_arrays: list[mx.array],
-) -> tuple[list[mx.array], list[float]]:
-    """Quantize bf16 KV arrays to int8 with per-tensor scale."""
-    quantized: list[mx.array] = []
-    scales: list[float] = []
-    for arr in kv_arrays:
-        arr_f32 = arr.astype(mx.float32)
-        max_val = mx.max(mx.abs(arr_f32)).item()
-        scale = max_val / 127.0 if max_val > 0 else 1.0
-        q = mx.clip(mx.round(arr_f32 / scale), -127, 127).astype(mx.int8)
-        quantized.append(q)
-        scales.append(scale)
-    return quantized, scales
-
-
-def _dequantize_kv(
-    kv_int8: list[mx.array], scales: list[float]
-) -> list[mx.array]:
-    """Dequantize int8 KV arrays back to bf16."""
-    return [
-        (arr.astype(mx.float32) * scale).astype(mx.bfloat16)
-        for arr, scale in zip(kv_int8, scales)
-    ]
-
-
-def _quantize_recurrent(
-    recurrent_state: Any,
-    dtype: str,
-) -> tuple[Any, list[list[float]] | None]:
-    """Quantize/cast recurrent state to the configured dtype.
-
-    For int8, uses per-channel (last-axis) scales for better precision on small tensors.
-    Returns (quantized_state, scales) where scales is None for non-int8 dtypes.
-    """
-    if recurrent_state is None:
-        return None, None
-
-    if dtype == "none":
-        return recurrent_state, None
-
-    target = mx.float16 if dtype == "fp16" else mx.bfloat16
-    if dtype in ("fp16", "bf16"):
-        if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
-            return [
-                {
-                    **ld,
-                    "state": tuple(arr.astype(target) for arr in ld.get("state", ())),
-                }
-                for ld in recurrent_state
-            ], None
-        else:
-            items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
-            return [
-                [
-                    arr.astype(target) if hasattr(arr, "astype") else arr
-                    for arr in (item if isinstance(item, (list, tuple)) else [item])
-                ]
-                for item in items
-            ], None
-
-    # int8 with per-channel (last-axis) scales
-    if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
-        all_scales: list[list[float]] = []
-        quantized = []
-        for ld in recurrent_state:
-            layer_scales: list[float] = []
-            quantized_states = []
-            for arr in ld.get("state", ()):
-                f32 = arr.astype(mx.float32)
-                scales = mx.max(mx.abs(f32), axis=tuple(range(f32.ndim - 1)), keepdims=True)
-                scale = mx.where(scales > 0, scales / 127.0, 1.0)
-                q = mx.clip(mx.round(f32 / scale), -127, 127).astype(mx.int8)
-                quantized_states.append(q)
-                layer_scales.append(mx.squeeze(scale).tolist())
-            all_scales.append(layer_scales)
-            quantized.append({**ld, "state": tuple(quantized_states)})
-        return quantized, all_scales
-    else:
-        all_scales = []
-        items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
-        quantized = []
-        for item in items:
-            layer_scales = []
-            sub = item if isinstance(item, (list, tuple)) else [item]
-            quantized_sub = []
-            for arr in sub:
-                if hasattr(arr, "astype"):
-                    f32 = arr.astype(mx.float32)
-                    scales = mx.max(mx.abs(f32), axis=tuple(range(f32.ndim - 1)), keepdims=True)
-                    scale = mx.where(scales > 0, scales / 127.0, 1.0)
-                    q = mx.clip(mx.round(f32 / scale), -127, 127).astype(mx.int8)
-                    quantized_sub.append(q)
-                    layer_scales.append(mx.squeeze(scale).tolist())
-                else:
-                    quantized_sub.append(arr)
-            all_scales.append(layer_scales)
-            quantized.append(quantized_sub if len(quantized_sub) > 1 else quantized_sub[0])
-        return (quantized if len(quantized) > 1 else (quantized[0] if quantized else None)), all_scales
-
-
-def _dequantize_recurrent(
-    recurrent_state: Any,
-    scales: list[list[float]] | None,
-    original_dtype: str = "bf16",
-) -> Any:
-    """Dequantize recurrent state back to bf16/fp16.
-
-    If scales is None, just cast to target dtype (for fp16/bf16 storage).
-    """
-    if recurrent_state is None:
-        return None
-
-    target = mx.float16 if original_dtype == "fp16" else mx.bfloat16
-
-    if scales is None:
-        # Simple cast (fp16/bf16 storage or no quantization)
-        if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
-            return [
-                {
-                    **ld,
-                    "state": tuple(arr.astype(target) for arr in ld.get("state", ())),
-                }
-                for ld in recurrent_state
-            ]
-        else:
-            items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
-            return [
-                [
-                    arr.astype(target) if hasattr(arr, "astype") else arr
-                    for arr in (item if isinstance(item, (list, tuple)) else [item])
-                ]
-                for item in items
-            ]
-
-    # int8 dequantize with per-channel scales
-    if isinstance(recurrent_state, list) and recurrent_state and isinstance(recurrent_state[0], dict):
-        dequantized = []
-        for ld, layer_scales in zip(recurrent_state, scales):
-            dq_states = []
-            for arr, scale_list in zip(ld.get("state", ()), layer_scales):
-                scale = mx.array(scale_list, dtype=mx.float32)
-                # Restore the kept dimensions for broadcasting
-                arr_f32 = arr.astype(mx.float32)
-                broadcast_shape = [1] * (arr_f32.ndim - 1) + [-1]
-                scale = mx.reshape(scale, broadcast_shape)
-                dq_states.append((arr_f32 * scale).astype(target))
-            dequantized.append({**ld, "state": tuple(dq_states)})
-        return dequantized
-    else:
-        items = recurrent_state if isinstance(recurrent_state, (list, tuple)) else [recurrent_state]
-        dequantized = []
-        for item, layer_scales in zip(items, scales):
-            sub = item if isinstance(item, (list, tuple)) else [item]
-            dq_sub = []
-            for arr, scale_list in zip(sub, layer_scales):
-                if hasattr(arr, "astype"):
-                    scale = mx.array(scale_list, dtype=mx.float32)
-                    arr_f32 = arr.astype(mx.float32)
-                    broadcast_shape = [1] * (arr_f32.ndim - 1) + [-1]
-                    scale = mx.reshape(scale, broadcast_shape)
-                    dq_sub.append((arr_f32 * scale).astype(target))
-                else:
-                    dq_sub.append(arr)
-            dequantized.append(dq_sub if len(dq_sub) > 1 else dq_sub[0])
-        return dequantized if len(dequantized) > 1 else (dequantized[0] if dequantized else None)
+    """Estimate bytes used by a node's kv_data and recurrent_data."""
+    total = 0
+    if isinstance(node.kv_data, list):
+        for kv in node.kv_data:
+            for arr in kv.arrays:
+                total += _arr_bytes(arr)
+    if isinstance(node.recurrent_data, list):
+        for rec in node.recurrent_data:
+            arrays = rec.arrays
+            if isinstance(arrays, (list, tuple)):
+                for item in arrays:
+                    if isinstance(item, dict):
+                        for arr in item.get('state', ()):
+                            if hasattr(arr, 'itemsize'):
+                                total += _arr_bytes(arr)
+                    elif hasattr(item, 'itemsize'):
+                        total += _arr_bytes(item)
+            elif isinstance(arrays, dict):
+                for arr in arrays.get('state', ()):
+                    if hasattr(arr, 'itemsize'):
+                        total += _arr_bytes(arr)
+    return total
 
 
 class TurnPrefixCache:
@@ -311,18 +135,14 @@ class TurnPrefixCache:
         self.root = TurnNode(
             token_ids=[],
             context_hash=0,
-            kv_arrays=None,
-            kv_scales=None,
-            recurrent_state=None,
-            recurrent_scales=None,
+            kv_data=None,
+            recurrent_data=None,
             parent=None,
-            is_permanent_checkpoint=True,  # root acts as checkpoint anchor
+            is_permanent_checkpoint=True,
         )
         self._lock = threading.RLock()
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
-        self._on_spill: Callable | None = None   # set via set_spill_delegate
-        self._on_promote: Callable | None = None
         self.has_recurrent_state: bool = False
 
     # ── SpillableCache / PrefixCache protocol stubs ─────────────────────────
@@ -350,192 +170,6 @@ class TurnPrefixCache:
     ) -> None:
         pass  # no-op; handled by TurnCacheAdapter
 
-    def set_spill_delegate(
-        self,
-        on_spill: Callable,
-        on_promote: Callable,
-    ) -> None:
-        """Register I/O delegates for spill/promote instead of direct SSD writes.
-
-        on_spill(tokens: tuple[int, ...], layers: list) -> handle
-        on_promote(handle) -> list | None
-        """
-        self._on_spill = on_spill
-        self._on_promote = on_promote
-
-    def split_cache_arrays(self, cache_states: list[Any], offset: int = 0):
-        """
-        Process the output from Scheduler._extract_cache_states.
-        KV arrays are quantized to int4 (group_size=64) before storage.
-        RotatingKVCache is linearized (temporal order) then quantized at rest;
-        it is restored as a plain RotatingKVCache for unquantized decoding.
-        """
-        from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
-        _KV_GROUP_SIZE = 64
-        _KV_BITS = 4
-
-        kv = []
-        kv_indices = []
-        rotating_kv_meta: dict[int, tuple[int, int]] = {}  # kv-slot → (max_size, keep)
-        recurrent = []
-        recurrent_indices = []
-        recurrent_cls = None
-        logs = []
-        for i, state in enumerate(cache_states):
-            class_name = state['class_name']
-            if class_name == 'RotatingKVCache':
-                meta = state.get('meta_state')
-                raw_keys, raw_values = state['state']
-                try:
-                    keep_r, max_size_r, offset_r, _idx_r = map(int, meta)
-                except (TypeError, ValueError):
-                    keep_r, _idx_r = 0, raw_keys.shape[2]
-                    max_size_r = offset_r = raw_keys.shape[2]
-
-                def _linearize(v, _idx=_idx_r, off=offset_r, keep=keep_r):
-                    if _idx == v.shape[2]:
-                        return v
-                    elif _idx < off:  # buffer has wrapped around
-                        return mx.concatenate(
-                            [v[..., :keep, :], v[..., _idx:, :], v[..., keep:_idx, :]], axis=2
-                        )
-                    else:
-                        return v[..., :_idx, :]
-
-                lin_keys = _linearize(raw_keys)
-                lin_values = _linearize(raw_values)
-                # _update_concat leaves buffer at max_size-1+S; clip before storing
-                if lin_keys.shape[2] > max_size_r:
-                    lin_keys = lin_keys[..., -max_size_r:, :]
-                    lin_values = lin_values[..., -max_size_r:, :]
-                q_state = (
-                    mx.quantize(mx.contiguous(lin_keys), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
-                    mx.quantize(mx.contiguous(lin_values), group_size=_KV_GROUP_SIZE, bits=_KV_BITS),
-                )
-                rotating_kv_meta[len(kv)] = (max_size_r, keep_r, offset_r)
-                kv.append(q_state)
-                kv_indices.append(i)
-            elif "KVCache" in class_name:
-                meta = state.get('meta_state')
-                raw_state = state['state']
-                try:
-                    actual_end = int(meta[0]) if meta else raw_state[0].shape[2]
-                except (ValueError, TypeError, IndexError):
-                    actual_end = raw_state[0].shape[2]
-                if len(raw_state) > 2:
-                    logs.append("Only keeping first 2 arrays in KVCache arrays.")
-                state = raw_state[:2]
-                if isinstance(state[0], (list, tuple)):
-                    # Already quantized: each element is [packed, scales, biases]
-                    state = tuple(
-                        tuple(mx.contiguous(comp[:, :, offset:actual_end, :]) for comp in arr)
-                        for arr in state
-                    )
-                else:
-                    state = tuple(
-                        mx.quantize(mx.contiguous(arr[:, :, offset:actual_end, :]), group_size=_KV_GROUP_SIZE, bits=_KV_BITS)
-                        for arr in state
-                    )
-                kv.append(state)
-                kv_indices.append(i)
-            else:
-                if not recurrent_cls: recurrent_cls = state['class_ref']
-                assert recurrent_cls == state['class_ref']
-                recurrent.append(state['state'])
-                recurrent_indices.append(i)
-
-        # Eval quantized tuples and recurrent arrays
-        arrays_to_eval = [comp for arrs in kv for q_tuple in arrs for comp in q_tuple]
-        arrays_to_eval += [arr for arrs in recurrent for arr in arrs if isinstance(arr, mx.array)]
-        if arrays_to_eval:
-            mx.eval(*arrays_to_eval)
-        mx.clear_cache()
-
-        n = len(cache_states)
-        kv_indices = tuple(kv_indices)
-        recurrent_indices = tuple(recurrent_indices)
-
-        def reconstruct(kv, recurrent, total_tokens=None):
-            rval: list[Any] = [None] * n
-            assert len(kv) == len(kv_indices)
-            assert len(recurrent) == len(recurrent_indices)
-            for i, out_i in enumerate(kv_indices):
-                q_keys, q_values = kv[i]
-                n_tokens = q_keys[0].shape[2]  # packed array; axis=2 is token dim
-                if i in rotating_kv_meta:
-                    max_size_r, keep_r, offset_r = rotating_kv_meta[i]
-                    # total_tokens (from the trie node) is authoritative for offset;
-                    # offset_r (from extraction) is a fallback for standalone calls.
-                    actual_offset = total_tokens if total_tokens is not None else offset_r
-                    rval[out_i] = {
-                        "state": kv[i],
-                        "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS), str(max_size_r), str(keep_r), str(actual_offset)),
-                        "class_name": "QuantizedRotatingKVCache",
-                        "class_ref": None,
-                    }
-                else:
-                    rval[out_i] = {
-                        "state": kv[i],
-                        "meta_state": (str(n_tokens), str(_KV_GROUP_SIZE), str(_KV_BITS)),
-                        "class_name": _QuantizedKVCache.__name__,
-                        "class_ref": _QuantizedKVCache,
-                    }
-            for i, out_i in enumerate(recurrent_indices):
-                rval[out_i] = {
-                    "state": recurrent[i],
-                    "meta_state": '',
-                    "class_name": recurrent_cls.__name__,
-                    "class_ref": recurrent_cls,
-                }
-            assert not any(x is None for x in rval)
-            return rval
-
-        if not hasattr(self, "_reassemble_cache_fn"):
-            self._reassemble_cache_fn = reconstruct
-
-        self._rotating_kv_slots = set(rotating_kv_meta.keys())
-
-        for log in logs:
-            logger.debug(log)
-
-        return kv, recurrent
-
-    def _retrieve_full_cache(self, node: TurnNode):
-        # NOTE: Assuming no SSD for now
-        """Reconstruct the cache for a node to pipe to _reconstruct_cache_from_states."""
-        with self._lock:
-            assert hasattr(self, '_reassemble_cache_fn')
-            path = self._inorder_path(node)
-            # Filter nodes that have KV slices; pure-SSM nodes have kv_arrays=[].
-            kv_slices = [n.kv_arrays for n in path if n.kv_arrays]
-            if kv_slices:
-                # Each node's kv_arrays: list of per-layer ((pk,sk,bk),(pv,sv,bv)) quantized tuples.
-                # Standard KV nodes store incremental tokens → concatenate across nodes.
-                # Rotating KV nodes store the full linearized buffer → use only the deepest node
-                # (each node's buffer already subsumes all earlier nodes' tokens).
-                rotating_slots = getattr(self, '_rotating_kv_slots', set())
-                kv = [
-                    tuple(
-                        tuple(
-                            kv_group[-1][j] if slot_i in rotating_slots
-                            else mx.concatenate([t[j] for t in kv_group], axis=2)
-                            for j in range(3)
-                        )
-                        for kv_group in zip(*arrs)
-                    )
-                    for slot_i, arrs in enumerate(zip(*kv_slices))
-                ]
-                n = max((kv[i][0][0].shape[2] for i in range(len(kv))))  # layer 0, q_keys, packed component, token dim
-                logger.info(f"Rebuilding KV cache... {n} tokens")
-            else:
-                kv = []
-                logger.info("Rebuilding cache... (SSM-only, no KV layers)")
-            recurrent = node.recurrent_state if node.recurrent_state is not None else []
-            total_tokens = path[-1].n_tokens if path else 0
-            rval = self._reassemble_cache_fn(kv, recurrent, total_tokens)
-            logger.info(f"MLX Cache size: {mx.get_cache_memory() / (1024 ** 3)} GB")
-            return rval
-
     def _inorder_path(self, node: TurnNode) -> list[TurnNode]:
         path = []
         while node != self.root:
@@ -548,21 +182,13 @@ class TurnPrefixCache:
         self,
         parent: TurnNode,
         segment: Segment,
-        kv_arrays: list | None = None,
-        kv_scales: list | None = None,
-        recurrent_state: Any = None,
+        kv_data: list[StaticKVData] | None = None,
+        recurrent_data: list[StaticRecurrentData] | None = None,
         is_system_prompt: bool = False,
-        recurrent_scales: list | None = None,
         acquire_lock: bool = True,
     ) -> TurnNode:
-        """Insert a node into the trie.
-
-        API: insert(parent, segment, kv_arrays, kv_scales, recurrent_state, ...)
-        """
         rval = self._insert_node(
-            parent, segment,
-            kv_arrays or [], kv_scales, recurrent_state,
-            is_system_prompt, recurrent_scales, acquire_lock,
+            parent, segment, kv_data, recurrent_data, is_system_prompt, acquire_lock,
         )
         logger.info(self.visualize())
         return rval
@@ -571,19 +197,16 @@ class TurnPrefixCache:
         self,
         parent: TurnNode,
         segment: Segment,
-        kv_arrays: list,
-        kv_scales: list | None,
-        recurrent_state: Any,
+        kv_data: list[StaticKVData] | None,
+        recurrent_data: list[StaticRecurrentData] | None,
         is_system_prompt: bool = False,
-        recurrent_scales: list | None = None,
         acquire_lock: bool = True,
     ) -> TurnNode:
         with self._lock if acquire_lock else nullcontext():
-            if recurrent_state is not None and not (isinstance(recurrent_state, list) and len(recurrent_state) == 0):
+            if recurrent_data:
                 self.has_recurrent_state = True
             h = _context_hash(parent.context_hash, segment.token_ids)
 
-            # Exact match: child already exists
             if h in parent.children:
                 node = parent.children[h]
                 node.touch()
@@ -597,18 +220,11 @@ class TurnPrefixCache:
             )
             node_tsc = 0 if is_permanent else tokens_since
 
-            # Quantize KV to int8 if configured and not already quantized.
-            # Arrays from split_cache_arrays are pre-quantized int4 tuples.
-            if self.config.kv_dtype == "int8" and kv_arrays and not isinstance(kv_arrays[0], tuple):
-                kv_arrays, kv_scales = _quantize_kv(kv_arrays)
-
             node = TurnNode(
                 token_ids=segment.token_ids,
                 context_hash=h,
-                kv_arrays=kv_arrays,
-                kv_scales=kv_scales,
-                recurrent_state=recurrent_state,
-                recurrent_scales=recurrent_scales,
+                kv_data=kv_data,
+                recurrent_data=recurrent_data,
                 parent=parent,
                 is_permanent_checkpoint=is_permanent,
                 tokens_since_checkpoint=node_tsc,
@@ -616,15 +232,13 @@ class TurnPrefixCache:
             node.touch()
             parent.children[h] = node
 
-            # Prune temp recurrent from parent when it becomes an inner node
             if (
-                len(parent.children) == 1          # parent just got its first child
+                len(parent.children) == 1
                 and not parent.is_permanent_checkpoint
                 and parent is not self.root
             ):
                 freed = _node_data_bytes(parent)
-                parent.recurrent_state = None
-                parent.recurrent_scales = None
+                parent.recurrent_data = None
                 freed -= _node_data_bytes(parent)
                 self._memory_bytes -= freed
 
@@ -653,8 +267,8 @@ class TurnPrefixCache:
                 path.append(node)
             has_recurrent = (
                 bool(path)
-                and path[-1].recurrent_state is not None
-                and not isinstance(path[-1].recurrent_state, SSDRef)
+                and path[-1].recurrent_data is not None
+                and not isinstance(path[-1].recurrent_data, SSDRef)
             )
             return path, has_recurrent
 
@@ -669,26 +283,63 @@ class TurnPrefixCache:
     def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode | None:
         """Return the deepest node in path that can serve as a prefill resume point.
 
-        Hybrid models: deepest node with real recurrent state.
-        KV-only models: deepest node with non-empty, in-memory kv_arrays.
+        Hybrid models: deepest node with real recurrent data.
+        KV-only models: deepest node with non-empty, in-memory kv_data.
         """
         if not self.has_recurrent_state:
             for node in reversed(path):
-                if node.kv_arrays and not isinstance(node.kv_arrays, SSDRef):
+                if isinstance(node.kv_data, list) and node.kv_data:
                     return node
             return None
 
-        def _has_real_recurrent(node: TurnNode) -> bool:
-            return (
-                node.recurrent_state is not None
-                and not isinstance(node.recurrent_state, SSDRef)
-                and len(node.recurrent_state) > 0
-            )
-
         for node in reversed(path):
-            if _has_real_recurrent(node):
+            if (
+                isinstance(node.recurrent_data, list)
+                and node.recurrent_data
+            ):
                 return node
         return None
+
+    def collect_path_data(
+        self, node: TurnNode
+    ) -> tuple[list[StaticKVData], list[StaticRecurrentData]]:
+        """Walk from root to node and merge KV data per layer.
+
+        KVCache layers are concatenated across nodes (incremental).
+        RotatingKVCache layers use only the deepest node (full ring buffer).
+        Recurrent data comes from the leaf node only.
+        """
+        path = self._inorder_path(node)
+
+        # Group per layer_index across path
+        kv_by_layer: dict[int, list[StaticKVData]] = {}
+        for n in path:
+            if isinstance(n.kv_data, list):
+                for item in n.kv_data:
+                    li = item.metadata['layer_index']
+                    kv_by_layer.setdefault(li, []).append(item)
+
+        merged_kv: list[StaticKVData] = []
+        for li in sorted(kv_by_layer):
+            items = kv_by_layer[li]
+            strategy = items[0].metadata.get('merge_strategy', 'concatenate')
+            if strategy == 'last':
+                merged_kv.append(items[-1])
+            else:
+                merged_keys = mx.concatenate([item.arrays[0] for item in items], axis=-2)
+                merged_values = mx.concatenate([item.arrays[1] for item in items], axis=-2)
+                last_meta = dict(items[-1].metadata)
+                last_meta['actual_end'] = merged_keys.shape[-2]
+                merged_kv.append(StaticKVData(arrays=[merged_keys, merged_values], metadata=last_meta))
+
+        leaf = path[-1] if path else None
+        recurrent: list[StaticRecurrentData] = (
+            leaf.recurrent_data
+            if leaf and isinstance(leaf.recurrent_data, list)
+            else []
+        )
+
+        return merged_kv, recurrent
 
     def _walk_nodes(self, node: TurnNode) -> list[TurnNode]:
         """DFS walk to collect all nodes in subtree."""
@@ -703,10 +354,8 @@ class TurnPrefixCache:
         while to_evict:
             current = to_evict.pop()
             self._memory_bytes -= _node_data_bytes(current)
-            current.kv_arrays = None
-            current.kv_scales = None
-            current.recurrent_state = None
-            current.recurrent_scales = None
+            current.kv_data = None
+            current.recurrent_data = None
 
             parent = current.parent
             if parent is not None and current.context_hash in parent.children:
@@ -746,7 +395,7 @@ class TurnPrefixCache:
     # ── Disk persistence ───────────────────────────────────────────────────
 
     def save(self, persist_dir: str) -> None:
-        """Save all trie nodes to persist_dir (SQLite index + per-node safetensors)."""
+        """Save all trie nodes to persist_dir (SQLite index + per-node safetensors + JSON sidecars)."""
         from safetensors.numpy import save_file as st_save
 
         os.makedirs(persist_dir, exist_ok=True)
@@ -780,73 +429,52 @@ class TurnPrefixCache:
                 kv_path = os.path.join(persist_dir, f"kv_{i}.safetensors")
                 rec_path: str | None = None
 
-                if isinstance(node.kv_arrays, list) and node.kv_arrays:
+                # Save kv_data: list[StaticKVData] — one safetensors file + JSON sidecar per item
+                if isinstance(node.kv_data, list) and node.kv_data:
                     tensors: dict[str, np.ndarray] = {}
-                    for j, arr in enumerate(node.kv_arrays):
-                        # Convert to float32 if bfloat16 to avoid numpy conversion issues
-                        if arr.dtype == mx.bfloat16:
-                            arr = arr.astype(mx.float32)
-                        tensors[f"kv_{j}"] = np.array(arr)
-                        if node.kv_scales:
-                            tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
+                    all_meta: list[dict] = []
+                    for j, kv_item in enumerate(node.kv_data):
+                        for k, arr in enumerate(kv_item.arrays):
+                            if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                                arr = arr.astype(mx.float32)
+                            tensors[f"layer_{j}_arr_{k}"] = np.array(arr)
+                        all_meta.append(kv_item.metadata)
                     tmp = kv_path + ".tmp"
                     st_save(tensors, tmp)
                     os.replace(tmp, kv_path)
+                    meta_path_kv = kv_path.replace(".safetensors", "_meta.json")
+                    with open(meta_path_kv, "w") as mf:
+                        json.dump(all_meta, mf)
 
-                if node.recurrent_state is not None and not isinstance(node.recurrent_state, SSDRef):
+                # Save recurrent_data: list[StaticRecurrentData]
+                if isinstance(node.recurrent_data, list) and node.recurrent_data:
                     rec_path = os.path.join(persist_dir, f"rec_{i}.safetensors")
-                    tensors: dict[str, np.ndarray] = {}
-                    state = node.recurrent_state
-                    has_scales = node.recurrent_scales is not None
-
-                    if isinstance(state, list) and state and isinstance(state[0], dict):
-                        # Dict format (_extract_cache_states output)
-                        for li, layer_dict in enumerate(state):
-                            for j, arr in enumerate(layer_dict.get("state", ())):
-                                # int8 arrays: store as int32 numpy + scales
-                                if arr.dtype == mx.int8 and has_scales and li < len(node.recurrent_scales):
-                                    tensors[f"ext_{li}_state_{j}"] = np.array(arr, dtype=np.int32)
-                                    if j < len(node.recurrent_scales[li]):
-                                        tensors[f"ext_{li}_scale_{j}"] = np.array(
-                                            node.recurrent_scales[li][j], dtype=np.float32
-                                        )
-                                elif hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
-                                    arr = arr.astype(mx.float32)
-                                    tensors[f"ext_{li}_state_{j}"] = np.array(arr)
-                                else:
-                                    tensors[f"ext_{li}_state_{j}"] = np.array(arr)
-                            meta = layer_dict.get("meta_state", ())
-                            if isinstance(meta, (list, tuple)):
-                                for j, s in enumerate(meta):
-                                    tensors[f"ext_{li}_meta_{j}"] = np.frombuffer(
-                                        str(s).encode(), dtype=np.uint8
-                                    )
-                            cn = layer_dict.get("class_name", "")
-                            tensors[f"ext_{li}_class"] = np.frombuffer(
-                                cn.encode(), dtype=np.uint8
-                            )
-                    else:
-                        # Legacy SSM raw-tensor format
-                        items = state if isinstance(state, (list, tuple)) else [state]
-                        for k, item in enumerate(items):
-                            sub = item if isinstance(item, (list, tuple)) else [item]
-                            for m, arr in enumerate(sub):
-                                if hasattr(arr, 'dtype') and arr.dtype == mx.int8 and has_scales and k < len(node.recurrent_scales):
-                                    tensors[f"r_{k}_{m}"] = np.array(arr, dtype=np.int32)
-                                    if m < len(node.recurrent_scales[k]):
-                                        tensors[f"r_{k}_scale_{m}"] = np.array(
-                                            node.recurrent_scales[k][m], dtype=np.float32
-                                        )
-                                elif hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
-                                    arr = arr.astype(mx.float32)
-                                    tensors[f"r_{k}_{m}"] = np.array(arr)
-                                else:
-                                    tensors[f"r_{k}_{m}"] = np.array(arr)
-
-                    if tensors:
+                    rec_tensors: dict[str, np.ndarray] = {}
+                    rec_meta_list: list[dict] = []
+                    for j, rec_item in enumerate(node.recurrent_data):
+                        arrays = rec_item.arrays
+                        if isinstance(arrays, (list, tuple)):
+                            for k, arr in enumerate(arrays):
+                                if hasattr(arr, 'dtype'):
+                                    if arr.dtype == mx.bfloat16:
+                                        arr = arr.astype(mx.float32)
+                                    rec_tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
+                        elif isinstance(arrays, dict):
+                            for k, arr in enumerate(arrays.get('state', ())):
+                                if hasattr(arr, 'dtype'):
+                                    if arr.dtype == mx.bfloat16:
+                                        arr = arr.astype(mx.float32)
+                                    rec_tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
+                        item_meta = dict(rec_item.metadata)
+                        item_meta['_scales'] = rec_item.scales
+                        rec_meta_list.append(item_meta)
+                    if rec_tensors:
                         tmp = rec_path + ".tmp"
-                        st_save(tensors, tmp)
+                        st_save(rec_tensors, tmp)
                         os.replace(tmp, rec_path)
+                        rec_meta_path = rec_path.replace(".safetensors", "_meta.json")
+                        with open(rec_meta_path, "w") as mf:
+                            json.dump(rec_meta_list, mf)
 
                 parent_hash = node.parent.context_hash if node.parent is not None else 0
                 conn.execute(
@@ -899,117 +527,59 @@ class TurnPrefixCache:
 
             token_ids = list(np.frombuffer(tok_blob, dtype=np.int32))
 
-            kv_arrays: list[mx.array] = []
-            kv_scales: list[float] = []
+            # Load kv_data: list[StaticKVData]
+            kv_data: list[StaticKVData] | None = None
             if os.path.exists(kv_path):
                 try:
                     tensors = st_load(kv_path)
-                    j = 0
-                    while f"kv_{j}" in tensors:
-                        kv_arrays.append(mx.array(tensors[f"kv_{j}"]))
-                        if f"scale_{j}" in tensors:
-                            kv_scales.append(float(tensors[f"scale_{j}"][0]))
-                        j += 1
+                    meta_path_kv = kv_path.replace(".safetensors", "_meta.json")
+                    if os.path.exists(meta_path_kv):
+                        with open(meta_path_kv) as mf:
+                            all_meta = json.load(mf)
+                        kv_items: list[StaticKVData] = []
+                        for j, item_meta in enumerate(all_meta):
+                            arrays: list[mx.array] = []
+                            k = 0
+                            while f"layer_{j}_arr_{k}" in tensors:
+                                arrays.append(mx.array(tensors[f"layer_{j}_arr_{k}"]))
+                                k += 1
+                            kv_items.append(StaticKVData(arrays=arrays, metadata=item_meta))
+                        kv_data = kv_items if kv_items else None
                 except Exception as e:
                     logger.warning(f"[turn_cache] skipping node {ctx_hash}: {e}")
                     continue
 
-            recurrent_state = None
-            recurrent_scales = None
+            # Load recurrent_data: list[StaticRecurrentData]
+            recurrent_data: list[StaticRecurrentData] | None = None
             if rec_path and os.path.exists(rec_path):
                 try:
-                    tensors = st_load(rec_path)
-
-                    # Collect scales alongside state tensors
-                    recurrent_scales: list[list[float]] | None = None
-
-                    if any(k.startswith("ext_") for k in tensors):
-                        # Dict format
-                        import importlib
-                        cache_mod = importlib.import_module("mlx_lm.models.cache")
-
-                        layer_indices = sorted({
-                            int(k.split("_")[1])
-                            for k in tensors
-                            if k.startswith("ext_")
-                        })
-                        state_list = []
-                        scales_list: list[list[float]] = []
-                        for li in layer_indices:
-                            state_parts = []
-                            layer_scales: list[float] = []
-                            j = 0
-                            while f"ext_{li}_state_{j}" in tensors:
-                                state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
-                                # Check for per-channel scale (int8 quantization)
-                                if f"ext_{li}_scale_{j}" in tensors:
-                                    layer_scales.append(
-                                        tensors[f"ext_{li}_scale_{j}"].tolist()
-                                    )
-                                j += 1
-                            if layer_scales:
-                                scales_list.append(layer_scales)
-                            meta_parts = []
-                            j = 0
-                            while f"ext_{li}_meta_{j}" in tensors:
-                                meta_parts.append(
-                                    bytes(tensors[f"ext_{li}_meta_{j}"]).decode()
-                                )
-                                j += 1
-                            cn = ""
-                            if f"ext_{li}_class" in tensors:
-                                cn = bytes(tensors[f"ext_{li}_class"]).decode()
-                            state_list.append({
-                                "state": tuple(state_parts),
-                                "meta_state": tuple(meta_parts) if meta_parts else "",
-                                "class_name": cn,
-                                "class_ref": getattr(cache_mod, cn, None),
-                            })
-                        recurrent_scales = scales_list if scales_list else None
-                        recurrent_state = state_list or None
-
-                    else:
-                        # Legacy SSM format
-                        max_k = -1
-                        for key in tensors.keys():
-                            if key.startswith("r_"):
-                                k = int(key.split("_")[1])
-                                max_k = max(max_k, k)
-                        if max_k >= 0:
-                            state_list = []
-                            scales_list: list[list[float]] = []
-                            for k in range(max_k + 1):
-                                layer_list = []
-                                layer_scales: list[float] = []
-                                m = 0
-                                while f"r_{k}_{m}" in tensors:
-                                    layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
-                                    if f"r_{k}_scale_{m}" in tensors:
-                                        layer_scales.append(
-                                            tensors[f"r_{k}_scale_{m}"].tolist()
-                                        )
-                                    m += 1
-                                if layer_scales:
-                                    scales_list.append(layer_scales)
-                                if layer_list:
-                                    state_list.append(
-                                        layer_list if len(layer_list) > 1 else layer_list[0]
-                                    )
-                            recurrent_scales = scales_list if scales_list else None
-                            recurrent_state = (
-                                state_list if len(state_list) > 1
-                                else (state_list[0] if state_list else None)
-                            )
+                    rec_tensors = st_load(rec_path)
+                    rec_meta_path = rec_path.replace(".safetensors", "_meta.json")
+                    if os.path.exists(rec_meta_path):
+                        with open(rec_meta_path) as mf:
+                            rec_meta_list = json.load(mf)
+                        rec_items: list[StaticRecurrentData] = []
+                        for j, item_meta in enumerate(rec_meta_list):
+                            scales = item_meta.pop('_scales', None)
+                            arrays_list: list[mx.array] = []
+                            k = 0
+                            while f"rec_{j}_arr_{k}" in rec_tensors:
+                                arrays_list.append(mx.array(rec_tensors[f"rec_{j}_arr_{k}"]))
+                                k += 1
+                            rec_items.append(StaticRecurrentData(
+                                arrays=arrays_list,
+                                metadata=item_meta,
+                                scales=scales,
+                            ))
+                        recurrent_data = rec_items if rec_items else None
                 except Exception as e:
                     logger.warning(f"[turn_cache] recurrent load failed for {ctx_hash}: {e}")
 
             node = TurnNode(
                 token_ids=token_ids,
                 context_hash=ctx_hash,
-                kv_arrays=kv_arrays or None,
-                kv_scales=kv_scales or None,
-                recurrent_state=recurrent_state,
-                recurrent_scales=recurrent_scales,
+                kv_data=kv_data,
+                recurrent_data=recurrent_data,
                 tokens_since_checkpoint=tokens_since,
                 is_permanent_checkpoint=bool(is_perm),
                 last_used=last_used,
@@ -1033,8 +603,7 @@ class TurnPrefixCache:
         for node in hash_to_node.values():
             if node is self.root:
                 continue
-            state = node.recurrent_state
-            if state is not None and not isinstance(state, SSDRef) and len(state) > 0:
+            if isinstance(node.recurrent_data, list) and node.recurrent_data:
                 self.has_recurrent_state = True
                 break
 
@@ -1065,311 +634,119 @@ class TurnPrefixCache:
         return os.path.join(ssd_dir, f"{node.context_hash & 0xFFFFFFFFFFFFFFFF:016x}_{suffix}.safetensors")
 
     def _spill_to_ssd(self, node: TurnNode) -> None:
-        """Write node's KV (and recurrent if present) to SSD; replace with SSDRef.
-
-        When a spill delegate is set, delegates I/O to on_spill instead of
-        writing safetensors files directly.  The opaque handle returned by
-        on_spill is stored in node.kv_arrays.
-        """
-        # Delegate path: route through on_spill instead of direct SSD I/O.
-        if self._on_spill is not None:
-            if isinstance(node.kv_arrays, list) and node.kv_arrays:
-                tokens = self._tokens_to_node(node)
-                handle = self._on_spill(tokens, node.kv_arrays)
-                node.kv_arrays = handle
-                node.kv_scales = None
-            # Legacy path still handles recurrent state even when delegate is set.
-            if (
-                node.recurrent_state is not None
-                and not isinstance(node.recurrent_state, SSDRef)
-            ):
-                from safetensors.numpy import save_file as st_save
-                path = self._ssd_path(node, "rec")
-                tensors: dict[str, np.ndarray] = {}
-                state = node.recurrent_state
-                has_scales = node.recurrent_scales is not None
-
-                if isinstance(state, list) and state and isinstance(state[0], dict):
-                    # Dict format (_extract_cache_states output)
-                    for li, layer_dict in enumerate(state):
-                        for j, arr in enumerate(layer_dict.get("state", ())):
-                            if arr.dtype == mx.int8 and has_scales and li < len(node.recurrent_scales):
-                                tensors[f"ext_{li}_state_{j}"] = np.array(arr, dtype=np.int32)
-                                if j < len(node.recurrent_scales[li]):
-                                    tensors[f"ext_{li}_scale_{j}"] = np.array(
-                                        node.recurrent_scales[li][j], dtype=np.float32
-                                    )
-                            elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
-                                tensors[f"ext_{li}_state_{j}"] = np.array(arr.astype(mx.float32))
-                            else:
-                                tensors[f"ext_{li}_state_{j}"] = np.array(arr)
-                        meta = layer_dict.get("meta_state", ())
-                        if isinstance(meta, (list, tuple)):
-                            for j, s in enumerate(meta):
-                                tensors[f"ext_{li}_meta_{j}"] = np.frombuffer(
-                                    str(s).encode(), dtype=np.uint8
-                                )
-                        cn = layer_dict.get("class_name", "")
-                        tensors[f"ext_{li}_class"] = np.frombuffer(
-                            cn.encode(), dtype=np.uint8
-                        )
-                else:
-                    # Legacy SSM raw-tensor format
-                    items = state if isinstance(state, (list, tuple)) else [state]
-                    for k, item in enumerate(items):
-                        sub = item if isinstance(item, (list, tuple)) else [item]
-                        for m, arr in enumerate(sub):
-                            if hasattr(arr, "dtype") and arr.dtype == mx.int8 and has_scales and k < len(node.recurrent_scales):
-                                tensors[f"r_{k}_{m}"] = np.array(arr, dtype=np.int32)
-                                if m < len(node.recurrent_scales[k]):
-                                    tensors[f"r_{k}_scale_{m}"] = np.array(
-                                        node.recurrent_scales[k][m], dtype=np.float32
-                                    )
-                            elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
-                                tensors[f"r_{k}_{m}"] = np.array(arr.astype(mx.float32))
-                            else:
-                                tensors[f"r_{k}_{m}"] = np.array(arr)
-
-                if tensors:
-                    tmp = path + ".tmp"
-                    st_save(tensors, tmp)
-                    os.replace(tmp, path)
-                    size = os.path.getsize(path)
-                    node.recurrent_state = SSDRef(file_path=path, size_bytes=size)
-                    node.recurrent_scales = None
-            return
-
-        # Legacy path: direct SSD write via safetensors.
+        """Write node's KV (and recurrent if present) to SSD; replace with SSDRef."""
         from safetensors.numpy import save_file as st_save
 
-        if isinstance(node.kv_arrays, list) and node.kv_arrays:
+        if isinstance(node.kv_data, list) and node.kv_data:
             path = self._ssd_path(node, "kv")
             tensors: dict[str, np.ndarray] = {}
-            for j, arr in enumerate(node.kv_arrays):
-                # Convert to float32 if bfloat16 to avoid numpy conversion issues
-                if arr.dtype == mx.bfloat16:
-                    arr = arr.astype(mx.float32)
-                tensors[f"kv_{j}"] = np.array(arr)
-                # Only save scale if it exists and we have enough scales
-                if node.kv_scales and j < len(node.kv_scales):
-                    tensors[f"scale_{j}"] = np.array([node.kv_scales[j]], dtype=np.float32)
+            all_meta: list[dict] = []
+            for j, kv_item in enumerate(node.kv_data):
+                for k, arr in enumerate(kv_item.arrays):
+                    if hasattr(arr, 'dtype') and arr.dtype == mx.bfloat16:
+                        arr = arr.astype(mx.float32)
+                    tensors[f"layer_{j}_arr_{k}"] = np.array(arr)
+                all_meta.append(kv_item.metadata)
             tmp = path + ".tmp"
             st_save(tensors, tmp)
             os.replace(tmp, path)
+            meta_path = path.replace(".safetensors", "_meta.json")
+            with open(meta_path, "w") as mf:
+                json.dump(all_meta, mf)
             size = os.path.getsize(path)
-            node.kv_arrays = SSDRef(file_path=path, size_bytes=size)
-            node.kv_scales = None
+            node.kv_data = SSDRef(file_path=path, size_bytes=size)
 
-        if (
-            node.recurrent_state is not None
-            and not isinstance(node.recurrent_state, SSDRef)
-        ):
+        if isinstance(node.recurrent_data, list) and node.recurrent_data:
             path = self._ssd_path(node, "rec")
             tensors: dict[str, np.ndarray] = {}
-            state = node.recurrent_state
-            has_scales = node.recurrent_scales is not None
-
-            if isinstance(state, list) and state and isinstance(state[0], dict):
-                # Dict format (_extract_cache_states output)
-                for li, layer_dict in enumerate(state):
-                    for j, arr in enumerate(layer_dict.get("state", ())):
-                        # int8 arrays: store as int32 numpy + scales
-                        if arr.dtype == mx.int8 and has_scales and li < len(node.recurrent_scales):
-                            tensors[f"ext_{li}_state_{j}"] = np.array(arr, dtype=np.int32)
-                            if j < len(node.recurrent_scales[li]):
-                                tensors[f"ext_{li}_scale_{j}"] = np.array(
-                                    node.recurrent_scales[li][j], dtype=np.float32
-                                )
-                        elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
-                            tensors[f"ext_{li}_state_{j}"] = np.array(arr.astype(mx.float32))
-                        else:
-                            tensors[f"ext_{li}_state_{j}"] = np.array(arr)
-                    meta = layer_dict.get("meta_state", ())
-                    if isinstance(meta, (list, tuple)):
-                        for j, s in enumerate(meta):
-                            tensors[f"ext_{li}_meta_{j}"] = np.frombuffer(
-                                str(s).encode(), dtype=np.uint8
-                            )
-                    cn = layer_dict.get("class_name", "")
-                    tensors[f"ext_{li}_class"] = np.frombuffer(
-                        cn.encode(), dtype=np.uint8
-                    )
-            else:
-                # Legacy SSM raw-tensor format
-                items = state if isinstance(state, (list, tuple)) else [state]
-                for k, item in enumerate(items):
-                    sub = item if isinstance(item, (list, tuple)) else [item]
-                    for m, arr in enumerate(sub):
-                        if hasattr(arr, "dtype") and arr.dtype == mx.int8 and has_scales and k < len(node.recurrent_scales):
-                            tensors[f"r_{k}_{m}"] = np.array(arr, dtype=np.int32)
-                            if m < len(node.recurrent_scales[k]):
-                                tensors[f"r_{k}_scale_{m}"] = np.array(
-                                    node.recurrent_scales[k][m], dtype=np.float32
-                                )
-                        elif hasattr(arr, "dtype") and arr.dtype == mx.bfloat16:
-                            tensors[f"r_{k}_{m}"] = np.array(arr.astype(mx.float32))
-                        else:
-                            tensors[f"r_{k}_{m}"] = np.array(arr)
-
+            rec_meta_list: list[dict] = []
+            for j, rec_item in enumerate(node.recurrent_data):
+                arrays = rec_item.arrays
+                if isinstance(arrays, (list, tuple)):
+                    for k, arr in enumerate(arrays):
+                        if hasattr(arr, 'dtype'):
+                            if arr.dtype == mx.bfloat16:
+                                arr = arr.astype(mx.float32)
+                            tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
+                elif isinstance(arrays, dict):
+                    for k, arr in enumerate(arrays.get('state', ())):
+                        if hasattr(arr, 'dtype'):
+                            if arr.dtype == mx.bfloat16:
+                                arr = arr.astype(mx.float32)
+                            tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
+                item_meta = dict(rec_item.metadata)
+                item_meta['_scales'] = rec_item.scales
+                rec_meta_list.append(item_meta)
             if tensors:
                 tmp = path + ".tmp"
                 st_save(tensors, tmp)
                 os.replace(tmp, path)
+                meta_path = path.replace(".safetensors", "_meta.json")
+                with open(meta_path, "w") as mf:
+                    json.dump(rec_meta_list, mf)
                 size = os.path.getsize(path)
-                node.recurrent_state = SSDRef(file_path=path, size_bytes=size)
-                node.recurrent_scales = None
+                node.recurrent_data = SSDRef(file_path=path, size_bytes=size)
 
     def _promote_from_ssd(self, node: TurnNode) -> bool:
-        """Load node's KV from SSD back into RAM. Returns False on error.
-
-        When a promote delegate is set, calls on_promote(handle) to retrieve
-        the layers instead of reading safetensors files directly.
-        """
-        # Delegate path: the handle stored during spill is passed to on_promote.
-        if self._on_promote is not None:
-            # Only promote if the node was actually spilled via the delegate
-            # (kv_arrays is an opaque handle — not a live list and not None).
-            if node.kv_arrays is None or isinstance(node.kv_arrays, list):
-                return True  # nothing to promote (or already in memory)
-            handle = node.kv_arrays
-            result = self._on_promote(handle)
-            if result is None:
-                return False
-            node.kv_arrays = result
-            return True
-
-        # Legacy path: direct SSD read via safetensors.
+        """Load node's KV from SSD back into RAM. Returns False on error."""
         from safetensors.numpy import load_file as st_load
 
-        if isinstance(node.kv_arrays, SSDRef):
-            path = node.kv_arrays.file_path
+        if isinstance(node.kv_data, SSDRef):
+            path = node.kv_data.file_path
             if not os.path.exists(path):
                 logger.warning(f"[turn_cache] SSD file missing: {path}")
                 return False
             try:
                 tensors = st_load(path)
-                kv_arrays: list[mx.array] = []
-                kv_scales: list[float] = []
-                j = 0
-                while f"kv_{j}" in tensors:
-                    kv_arrays.append(mx.array(tensors[f"kv_{j}"]))
-                    if f"scale_{j}" in tensors:
-                        kv_scales.append(float(tensors[f"scale_{j}"][0]))
-                    j += 1
-                node.kv_arrays = kv_arrays
-                node.kv_scales = kv_scales or None
+                meta_path = path.replace(".safetensors", "_meta.json")
+                if os.path.exists(meta_path):
+                    with open(meta_path) as mf:
+                        all_meta = json.load(mf)
+                    kv_items: list[StaticKVData] = []
+                    for j, item_meta in enumerate(all_meta):
+                        arrays: list[mx.array] = []
+                        k = 0
+                        while f"layer_{j}_arr_{k}" in tensors:
+                            arrays.append(mx.array(tensors[f"layer_{j}_arr_{k}"]))
+                            k += 1
+                        kv_items.append(StaticKVData(arrays=arrays, metadata=item_meta))
+                    node.kv_data = kv_items if kv_items else None
+                else:
+                    node.kv_data = None
             except Exception as e:
                 logger.warning(f"[turn_cache] SSD promote failed: {e}")
                 return False
 
-        if isinstance(node.recurrent_state, SSDRef):
-            path = node.recurrent_state.file_path
+        if isinstance(node.recurrent_data, SSDRef):
+            path = node.recurrent_data.file_path
             if os.path.exists(path):
                 try:
-                    tensors = st_load(path)
-
-                    if any(k.startswith("ext_") for k in tensors):
-                        # Dict format
-                        layer_indices = sorted({
-                            int(k.split("_")[1])
-                            for k in tensors
-                            if k.startswith("ext_")
-                        })
-                        state_list = []
-                        scales_list: list[list[float]] = []
-                        for li in layer_indices:
-                            state_parts = []
-                            layer_scales: list[float] = []
-                            j = 0
-                            while f"ext_{li}_state_{j}" in tensors:
-                                state_parts.append(mx.array(tensors[f"ext_{li}_state_{j}"]))
-                                if f"ext_{li}_scale_{j}" in tensors:
-                                    layer_scales.append(
-                                        tensors[f"ext_{li}_scale_{j}"].tolist()
-                                    )
-                                j += 1
-                            if layer_scales:
-                                scales_list.append(layer_scales)
-                            meta_parts = []
-                            j = 0
-                            while f"ext_{li}_meta_{j}" in tensors:
-                                meta_parts.append(
-                                    bytes(tensors[f"ext_{li}_meta_{j}"]).decode()
-                                )
-                                j += 1
-                            state_list.append({
-                                "state": tuple(state_parts),
-                                "meta_state": tuple(meta_parts) if meta_parts else "",
-                                "class_name": "",
-                                "class_ref": None,
-                            })
-                        node.recurrent_state = state_list or None
-                        node.recurrent_scales = scales_list if scales_list else None
+                    rec_tensors = st_load(path)
+                    meta_path = path.replace(".safetensors", "_meta.json")
+                    if os.path.exists(meta_path):
+                        with open(meta_path) as mf:
+                            rec_meta_list = json.load(mf)
+                        rec_items: list[StaticRecurrentData] = []
+                        for j, item_meta in enumerate(rec_meta_list):
+                            scales = item_meta.pop('_scales', None)
+                            arrays_list: list[mx.array] = []
+                            k = 0
+                            while f"rec_{j}_arr_{k}" in rec_tensors:
+                                arrays_list.append(mx.array(rec_tensors[f"rec_{j}_arr_{k}"]))
+                                k += 1
+                            rec_items.append(StaticRecurrentData(
+                                arrays=arrays_list,
+                                metadata=item_meta,
+                                scales=scales,
+                            ))
+                        node.recurrent_data = rec_items if rec_items else None
                     else:
-                        # Legacy SSM format
-                        max_k = -1
-                        for key in tensors.keys():
-                            if key.startswith("r_"):
-                                parts = key.split("_")
-                                if len(parts) >= 3:
-                                    try:
-                                        k_idx = int(parts[1])
-                                        max_k = max(max_k, k_idx)
-                                    except ValueError:
-                                        pass
-
-                        state_list = []
-                        scales_list: list[list[float]] = []
-                        for k in range(max_k + 1):
-                            layer_list = []
-                            layer_scales: list[float] = []
-                            m = 0
-                            while f"r_{k}_{m}" in tensors:
-                                layer_list.append(mx.array(tensors[f"r_{k}_{m}"]))
-                                if f"r_{k}_scale_{m}" in tensors:
-                                    layer_scales.append(
-                                        tensors[f"r_{k}_scale_{m}"].tolist()
-                                    )
-                                m += 1
-                            if layer_scales:
-                                scales_list.append(layer_scales)
-                            if layer_list:
-                                state_list.append(layer_list if len(layer_list) > 1 else layer_list[0])
-
-                        node.recurrent_state = state_list if len(state_list) > 1 else (state_list[0] if state_list else None)
-                        node.recurrent_scales = scales_list if scales_list else None
+                        node.recurrent_data = None
                 except Exception as e:
                     logger.warning(f"[turn_cache] SSD recurrent promote failed: {e}")
-                    node.recurrent_state = None
+                    node.recurrent_data = None
 
         return True
-
-    def get_dequantized_recurrent(self, node: TurnNode) -> Any | None:
-        """Return the recurrent state dequantized to bf16/fp16.
-
-        Handles both dict format (_extract_cache_states) and legacy SSM format.
-        If the state has scales (int8 quantization), dequantizes on demand.
-        If the state is an SSDRef, promotes it first.
-        """
-        state = node.recurrent_state
-        scales = node.recurrent_scales
-
-        # Promote from SSD if needed
-        if isinstance(state, SSDRef):
-            if not self._promote_from_ssd(node):
-                return None
-            state = node.recurrent_state
-            scales = node.recurrent_scales
-
-        if state is None:
-            return None
-
-        # Always cast for fp16/bf16 configs (fixes float32 dtype after bf16 disk roundtrip)
-        # and dequantize when int8 scales are present.
-        if scales is not None or self.config.recurrent_dtype in ("fp16", "bf16"):
-            state = _dequantize_recurrent(state, scales, self.config.recurrent_dtype)
-
-        return state
 
     def visualize(self, max_depth: int = 10, tokenizer=None) -> str:
         """Return a tree representation of the trie structure.
@@ -1385,8 +762,8 @@ class TurnPrefixCache:
                 return "ROOT"
             ntok = len(node.token_ids)
             ckpt = "✓" if node.is_permanent_checkpoint else " "
-            has_kv = "K" if node.kv_arrays else " "
-            has_state = "S" if node.recurrent_state is not None and node.recurrent_state != [] else " "
+            has_kv = "K" if isinstance(node.kv_data, list) and node.kv_data else " "
+            has_state = "S" if isinstance(node.recurrent_data, list) and node.recurrent_data else " "
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
             if node.token_ids:
