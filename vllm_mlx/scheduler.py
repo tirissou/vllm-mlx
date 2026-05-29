@@ -571,7 +571,7 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
     Encapsulates the four-way selection (paged / memory-aware / turn / legacy)
     so that Scheduler.__init__ is not responsible for cache-backend wiring.
     """
-    from .prefix_cache_adapters import TurnCacheAdapter
+    from .prefix_cache_adapters import TurnCacheManager
 
     bundle = _PrefixCacheBundle()
 
@@ -617,7 +617,7 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             ssd_max_gb=config.turn_cache_ssd_gb,
         ))
         bundle.turn_cache = turn_cache
-        bundle.adapter = TurnCacheAdapter(turn_cache)
+        bundle.adapter = TurnCacheManager(turn_cache)
         logger.info(
             f"TurnPrefixCache enabled: stride={config.turn_cache_stride} "
             f"memory={config.turn_cache_memory_gb}GB"

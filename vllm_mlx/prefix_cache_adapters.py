@@ -106,49 +106,45 @@ class CacheManager(ABC):
         )
         return self._cache_index_map
 
-class TurnCacheAdapter(CacheManager):
-    """Adapts TurnPrefixCache to the PrefixCache / PersistableCache protocol."""
+class TurnCacheManager(CacheManager):
+    """Adapts TurnPrefixCache to the CacheManager protocol.
+
+    Wires TurnPrefixCache (index) + TurnCacheAdapter (orchestrator) together.
+    """
 
     def __init__(self, inner: TurnPrefixCache):
+        from vllm_mlx.turn_cache_adapter import TurnCacheAdapter as Orchestrator
         self._inner = inner
+        self._orchestrator = Orchestrator()
 
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state
         cached = cs.cached_tokens if cs is not None else 0
-        turn_bds = getattr(request, "_turn_boundaries", None) or []
+        turn_bds = getattr(request, '_turn_boundaries', None) or []
         return sorted(b - cached for b in turn_bds if b > cached)
 
     @staticmethod
     def messages_to_segments(request) -> list:
-        """Split a request's token sequence into per-message Segment objects.
-
-        Pure function of request.prompt_token_ids and request._turn_boundaries.
-        """
+        """Split request token sequence into per-message Segment objects."""
         from .turn_prefix_cache import Segment
 
         full_tokens = list(request.prompt_token_ids or [])
         if not full_tokens:
             return []
-
-        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+        _turn_boundaries = getattr(request, '_turn_boundaries', None) or []
         if not _turn_boundaries:
             return []
-
         B_sys = _turn_boundaries[0]
         if B_sys <= 0:
             return []
-
-        segments: list = [Segment(role="system", token_ids=full_tokens[:B_sys])]
-
+        segments: list = [Segment(role='system', token_ids=full_tokens[:B_sys])]
         prev = B_sys
         for B_k in _turn_boundaries[1:]:
             if B_k > prev and B_k < len(full_tokens):
-                segments.append(Segment(role="conversation", token_ids=full_tokens[prev:B_k]))
+                segments.append(Segment(role='conversation', token_ids=full_tokens[prev:B_k]))
                 prev = B_k
-
         if prev < len(full_tokens):
-            segments.append(Segment(role="user", token_ids=full_tokens[prev:]))
-
+            segments.append(Segment(role='user', token_ids=full_tokens[prev:]))
         return segments
 
     def fetch(self, request) -> CacheHit | None:
@@ -163,8 +159,7 @@ class TurnCacheAdapter(CacheManager):
             self._inner.release(path)
             return None
 
-        # Store path on request so _cleanup_finished can access it for the store step
-        cs = getattr(request, "_cache_state", None)
+        cs = getattr(request, '_cache_state', None)
         if cs is not None:
             cs.turn_path = path
 
@@ -175,32 +170,30 @@ class TurnCacheAdapter(CacheManager):
                 cached_tokens=0,
                 remaining_tokens=list(request.prompt_token_ids),
                 handle=path,
-                hit_type="hit",
+                hit_type='hit',
             )
 
-        assembled = self._inner._retrieve_full_cache(ancestor)
+        kv_data, rec_data = self._inner.collect_path_data(ancestor)
+        assembled = self._orchestrator.assemble(kv_data, rec_data)
         reconstructed = reconstruct_cache_from_states(assembled)
         cached_tokens = ancestor.n_tokens
         remaining = list(request.prompt_token_ids[cached_tokens:])
-        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+        _turn_boundaries = getattr(request, '_turn_boundaries', None) or []
         prefill_boundaries = sorted(
-            b - cached_tokens
-            for b in _turn_boundaries
-            if b > cached_tokens
+            b - cached_tokens for b in _turn_boundaries if b > cached_tokens
         )
         return CacheHit(
             cache=reconstructed,
             cached_tokens=cached_tokens,
             remaining_tokens=remaining,
             handle=path,
-            hit_type="hit",
+            hit_type='hit',
             prefill_boundaries=prefill_boundaries,
         )
 
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:
         from .turn_prefix_cache import Segment
 
-        # Support legacy call signature: store(request, cache) where cache is a list
         if cache is None and isinstance(tokens, list) and (not tokens or not isinstance(tokens[0], int)):
             cache = tokens
             tokens = None
@@ -208,34 +201,35 @@ class TurnCacheAdapter(CacheManager):
             cache = []
 
         segments = self.messages_to_segments(request)
-        if not segments or not getattr(request, "output_token_ids", None):
+        if not segments or not getattr(request, 'output_token_ids', None):
             return False
 
-        cs = getattr(request, "_cache_state", None)
+        cs = getattr(request, '_cache_state', None)
         path = cs.turn_path if cs is not None else []
         matched_depth = len(path)
         parent = path[-1] if path else self._inner.root
         new_segments = segments[matched_depth:]
-
         if not new_segments:
             return False
 
         response_tokens = list(segments[-1].token_ids) + list(request.output_token_ids)
-        # Normalize to dict form if raw KV layer objects were passed
+
         if cache and not isinstance(cache[0], dict):
             from .kv_cache import extract_layer_state
             cache = [d for layer in cache if (d := extract_layer_state(layer)) is not None]
 
-        resp_state = cache if cache else None
+        if cache:
+            kv_sparse, rec_sparse = self._orchestrator.segment(cache)
+            kv_layers = [kv for kv in kv_sparse if kv is not None]
+            rec_layers = [rec for rec in rec_sparse if rec is not None]
+        else:
+            kv_layers, rec_layers = [], []
 
-        resp_kv, resp_recur = (
-            self._inner.split_cache_arrays(resp_state, parent.n_tokens)
-            if resp_state is not None else ([], None)
-        )
         self._inner.insert(
             parent,
-            Segment(role="conversation", token_ids=response_tokens),
-            resp_kv, None, resp_recur,
+            Segment(role='conversation', token_ids=response_tokens),
+            kv_data=kv_layers or None,
+            recurrent_data=rec_layers or None,
         )
         return True
 
@@ -252,7 +246,7 @@ class TurnCacheAdapter(CacheManager):
     def on_prefill_checkpoint(
         self, request, total_tokens_prefilled: int, extracted_cache: list
     ) -> None:
-        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
+        _turn_boundaries = getattr(request, '_turn_boundaries', None) or []
         if total_tokens_prefilled not in _turn_boundaries:
             return
 
@@ -265,19 +259,34 @@ class TurnCacheAdapter(CacheManager):
         if abs_idx >= len(segments):
             return
 
-        cs = getattr(request, "_cache_state", None)
+        cs = getattr(request, '_cache_state', None)
         turn_path = cs.turn_path if cs is not None else []
-
         if len(turn_path) > abs_idx:
-            return  # already inserted (duplicate callback guard)
+            return
 
         parent = turn_path[-1] if turn_path else self._inner.root
         segment = segments[abs_idx]
-        is_sys = segment.role == "system" and abs_idx == 0
+        is_sys = segment.role == 'system' and abs_idx == 0
 
-        kv_slice, recur = self._inner.split_cache_arrays(extracted_cache, parent.n_tokens)
-        new_node = self._inner.insert(parent, segment, kv_slice, None, recur, is_system_prompt=is_sys)
+        if extracted_cache:
+            if not isinstance(extracted_cache[0], dict):
+                from .kv_cache import extract_layer_state
+                extracted_cache = [
+                    d for layer in extracted_cache
+                    if (d := extract_layer_state(layer)) is not None
+                ]
+            kv_sparse, rec_sparse = self._orchestrator.segment(extracted_cache)
+            kv_layers = [kv for kv in kv_sparse if kv is not None]
+            rec_layers = [rec for rec in rec_sparse if rec is not None]
+        else:
+            kv_layers, rec_layers = [], []
 
+        new_node = self._inner.insert(
+            parent, segment,
+            kv_data=kv_layers or None,
+            recurrent_data=rec_layers or None,
+            is_system_prompt=is_sys,
+        )
         if cs is not None:
             cs.turn_path.append(new_node)
 
