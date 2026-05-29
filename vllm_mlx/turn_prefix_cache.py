@@ -326,10 +326,19 @@ class TurnPrefixCache:
             if strategy == 'last':
                 merged_kv.append(items[-1])
             else:
-                merged_keys = mx.concatenate([item.arrays[0] for item in items], axis=-2)
-                merged_values = mx.concatenate([item.arrays[1] for item in items], axis=-2)
+                from vllm_mlx.cache_translator import CacheTranslator
+                dq_keys_chunks = []
+                dq_values_chunks = []
+                for item in items:
+                    scales = item.metadata.get('scales', [1.0, 1.0])
+                    dq = CacheTranslator.dequantize_kv(item.arrays, scales)
+                    dq_keys_chunks.append(dq[0])
+                    dq_values_chunks.append(dq[1])
+                merged_keys = mx.concatenate(dq_keys_chunks, axis=-2)
+                merged_values = mx.concatenate(dq_values_chunks, axis=-2)
                 last_meta = dict(items[-1].metadata)
                 last_meta['actual_end'] = merged_keys.shape[-2]
+                last_meta['scales'] = [1.0, 1.0]  # already dequantized
                 merged_kv.append(StaticKVData(arrays=[merged_keys, merged_values], metadata=last_meta))
 
         leaf = path[-1] if path else None
@@ -868,6 +877,21 @@ def reconstruct_cache_from_states(extracted_states):
                 cache.keys = keys
                 cache.values = values
                 cache.offset = total_offset
+                cache._idx = keys.shape[2]
+            elif layer_state.get("class_name") == "RotatingKVCache":
+                from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
+                keys, values = state[0], state[1]
+                max_size = int(meta_state[0]) if meta_state else keys.shape[2]
+                keep = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 0
+                offset = int(meta_state[2]) if meta_state and len(meta_state) > 2 else keys.shape[2]
+                # Trim to max_size if concatenation across turns exceeded the window
+                if keys.shape[2] > max_size:
+                    keys = keys[..., -max_size:, :]
+                    values = values[..., -max_size:, :]
+                cache = _RotatingKVCache(max_size, keep)
+                cache.keys = keys
+                cache.values = values
+                cache.offset = offset
                 cache._idx = keys.shape[2]
             elif cache_cls is not None and hasattr(cache_cls, "from_state"):
                 from mlx_lm.models.cache import (
