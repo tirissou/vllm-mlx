@@ -219,6 +219,8 @@ class TurnCacheManager(CacheManager):
             cache = [d for layer in cache if (d := extract_layer_state(layer)) is not None]
 
         if cache:
+            prev_end = path[-1].n_tokens if path else 0
+            cache = self._slice_kv_to_delta(cache, prev_end)
             kv_sparse, rec_sparse = self._orchestrator.segment(cache)
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
@@ -232,6 +234,27 @@ class TurnCacheManager(CacheManager):
             recurrent_data=rec_layers or None,
         )
         return True
+
+    @staticmethod
+    def _slice_kv_to_delta(states: list[dict], prev_end: int) -> list[dict]:
+        """Slice KVCache state arrays to the incremental delta [prev_end:actual_end].
+
+        RotatingKVCache is left untouched — its ring buffer is not a cumulative sequence.
+        """
+        if prev_end == 0:
+            return states
+        result = []
+        for s in states:
+            cname = s.get("class_name", "")
+            if "KVCache" in cname and "Rotating" not in cname:
+                state = s["state"]
+                meta = s.get("meta_state") or ()
+                actual_end = int(meta[0]) if meta else state[0].shape[2]
+                sliced_state = tuple(arr[:, :, prev_end:actual_end, :] for arr in state[:2])
+                new_meta = (actual_end - prev_end,) + tuple(meta[1:])
+                s = {**s, "state": sliced_state, "meta_state": new_meta}
+            result.append(s)
+        return result
 
     def release(self, handle) -> None:
         if handle is not None:
@@ -275,6 +298,8 @@ class TurnCacheManager(CacheManager):
                     d for layer in extracted_cache
                     if (d := extract_layer_state(layer)) is not None
                 ]
+            prev_end = _turn_boundaries[abs_idx - 1] if abs_idx > 0 else 0
+            extracted_cache = self._slice_kv_to_delta(extracted_cache, prev_end)
             kv_sparse, rec_sparse = self._orchestrator.segment(extracted_cache)
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]

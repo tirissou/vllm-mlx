@@ -25,7 +25,7 @@ from vllm_mlx.cache_types import StaticKVData, StaticRecurrentData
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-_CACHE_FORMAT_VERSION = 3
+_CACHE_FORMAT_VERSION = 4
 
 
 @dataclass

@@ -15,7 +15,7 @@ class StaticKVData:
     #   layer_index: int         — position in the original live_states list
     #   merge_strategy: str      — 'concatenate' (KVCache) or 'last' (RotatingKVCache)
     #   scales: list[float]      — [key_scale, value_scale]
-    #   actual_end: int          — (KVCache) number of valid tokens stored
+    #   actual_end: int          — (KVCache) number of tokens in this node's incremental slice
     #   max_size: int            — (RotatingKVCache) ring-buffer max capacity
     #   keep: int                — (RotatingKVCache) attention sink tokens kept
     #   offset: int              — (RotatingKVCache) current write head position
