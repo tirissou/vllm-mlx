@@ -175,54 +175,6 @@ class SchedulerOutput:
 
 
 class _InstrumentedBatchGenerator(BatchGenerator):
-    """BatchGenerator subclass that fires a mid-prefill callback after each chunk."""
-
-    def __init__(self, *args, mid_prefill_callback=None, save_interval=0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._mid_prefill_callback = mid_prefill_callback
-        self._save_interval = save_interval
-        self._uid_last_saved: dict = {}
-
-    def _next(self):
-        prompt_responses, gen_responses = super()._next()
-
-        if self._mid_prefill_callback and prompt_responses:
-            uid_to_idx = {uid: i for i, uid in enumerate(self._prompt_batch.uids)}
-            for resp in prompt_responses:
-                if resp.end_of_prompt or resp.uid not in uid_to_idx:
-                    continue
-                processed = resp.progress[0]
-                last = self._uid_last_saved.get(resp.uid, 0)
-                # Always fire at segment boundaries (needed for eager turn insertion);
-                # apply interval throttle only for mid-segment checkpoints.
-                if not resp.end_of_segment and self._save_interval > 0 and (processed - last) < self._save_interval:
-                    continue
-                idx = uid_to_idx[resp.uid]
-                per_uid_cache = self._prompt_batch.extract_cache(idx)
-                self._mid_prefill_callback(resp.uid, processed, per_uid_cache)
-                self._uid_last_saved[resp.uid] = processed
-
-        active = set(self._prompt_batch.uids)
-        for uid in list(self._uid_last_saved):
-            if uid not in active:
-                del self._uid_last_saved[uid]
-
-        return prompt_responses, gen_responses
-
-    def _make_new_cache(self):
-        from mlx_lm.models.cache import QuantizedKVCache
-        from .batch_quantized_kv_cache import VllmQuantizedKVCache
-        caches = super()._make_new_cache()
-        # model.make_cache() may return QuantizedKVCache objects (e.g. --kv-bits models).
-        # Plain QuantizedKVCache has no .merge(), so _merge_caches would fail.
-        # Upgrade to VllmQuantizedKVCache which adds .merge() → BatchQuantizedKVCache.
-        return [
-            VllmQuantizedKVCache(c.group_size, c.bits) if type(c) is QuantizedKVCache else c
-            for c in caches
-        ]
-
-
-class _InstrumentedBatchGenerator(BatchGenerator):
     """BatchGenerator subclass that fires a mid-prefill callback after each chunk.
 
     After every _next() call, for each sequence still in the prompt batch
@@ -232,11 +184,24 @@ class _InstrumentedBatchGenerator(BatchGenerator):
     new tokens have been processed since the last save for that uid.
     """
 
-    def __init__(self, *args, mid_prefill_callback=None, save_interval=0, **kwargs):
+    def __init__(self, *args, mid_prefill_callback=None, save_interval=0, kv_cache_bits=None, kv_cache_group_size=64, **kwargs):
         super().__init__(*args, **kwargs)
         self._mid_prefill_callback = mid_prefill_callback
         self._save_interval = save_interval
         self._uid_last_saved: dict = {}
+        self._kv_cache_bits = kv_cache_bits
+        self._kv_cache_group_size = kv_cache_group_size
+
+    def _make_new_cache(self):
+        from mlx_lm.models.cache import KVCache, QuantizedKVCache
+        caches = super()._make_new_cache()
+        if self._kv_cache_bits is None:
+            return caches
+        return [
+            QuantizedKVCache(group_size=self._kv_cache_group_size, bits=self._kv_cache_bits)
+            if isinstance(c, KVCache) else c
+            for c in caches
+        ]
 
     def _next(self):
         prompt_responses, gen_responses = super()._next()
@@ -839,6 +804,7 @@ class Scheduler:
             mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
             logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
 
+        kv_bits = self.config.kv_cache_quantization_bits if self.config.use_turn_cache else None
         bg = _InstrumentedBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
@@ -849,6 +815,8 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             mid_prefill_callback=mid_prefill_cb,
             save_interval=save_interval,
+            kv_cache_bits=kv_bits,
+            kv_cache_group_size=self.config.kv_cache_quantization_group_size,
         )
         # mlx-lm >=0.31.x BatchGenerator natively interleaves prefill and
         # decode — chunked_prefill_tokens now only controls mid-prefill save

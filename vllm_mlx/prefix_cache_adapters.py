@@ -247,7 +247,6 @@ class TurnCacheManager(CacheManager):
     ) -> list:
         """Reconstruct live cache objects from KVLayerSegment and RecurrentLayerSegment lists."""
         from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
-        from .batch_quantized_kv_cache import BatchQuantizedKVCache
 
         result: dict[int, Any] = {}
 
@@ -284,13 +283,12 @@ class TurnCacheManager(CacheManager):
                 cache.offset = layer.metadata.get('offset', dq_keys.shape[-2])
                 cache._idx = _idx
             else:
-                cache = BatchQuantizedKVCache.from_quantized_arrays(
-                    keys=layer.keys,
-                    values=layer.values,
-                    n_tokens=layer.metadata.get('n_tokens', layer.keys.packed.shape[-2]),
-                    group_size=group_size,
-                    bits=bits,
-                ).extract(0)
+                from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
+                n_tokens = layer.metadata.get('n_tokens', layer.keys.packed.shape[-2])
+                cache = _QuantizedKVCache(group_size=group_size, bits=bits)
+                cache.keys = [k[..., :n_tokens, :] for k in layer.keys]
+                cache.values = [v[..., :n_tokens, :] for v in layer.values]
+                cache.offset = n_tokens
             result[li] = cache
 
         for layer in recurrent_layers:
