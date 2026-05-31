@@ -4,10 +4,13 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 #### Environment
 - macOS on Apple Silicon.
 - Local inference may use llama.cpp or LM Studio via OpenAI-compatible endpoints.
+- The python source code lives in `./vllm_mlx/`. 
+- All tests lives in `./tests/`.
+- All docs live in `./docs/`.
 - Prefer `rg` over `grep`.
 - Prefer `fd` over `find` when available.
+- Always pass a `path` parameter to `rg` and `fd` queries (ie for source code, tests, docs, etc).
 - Python virtual environment at `.venv` is managed by `uv`. Use `uv pip` always.
-- The python source code is in `vllm_mlx`.
 
 #### Research
 - Use the available web search tool for:
