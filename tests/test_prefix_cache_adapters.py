@@ -3,6 +3,8 @@
 import inspect
 from abc import ABC
 
+import pytest
+
 from vllm_mlx.kv_cache import RequestCacheState
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
 
@@ -566,3 +568,128 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     )
     # inner.split_cache_arrays must NOT be called (it was the old API)
     inner.split_cache_arrays.assert_not_called()
+
+
+# ── _segment() lazy-eval fix ─────────────────────────────────────────────────
+
+
+def _rotating_state(B=1, H=2, T=16, D=64):
+    """Return a RotatingKVCache state dict with float16 keys/values."""
+    import mlx.core as mx
+
+    keys = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    values = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    mx.eval(keys, values)
+    return {
+        "class_name": "RotatingKVCache",
+        "state": (keys, values),
+        # meta: (keep, max_size, offset, _idx)
+        "meta_state": ("0", str(T), str(T), str(T)),
+    }
+
+
+def _kvcache_state(B=1, H=2, T=16, D=64):
+    """Return a KVCache state dict with float16 keys/values."""
+    import mlx.core as mx
+
+    keys = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    values = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    mx.eval(keys, values)
+    return {
+        "class_name": "KVCache",
+        "state": (keys, values),
+        "meta_state": (str(T),),
+    }
+
+
+def test_segment_rotating_kvcache_quantized_arrays_are_evaluated():
+    """KVLayerSegment arrays from the RotatingKVCache branch must be concrete
+    (already evaluated) so that freeing the source float16 arrays does not
+    leave dangling computation graph references in active Metal memory."""
+    import mlx.core as mx
+
+    state = _rotating_state()
+    kv_list, _ = TurnCacheManager._segment([state], group_size=32, bits=8)
+    seg = kv_list[0]
+    assert seg is not None
+
+    # Release source arrays and flush the Metal pool.
+    del state
+    mx.clear_cache()
+
+    # If the quantized arrays were NOT evaluated inside _segment(), calling
+    # mx.eval() here would attempt to resolve a computation graph whose input
+    # buffers have been freed, producing incorrect data.  With the fix the
+    # arrays are already concrete and this is a no-op that must not raise.
+    mx.eval(seg.keys.packed, seg.keys.scales, seg.keys.biases)
+    mx.eval(seg.values.packed, seg.values.scales, seg.values.biases)
+
+    assert seg.keys.packed.nbytes > 0
+    assert seg.values.packed.nbytes > 0
+
+
+def test_segment_kvcache_quantized_arrays_are_evaluated():
+    """KVLayerSegment arrays from the KVCache branch must be concrete."""
+    import mlx.core as mx
+
+    state = _kvcache_state()
+    kv_list, _ = TurnCacheManager._segment([state], group_size=32, bits=8)
+    seg = kv_list[0]
+    assert seg is not None
+
+    del state
+    mx.clear_cache()
+
+    mx.eval(seg.keys.packed, seg.keys.scales, seg.keys.biases)
+    mx.eval(seg.values.packed, seg.values.scales, seg.values.biases)
+
+    assert seg.keys.packed.nbytes > 0
+    assert seg.values.packed.nbytes > 0
+
+
+@pytest.mark.skipif(
+    not __import__("mlx.core", fromlist=["metal"]).metal.is_available(),
+    reason="requires Metal GPU",
+)
+def test_segment_does_not_retain_source_float16_in_active_memory():
+    """Source float16 buffers must not stay in active Metal memory after
+    _segment() returns and the source references are dropped."""
+    import mlx.core as mx
+
+    # Establish baseline before any new allocations.
+    mx.clear_cache()
+    baseline = mx.get_active_memory()
+
+    # Use a large tensor so the delta is measurable (8 MB float16).
+    B, H, T, D = 1, 8, 128, 128
+    keys = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    values = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    mx.eval(keys, values)
+    source_bytes = keys.nbytes + values.nbytes  # float16 footprint
+
+    state = {
+        "class_name": "RotatingKVCache",
+        "state": (keys, values),
+        "meta_state": ("0", str(T), str(T), str(T)),
+    }
+
+    kv_list, _ = TurnCacheManager._segment([state], group_size=32, bits=8)
+    seg = kv_list[0]
+
+    # Release all source references.
+    del keys, values, state
+    mx.eval(seg.keys.packed)  # ensure segment is materialised
+    mx.clear_cache()
+
+    active_after = mx.get_active_memory()
+    # Without the fix: active_after ≈ baseline + source_bytes (float16 still
+    # referenced via lazy computation graph in the trie).
+    # With the fix: active_after ≈ baseline + quantized_bytes (< source_bytes).
+    # Assert the float16 source is NOT retained: growth must be well under
+    # the full float16 footprint (allow 50% to account for quantized arrays).
+    growth = active_after - baseline
+    assert growth < source_bytes * 0.75, (
+        f"Source float16 ({source_bytes / 1e6:.1f} MB) appears retained: "
+        f"baseline={baseline / 1e6:.1f} MB, active_after={active_after / 1e6:.1f} MB, "
+        f"growth={growth / 1e6:.1f} MB"
+    )
