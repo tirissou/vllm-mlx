@@ -196,6 +196,27 @@ class TurnCacheManager(CacheManager):
                 q_values = QuantizedArray(
                     *mx.quantize(lin_values, group_size=group_size, bits=bits)
                 )
+                mx.eval(
+                    q_keys.packed,
+                    q_keys.scales,
+                    q_keys.biases,
+                    q_values.packed,
+                    q_values.scales,
+                    q_values.biases,
+                )
+                # mx.stop_gradient severs the MLX computation graph so the
+                # trie node does not retain a reference to the source float16
+                # Metal buffers via the lazy quantize dependency chain.
+                q_keys = QuantizedArray(
+                    packed=mx.stop_gradient(q_keys.packed),
+                    scales=mx.stop_gradient(q_keys.scales),
+                    biases=mx.stop_gradient(q_keys.biases),
+                )
+                q_values = QuantizedArray(
+                    packed=mx.stop_gradient(q_values.packed),
+                    scales=mx.stop_gradient(q_values.scales),
+                    biases=mx.stop_gradient(q_values.biases),
+                )
 
                 kv_list[i] = KVLayerSegment(
                     keys=q_keys,
@@ -225,6 +246,27 @@ class TurnCacheManager(CacheManager):
                 )
                 q_values = QuantizedArray(
                     *mx.quantize(sliced_values, group_size=group_size, bits=bits)
+                )
+                mx.eval(
+                    q_keys.packed,
+                    q_keys.scales,
+                    q_keys.biases,
+                    q_values.packed,
+                    q_values.scales,
+                    q_values.biases,
+                )
+                # mx.stop_gradient severs the MLX computation graph so the
+                # trie node does not retain a reference to the source float16
+                # Metal buffers via the lazy quantize dependency chain.
+                q_keys = QuantizedArray(
+                    packed=mx.stop_gradient(q_keys.packed),
+                    scales=mx.stop_gradient(q_keys.scales),
+                    biases=mx.stop_gradient(q_keys.biases),
+                )
+                q_values = QuantizedArray(
+                    packed=mx.stop_gradient(q_values.packed),
+                    scales=mx.stop_gradient(q_values.scales),
+                    biases=mx.stop_gradient(q_values.biases),
                 )
 
                 kv_list[i] = KVLayerSegment(
