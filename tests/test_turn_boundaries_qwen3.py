@@ -4,11 +4,13 @@ Tests for _compute_turn_boundaries() using the real Qwen3-0.6B tokenizer.
 These tests verify that the LCP-based boundary detection works correctly
 with a real tokenizer, not just the mock tokenizer used in test_turn_prefix_cache.py.
 """
+
 import pytest
 
 # Try to import the tokenizer; skip all tests if unavailable
 try:
     from transformers import AutoTokenizer
+
     TOKENIZER = AutoTokenizer.from_pretrained("mlx-community/Qwen3-0.6B-4bit")
     TOKENIZER_AVAILABLE = True
 except Exception as e:
@@ -19,6 +21,7 @@ except Exception as e:
 def _make_engine_with_qwen3():
     """Return a BatchedEngine stub with the real Qwen3 tokenizer."""
     from vllm_mlx.engine.batched import BatchedEngine
+
     eng = object.__new__(BatchedEngine)
     eng._is_mllm = False
     eng._tokenizer = TOKENIZER
@@ -50,9 +53,9 @@ class TestTurnBoundariesQwen3:
             messages, add_generation_prompt=True, tokenize=True
         )
         full_tokens = full_tokens_dict["input_ids"]
-        assert boundaries[0] < len(full_tokens), (
-            f"B_sys={boundaries[0]} should be < total tokens {len(full_tokens)}"
-        )
+        assert boundaries[0] < len(
+            full_tokens
+        ), f"B_sys={boundaries[0]} should be < total tokens {len(full_tokens)}"
 
     def test_multi_turn_has_increasing_boundaries(self):
         """Multi-turn: system + user1 + assistant1 + user2 → [B_sys, B_1]."""
@@ -70,9 +73,9 @@ class TestTurnBoundariesQwen3:
 
         # All boundaries should be strictly increasing
         for i in range(len(boundaries) - 1):
-            assert boundaries[i] < boundaries[i + 1], (
-                f"Boundaries not increasing: {boundaries[i]} >= {boundaries[i+1]}"
-            )
+            assert (
+                boundaries[i] < boundaries[i + 1]
+            ), f"Boundaries not increasing: {boundaries[i]} >= {boundaries[i+1]}"
 
     def test_multi_turn_three_assistant_turns(self):
         """Three completed assistant turns → [B_sys, B_1, B_2, B_3]."""
@@ -94,9 +97,9 @@ class TestTurnBoundariesQwen3:
 
         # Verify all increasing
         for i in range(len(boundaries) - 1):
-            assert boundaries[i] < boundaries[i + 1], (
-                f"Boundaries not strictly increasing: {boundaries}"
-            )
+            assert (
+                boundaries[i] < boundaries[i + 1]
+            ), f"Boundaries not strictly increasing: {boundaries}"
 
     def test_empty_system_message(self):
         """Edge case: empty system message."""
@@ -123,9 +126,9 @@ class TestTurnBoundariesQwen3:
 
         assert len(boundaries) >= 1, f"Expected at least 1 boundary, got {boundaries}"
         # Long system message should result in large boundary
-        assert boundaries[0] > 50, (
-            f"Long system message should have B_sys > 50, got {boundaries[0]}"
-        )
+        assert (
+            boundaries[0] > 50
+        ), f"Long system message should have B_sys > 50, got {boundaries[0]}"
 
     def test_token_boundary_accuracy(self):
         """Verify computed boundary is within valid range of full token sequence."""
@@ -143,9 +146,9 @@ class TestTurnBoundariesQwen3:
 
         # Boundary should be a valid position in the full token sequence
         B_sys = boundaries[0]
-        assert 0 < B_sys < len(full_tokens), (
-            f"B_sys={B_sys} should be within range (0, {len(full_tokens)})"
-        )
+        assert (
+            0 < B_sys < len(full_tokens)
+        ), f"B_sys={B_sys} should be within range (0, {len(full_tokens)})"
 
     def test_system_message_in_multi_turn(self):
         """System boundary is computed correctly in multi-turn conversations."""
@@ -200,9 +203,9 @@ class TestTurnBoundariesQwen3:
         boundaries = eng._compute_turn_boundaries(messages)
 
         # No duplicates
-        assert len(boundaries) == len(set(boundaries)), (
-            f"Boundaries contain duplicates: {boundaries}"
-        )
+        assert len(boundaries) == len(
+            set(boundaries)
+        ), f"Boundaries contain duplicates: {boundaries}"
 
     def test_last_boundary_less_than_full_tokens(self):
         """Last boundary must be < len(full_tokens) because there's a user segment after."""
@@ -219,9 +222,9 @@ class TestTurnBoundariesQwen3:
             messages, add_generation_prompt=True, tokenize=True
         )["input_ids"]
 
-        assert boundaries[-1] < len(full_tokens), (
-            f"Last boundary {boundaries[-1]} should be < full_tokens {len(full_tokens)}"
-        )
+        assert boundaries[-1] < len(
+            full_tokens
+        ), f"Last boundary {boundaries[-1]} should be < full_tokens {len(full_tokens)}"
 
     def test_boundaries_strictly_increasing(self):
         """Multiple boundaries should be strictly increasing positions."""
@@ -243,22 +246,25 @@ class TestTurnBoundariesQwen3:
 
         # All boundaries should be strictly increasing
         for i in range(len(boundaries) - 1):
-            assert boundaries[i] < boundaries[i + 1], (
-                f"Boundaries not strictly increasing: {boundaries}"
-            )
+            assert (
+                boundaries[i] < boundaries[i + 1]
+            ), f"Boundaries not strictly increasing: {boundaries}"
 
         # All boundaries should be within valid token range
         for b in boundaries:
-            assert 0 < b < len(full_tokens), (
-                f"Boundary {b} outside valid range (0, {len(full_tokens)})"
-            )
+            assert (
+                0 < b < len(full_tokens)
+            ), f"Boundary {b} outside valid range (0, {len(full_tokens)})"
 
     def test_special_characters_in_messages(self):
         """Messages with special characters should compute boundaries correctly."""
         eng = _make_engine_with_qwen3()
         messages = [
-            {"role": "system", "content": "Handle special chars: <>, {}, [], @, #, $, %"},
-            {"role": "user", "content": 'Question with "quotes" and \'apostrophes\''},
+            {
+                "role": "system",
+                "content": "Handle special chars: <>, {}, [], @, #, $, %",
+            },
+            {"role": "user", "content": "Question with \"quotes\" and 'apostrophes'"},
         ]
         boundaries = eng._compute_turn_boundaries(messages)
 
@@ -294,9 +300,9 @@ class TestTurnBoundariesQwen3:
 
         # All strictly increasing
         for i in range(len(boundaries) - 1):
-            assert boundaries[i] < boundaries[i + 1], (
-                f"Boundaries not strictly increasing: {boundaries}"
-            )
+            assert (
+                boundaries[i] < boundaries[i + 1]
+            ), f"Boundaries not strictly increasing: {boundaries}"
 
     def test_exact_boundary_count_two_messages(self):
         """system + user → exactly 2 boundaries (after system, after user)."""
@@ -306,9 +312,9 @@ class TestTurnBoundariesQwen3:
             {"role": "user", "content": "Q1"},
         ]
         boundaries = eng._compute_turn_boundaries(messages)
-        assert len(boundaries) == 2, (
-            f"Expected 2 boundaries (system, user), got {len(boundaries)}: {boundaries}"
-        )
+        assert (
+            len(boundaries) == 2
+        ), f"Expected 2 boundaries (system, user), got {len(boundaries)}: {boundaries}"
 
     def test_exact_boundary_count_multi_turn(self):
         """system + user + asst + user → exactly 4 boundaries."""
@@ -320,9 +326,9 @@ class TestTurnBoundariesQwen3:
             {"role": "user", "content": "Q2"},
         ]
         boundaries = eng._compute_turn_boundaries(messages)
-        assert len(boundaries) == 4, (
-            f"Expected 4 boundaries, got {len(boundaries)}: {boundaries}"
-        )
+        assert (
+            len(boundaries) == 4
+        ), f"Expected 4 boundaries, got {len(boundaries)}: {boundaries}"
 
     def test_same_system_boundary_for_different_user_messages(self):
         """Same system prompt → same system boundary regardless of user content."""

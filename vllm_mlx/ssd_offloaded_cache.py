@@ -67,7 +67,7 @@ class SSDOffloadedCache:
                 return CacheHit(
                     cache=layers,
                     cached_tokens=len(disk_key),
-                    remaining_tokens=list(prompt[len(disk_key):]),
+                    remaining_tokens=list(prompt[len(disk_key) :]),
                     hit_type="ssd_hit",
                 )
             # Enqueue for background promotion (dedup).

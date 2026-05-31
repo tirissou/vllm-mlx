@@ -44,7 +44,7 @@ class SSDRef:
 class TurnNode:
     token_ids: list[int]
     context_hash: int
-    kv_data: list[KVLayerSegment] | SSDRef | None   # None for root sentinel
+    kv_data: list[KVLayerSegment] | SSDRef | None  # None for root sentinel
     recurrent_data: list[RecurrentLayerSegment] | SSDRef | None
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
@@ -73,16 +73,15 @@ class TurnNode:
         return len(self.token_ids) + (self.parent.n_tokens if self.parent else 0)
 
 
-
 @dataclass
 class TurnPrefixCacheConfig:
-    checkpoint_stride: int = 512 # tokens between permanent checkpoints; 0 = every node
+    checkpoint_stride: int = 512  # tokens between permanent checkpoints; 0 = every node
     max_memory_gb: float = 8.0
-    kv_dtype: str = "int8"                      # "bf16" or "int8"
-    recurrent_dtype: str = "bf16"                # "none", "fp16", "bf16", or "int8" (per-channel)
-    persist_dir: str | None = None    # None = disabled
-    ssd_max_gb: float = 0.0           # 0 = disabled
-    ssd_dir: str | None = None        # SSD spill directory (defaults to persist_dir/ssd)
+    kv_dtype: str = "int8"  # "bf16" or "int8"
+    recurrent_dtype: str = "bf16"  # "none", "fp16", "bf16", or "int8" (per-channel)
+    persist_dir: str | None = None  # None = disabled
+    ssd_max_gb: float = 0.0  # 0 = disabled
+    ssd_dir: str | None = None  # SSD spill directory (defaults to persist_dir/ssd)
 
 
 def _context_hash(parent_hash: int, token_ids: list[int]) -> int:
@@ -116,14 +115,14 @@ def _node_data_bytes(node: TurnNode) -> int:
             if isinstance(arrays, (list, tuple)):
                 for item in arrays:
                     if isinstance(item, dict):
-                        for arr in item.get('state', ()):
-                            if hasattr(arr, 'itemsize'):
+                        for arr in item.get("state", ()):
+                            if hasattr(arr, "itemsize"):
                                 total += _arr_bytes(arr)
-                    elif hasattr(item, 'itemsize'):
+                    elif hasattr(item, "itemsize"):
                         total += _arr_bytes(item)
             elif isinstance(arrays, dict):
-                for arr in arrays.get('state', ()):
-                    if hasattr(arr, 'itemsize'):
+                for arr in arrays.get("state", ()):
+                    if hasattr(arr, "itemsize"):
                         total += _arr_bytes(arr)
     return total
 
@@ -149,7 +148,7 @@ class TurnPrefixCache:
     # implemented by TurnCacheManager.  These stubs exist solely so that
     # isinstance(cache, SpillableCache) returns True (runtime_checkable).
 
-    def fetch(self, request) -> None:          # type: ignore[override]
+    def fetch(self, request) -> None:  # type: ignore[override]
         raise NotImplementedError("Use TurnCacheManager.fetch()")
 
     def store(self, request, cache: list) -> bool:  # type: ignore[override]
@@ -187,7 +186,12 @@ class TurnPrefixCache:
         acquire_lock: bool = True,
     ) -> TurnNode:
         rval = self._insert_node(
-            parent, segment, kv_data, recurrent_data, is_system_prompt, acquire_lock,
+            parent,
+            segment,
+            kv_data,
+            recurrent_data,
+            is_system_prompt,
+            acquire_lock,
         )
         logger.info(self.visualize())
         return rval
@@ -246,7 +250,9 @@ class TurnPrefixCache:
             self._evict_if_needed_unlocked()
             return node
 
-    def match(self, segments: list[Segment], acquire_lock=True) -> tuple[list[TurnNode], bool]:
+    def match(
+        self, segments: list[Segment], acquire_lock=True
+    ) -> tuple[list[TurnNode], bool]:
         """Walk trie matching segments. Returns (path, has_recurrent).
 
         Increments ref_count for all matched nodes (caller must call release()).
@@ -277,7 +283,9 @@ class TurnPrefixCache:
             for node in path:
                 node.ref_count = max(0, node.ref_count - 1)
                 if node.is_evictable:
-                    heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+                    heapq.heappush(
+                        self._eviction_heap, (node.last_used, id(node), node)
+                    )
 
     def find_checkpoint_ancestor(self, path: list[TurnNode]) -> TurnNode | None:
         """Return the deepest node in path that can serve as a prefill resume point.
@@ -292,10 +300,7 @@ class TurnPrefixCache:
             return None
 
         for node in reversed(path):
-            if (
-                isinstance(node.recurrent_data, list)
-                and node.recurrent_data
-            ):
+            if isinstance(node.recurrent_data, list) and node.recurrent_data:
                 return node
         return None
 
@@ -314,13 +319,13 @@ class TurnPrefixCache:
         for n in path:
             if isinstance(n.kv_data, list):
                 for item in n.kv_data:
-                    li = item.metadata['layer_index']
+                    li = item.metadata["layer_index"]
                     kv_by_layer.setdefault(li, []).append(item)
 
         merged_kv: list[KVLayerSegment] = []
         for li in sorted(kv_by_layer):
             items = kv_by_layer[li]
-            if items[0].metadata.get('merge_strategy', 'concatenate') == 'last':
+            if items[0].metadata.get("merge_strategy", "concatenate") == "last":
                 merged_kv.append(items[-1])
             else:
                 merged_kv.append(KVLayerSegment.concat(items))
@@ -426,12 +431,24 @@ class TurnPrefixCache:
                     tensors: dict[str, np.ndarray] = {}
                     all_meta: list[dict] = []
                     for j, kv_item in enumerate(node.kv_data):
-                        tensors[f"layer_{j}_keys_packed"] = np.array(kv_item.keys.packed)
-                        tensors[f"layer_{j}_keys_scales"] = np.array(kv_item.keys.scales.astype(mx.float32))
-                        tensors[f"layer_{j}_keys_biases"] = np.array(kv_item.keys.biases.astype(mx.float32))
-                        tensors[f"layer_{j}_values_packed"] = np.array(kv_item.values.packed)
-                        tensors[f"layer_{j}_values_scales"] = np.array(kv_item.values.scales.astype(mx.float32))
-                        tensors[f"layer_{j}_values_biases"] = np.array(kv_item.values.biases.astype(mx.float32))
+                        tensors[f"layer_{j}_keys_packed"] = np.array(
+                            kv_item.keys.packed
+                        )
+                        tensors[f"layer_{j}_keys_scales"] = np.array(
+                            kv_item.keys.scales.astype(mx.float32)
+                        )
+                        tensors[f"layer_{j}_keys_biases"] = np.array(
+                            kv_item.keys.biases.astype(mx.float32)
+                        )
+                        tensors[f"layer_{j}_values_packed"] = np.array(
+                            kv_item.values.packed
+                        )
+                        tensors[f"layer_{j}_values_scales"] = np.array(
+                            kv_item.values.scales.astype(mx.float32)
+                        )
+                        tensors[f"layer_{j}_values_biases"] = np.array(
+                            kv_item.values.biases.astype(mx.float32)
+                        )
                         all_meta.append(kv_item.metadata)
                     tmp = kv_path + ".tmp"
                     st_save(tensors, tmp)
@@ -449,18 +466,18 @@ class TurnPrefixCache:
                         arrays = rec_item.arrays
                         if isinstance(arrays, (list, tuple)):
                             for k, arr in enumerate(arrays):
-                                if hasattr(arr, 'dtype'):
+                                if hasattr(arr, "dtype"):
                                     if arr.dtype == mx.bfloat16:
                                         arr = arr.astype(mx.float32)
                                     rec_tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
                         elif isinstance(arrays, dict):
-                            for k, arr in enumerate(arrays.get('state', ())):
-                                if hasattr(arr, 'dtype'):
+                            for k, arr in enumerate(arrays.get("state", ())):
+                                if hasattr(arr, "dtype"):
                                     if arr.dtype == mx.bfloat16:
                                         arr = arr.astype(mx.float32)
                                     rec_tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
                         item_meta = dict(rec_item.metadata)
-                        item_meta['_scales'] = rec_item.scales
+                        item_meta["_scales"] = rec_item.scales
                         rec_meta_list.append(item_meta)
                     if rec_tensors:
                         tmp = rec_path + ".tmp"
@@ -516,8 +533,16 @@ class TurnPrefixCache:
         # Build hash→node map in one pass
         hash_to_node: dict[int, TurnNode] = {0: self.root}
         for row in rows:
-            (ctx_hash, parent_hash, tok_blob, kv_path, rec_path,
-             last_used, tokens_since, is_perm) = row
+            (
+                ctx_hash,
+                parent_hash,
+                tok_blob,
+                kv_path,
+                rec_path,
+                last_used,
+                tokens_since,
+                is_perm,
+            ) = row
 
             token_ids = list(np.frombuffer(tok_blob, dtype=np.int32))
 
@@ -531,19 +556,32 @@ class TurnPrefixCache:
                         with open(meta_path_kv) as mf:
                             all_meta = json.load(mf)
                         from vllm_mlx.kv_cache import QuantizedArray
+
                         kv_items: list[KVLayerSegment] = []
                         for j, item_meta in enumerate(all_meta):
                             keys = QuantizedArray(
                                 packed=mx.array(tensors[f"layer_{j}_keys_packed"]),
-                                scales=mx.array(tensors[f"layer_{j}_keys_scales"]).astype(mx.bfloat16),
-                                biases=mx.array(tensors[f"layer_{j}_keys_biases"]).astype(mx.bfloat16),
+                                scales=mx.array(
+                                    tensors[f"layer_{j}_keys_scales"]
+                                ).astype(mx.bfloat16),
+                                biases=mx.array(
+                                    tensors[f"layer_{j}_keys_biases"]
+                                ).astype(mx.bfloat16),
                             )
                             values = QuantizedArray(
                                 packed=mx.array(tensors[f"layer_{j}_values_packed"]),
-                                scales=mx.array(tensors[f"layer_{j}_values_scales"]).astype(mx.bfloat16),
-                                biases=mx.array(tensors[f"layer_{j}_values_biases"]).astype(mx.bfloat16),
+                                scales=mx.array(
+                                    tensors[f"layer_{j}_values_scales"]
+                                ).astype(mx.bfloat16),
+                                biases=mx.array(
+                                    tensors[f"layer_{j}_values_biases"]
+                                ).astype(mx.bfloat16),
                             )
-                            kv_items.append(KVLayerSegment(keys=keys, values=values, metadata=item_meta))
+                            kv_items.append(
+                                KVLayerSegment(
+                                    keys=keys, values=values, metadata=item_meta
+                                )
+                            )
                         kv_data = kv_items if kv_items else None
                 except Exception as e:
                     logger.warning(f"[turn_cache] skipping node {ctx_hash}: {e}")
@@ -560,20 +598,26 @@ class TurnPrefixCache:
                             rec_meta_list = json.load(mf)
                         rec_items: list[RecurrentLayerSegment] = []
                         for j, item_meta in enumerate(rec_meta_list):
-                            scales = item_meta.pop('_scales', None)
+                            scales = item_meta.pop("_scales", None)
                             arrays_list: list[mx.array] = []
                             k = 0
                             while f"rec_{j}_arr_{k}" in rec_tensors:
-                                arrays_list.append(mx.array(rec_tensors[f"rec_{j}_arr_{k}"]))
+                                arrays_list.append(
+                                    mx.array(rec_tensors[f"rec_{j}_arr_{k}"])
+                                )
                                 k += 1
-                            rec_items.append(RecurrentLayerSegment(
-                                arrays=arrays_list,
-                                metadata=item_meta,
-                                scales=scales,
-                            ))
+                            rec_items.append(
+                                RecurrentLayerSegment(
+                                    arrays=arrays_list,
+                                    metadata=item_meta,
+                                    scales=scales,
+                                )
+                            )
                         recurrent_data = rec_items if rec_items else None
                 except Exception as e:
-                    logger.warning(f"[turn_cache] recurrent load failed for {ctx_hash}: {e}")
+                    logger.warning(
+                        f"[turn_cache] recurrent load failed for {ctx_hash}: {e}"
+                    )
 
             node = TurnNode(
                 token_ids=token_ids,
@@ -598,7 +642,9 @@ class TurnPrefixCache:
                 parent.children[ctx_hash] = node
                 self._memory_bytes += _node_data_bytes(node)
                 if node.is_evictable:
-                    heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+                    heapq.heappush(
+                        self._eviction_heap, (node.last_used, id(node), node)
+                    )
 
         for node in hash_to_node.values():
             if node is self.root:
@@ -631,7 +677,10 @@ class TurnPrefixCache:
             self.config.persist_dir or "/tmp", "ssd"
         )
         os.makedirs(ssd_dir, exist_ok=True)
-        return os.path.join(ssd_dir, f"{node.context_hash & 0xFFFFFFFFFFFFFFFF:016x}_{suffix}.safetensors")
+        return os.path.join(
+            ssd_dir,
+            f"{node.context_hash & 0xFFFFFFFFFFFFFFFF:016x}_{suffix}.safetensors",
+        )
 
     def _spill_to_ssd(self, node: TurnNode) -> None:
         """Write node's KV (and recurrent if present) to SSD; replace with SSDRef."""
@@ -643,11 +692,19 @@ class TurnPrefixCache:
             all_meta: list[dict] = []
             for j, kv_item in enumerate(node.kv_data):
                 tensors[f"layer_{j}_keys_packed"] = np.array(kv_item.keys.packed)
-                tensors[f"layer_{j}_keys_scales"] = np.array(kv_item.keys.scales.astype(mx.float32))
-                tensors[f"layer_{j}_keys_biases"] = np.array(kv_item.keys.biases.astype(mx.float32))
+                tensors[f"layer_{j}_keys_scales"] = np.array(
+                    kv_item.keys.scales.astype(mx.float32)
+                )
+                tensors[f"layer_{j}_keys_biases"] = np.array(
+                    kv_item.keys.biases.astype(mx.float32)
+                )
                 tensors[f"layer_{j}_values_packed"] = np.array(kv_item.values.packed)
-                tensors[f"layer_{j}_values_scales"] = np.array(kv_item.values.scales.astype(mx.float32))
-                tensors[f"layer_{j}_values_biases"] = np.array(kv_item.values.biases.astype(mx.float32))
+                tensors[f"layer_{j}_values_scales"] = np.array(
+                    kv_item.values.scales.astype(mx.float32)
+                )
+                tensors[f"layer_{j}_values_biases"] = np.array(
+                    kv_item.values.biases.astype(mx.float32)
+                )
                 all_meta.append(kv_item.metadata)
             tmp = path + ".tmp"
             st_save(tensors, tmp)
@@ -666,18 +723,18 @@ class TurnPrefixCache:
                 arrays = rec_item.arrays
                 if isinstance(arrays, (list, tuple)):
                     for k, arr in enumerate(arrays):
-                        if hasattr(arr, 'dtype'):
+                        if hasattr(arr, "dtype"):
                             if arr.dtype == mx.bfloat16:
                                 arr = arr.astype(mx.float32)
                             tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
                 elif isinstance(arrays, dict):
-                    for k, arr in enumerate(arrays.get('state', ())):
-                        if hasattr(arr, 'dtype'):
+                    for k, arr in enumerate(arrays.get("state", ())):
+                        if hasattr(arr, "dtype"):
                             if arr.dtype == mx.bfloat16:
                                 arr = arr.astype(mx.float32)
                             tensors[f"rec_{j}_arr_{k}"] = np.array(arr)
                 item_meta = dict(rec_item.metadata)
-                item_meta['_scales'] = rec_item.scales
+                item_meta["_scales"] = rec_item.scales
                 rec_meta_list.append(item_meta)
             if tensors:
                 tmp = path + ".tmp"
@@ -705,19 +762,30 @@ class TurnPrefixCache:
                     with open(meta_path) as mf:
                         all_meta = json.load(mf)
                     from vllm_mlx.kv_cache import QuantizedArray
+
                     kv_items: list[KVLayerSegment] = []
                     for j, item_meta in enumerate(all_meta):
                         keys = QuantizedArray(
                             packed=mx.array(tensors[f"layer_{j}_keys_packed"]),
-                            scales=mx.array(tensors[f"layer_{j}_keys_scales"]).astype(mx.bfloat16),
-                            biases=mx.array(tensors[f"layer_{j}_keys_biases"]).astype(mx.bfloat16),
+                            scales=mx.array(tensors[f"layer_{j}_keys_scales"]).astype(
+                                mx.bfloat16
+                            ),
+                            biases=mx.array(tensors[f"layer_{j}_keys_biases"]).astype(
+                                mx.bfloat16
+                            ),
                         )
                         values = QuantizedArray(
                             packed=mx.array(tensors[f"layer_{j}_values_packed"]),
-                            scales=mx.array(tensors[f"layer_{j}_values_scales"]).astype(mx.bfloat16),
-                            biases=mx.array(tensors[f"layer_{j}_values_biases"]).astype(mx.bfloat16),
+                            scales=mx.array(tensors[f"layer_{j}_values_scales"]).astype(
+                                mx.bfloat16
+                            ),
+                            biases=mx.array(tensors[f"layer_{j}_values_biases"]).astype(
+                                mx.bfloat16
+                            ),
                         )
-                        kv_items.append(KVLayerSegment(keys=keys, values=values, metadata=item_meta))
+                        kv_items.append(
+                            KVLayerSegment(keys=keys, values=values, metadata=item_meta)
+                        )
                     node.kv_data = kv_items if kv_items else None
                 else:
                     node.kv_data = None
@@ -736,17 +804,21 @@ class TurnPrefixCache:
                             rec_meta_list = json.load(mf)
                         rec_items: list[RecurrentLayerSegment] = []
                         for j, item_meta in enumerate(rec_meta_list):
-                            scales = item_meta.pop('_scales', None)
+                            scales = item_meta.pop("_scales", None)
                             arrays_list: list[mx.array] = []
                             k = 0
                             while f"rec_{j}_arr_{k}" in rec_tensors:
-                                arrays_list.append(mx.array(rec_tensors[f"rec_{j}_arr_{k}"]))
+                                arrays_list.append(
+                                    mx.array(rec_tensors[f"rec_{j}_arr_{k}"])
+                                )
                                 k += 1
-                            rec_items.append(RecurrentLayerSegment(
-                                arrays=arrays_list,
-                                metadata=item_meta,
-                                scales=scales,
-                            ))
+                            rec_items.append(
+                                RecurrentLayerSegment(
+                                    arrays=arrays_list,
+                                    metadata=item_meta,
+                                    scales=scales,
+                                )
+                            )
                         node.recurrent_data = rec_items if rec_items else None
                     else:
                         node.recurrent_data = None
@@ -771,11 +843,19 @@ class TurnPrefixCache:
             ntok = len(node.token_ids)
             ckpt = "✓" if node.is_permanent_checkpoint else " "
             has_kv = "K" if isinstance(node.kv_data, list) and node.kv_data else " "
-            has_state = "S" if isinstance(node.recurrent_data, list) and node.recurrent_data else " "
+            has_state = (
+                "S"
+                if isinstance(node.recurrent_data, list) and node.recurrent_data
+                else " "
+            )
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
             if node.token_ids:
-                last_tokens = node.token_ids[-10:] if len(node.token_ids) >= 10 else node.token_ids
+                last_tokens = (
+                    node.token_ids[-10:]
+                    if len(node.token_ids) >= 10
+                    else node.token_ids
+                )
 
                 # Try to decode tokens to text
                 if tokenizer:
@@ -807,7 +887,9 @@ class TurnPrefixCache:
 
             return label
 
-        def visit(node: TurnNode, prefix: str = "", is_root: bool = False, depth: int = 0):
+        def visit(
+            node: TurnNode, prefix: str = "", is_root: bool = False, depth: int = 0
+        ):
             if depth > max_depth:
                 return
             lines.append(prefix + node_label(node, is_root))
@@ -816,21 +898,23 @@ class TurnPrefixCache:
                 is_last = i == len(children) - 1
                 ext = "└── " if is_last else "├── "
                 new_prefix = prefix + ("    " if is_last else "│   ")
-                visit(child, new_prefix, depth=depth+1)
+                visit(child, new_prefix, depth=depth + 1)
 
         visit(self.root, is_root=True)
-        summary = f"Nodes: {self._count_nodes()}, Memory: {self._memory_bytes / 1e9:.2f}GB"
+        summary = (
+            f"Nodes: {self._count_nodes()}, Memory: {self._memory_bytes / 1e9:.2f}GB"
+        )
         return "\n".join(lines) + "\n" + summary
 
     def _count_nodes(self) -> int:
         """Count total nodes in trie."""
         count = 1  # root
+
         def visit(node):
             nonlocal count
             for child in node.children.values():
                 count += 1
                 visit(child)
+
         visit(self.root)
         return count
-
-

@@ -320,7 +320,12 @@ class TestCompletionStreamingRelease:
                 raise RuntimeError("generation failed")
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             acquires["count"] += 1
             return FakeEngine()
@@ -393,7 +398,12 @@ class TestCompletionStreamingRelease:
                 )
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             return FakeEngine()
 
@@ -546,7 +556,12 @@ class TestToolParserUsesLocalEngine:
         local_engine = FakeEngine("tok-local")
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             return local_engine
 
@@ -619,7 +634,12 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             calls["acquires"] += 1
             return FakeEngine()
@@ -648,7 +668,12 @@ class TestLifecycleFailureHandling:
             preserve_native_tool_format = False
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             calls["acquires"] += 1
             return FakeEngine()
@@ -3476,7 +3501,12 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             return FakeEngine()
 
@@ -3523,7 +3553,12 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             return FakeEngine()
 
@@ -3574,7 +3609,12 @@ class TestResponseModelFieldUsesServedName:
         served_name = "my-custom-served-name"
 
         async def fake_acquire(
-            raw_request, *, total_timeout=None, deadline=None, count_activity=True, model=None
+            raw_request,
+            *,
+            total_timeout=None,
+            deadline=None,
+            count_activity=True,
+            model=None,
         ):
             return FakeEngine()
 
@@ -3645,7 +3685,9 @@ class TestToolParserConcurrencySafety:
             "_get_streaming_tool_parser reset the shared singleton, corrupting "
             "session A's mid-stream state"
         )
-        assert parser_a.prev_tool_call_arr == [{"name": "get_weather", "arguments": "{}"}]
+        assert parser_a.prev_tool_call_arr == [
+            {"name": "get_weather", "arguments": "{}"}
+        ]
 
         # The two parsers must be independent objects
         assert parser_a is not parser_b

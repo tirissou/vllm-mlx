@@ -12,10 +12,10 @@ import pytest
 
 from vllm_mlx import AsyncEngineCore, EngineConfig, SamplingParams, SchedulerConfig
 
-
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
+
 
 def _no_cache_config():
     return EngineConfig(
@@ -38,6 +38,7 @@ def _turn_cache_config():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _compute_turn_boundaries(tokenizer, messages):
     """Compute turn boundaries by scanning for <|im_end|> in the full prompt.
@@ -85,6 +86,7 @@ async def _run_chat(engine, tokenizer, messages, max_tokens=20):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def model_and_tokenizer():
     try:
@@ -98,6 +100,7 @@ def model_and_tokenizer():
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.anyio
 class TestCacheParity:
@@ -156,7 +159,9 @@ class TestCacheParity:
         # Generate assistant₁ live (simulates the tool-call turn).
         async with AsyncEngineCore(model, tokenizer, _no_cache_config()) as engine:
             await asyncio.sleep(0.05)
-            toks_a1 = await _run_chat(engine, tokenizer, [system, user_1], max_tokens=10)
+            toks_a1 = await _run_chat(
+                engine, tokenizer, [system, user_1], max_tokens=10
+            )
         text_a1 = tokenizer.decode(toks_a1)
 
         # Generate assistant₂ live (simulates the reply after the file was read).
@@ -164,8 +169,15 @@ class TestCacheParity:
         async with AsyncEngineCore(model, tokenizer, _no_cache_config()) as engine:
             await asyncio.sleep(0.05)
             toks_a2 = await _run_chat(
-                engine, tokenizer,
-                [system, {"role": "user", "content": "Is that planet larger than Earth? One word."}],
+                engine,
+                tokenizer,
+                [
+                    system,
+                    {
+                        "role": "user",
+                        "content": "Is that planet larger than Earth? One word.",
+                    },
+                ],
                 max_tokens=10,
             )
         text_a2 = tokenizer.decode(toks_a2)

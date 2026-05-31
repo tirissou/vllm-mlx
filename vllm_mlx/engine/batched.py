@@ -1002,7 +1002,10 @@ class BatchedEngine(BaseEngine):
             return []
 
         try:
-            boundary_kwargs = {**(chat_template_kwargs or {}), "add_generation_prompt": False}
+            boundary_kwargs = {
+                **(chat_template_kwargs or {}),
+                "add_generation_prompt": False,
+            }
             full_prompt = self._apply_chat_template(
                 messages,
                 tools=tools,
@@ -1020,7 +1023,9 @@ class BatchedEngine(BaseEngine):
                 im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
             # Try im_end scan for Qwen3-like tokenizers
-            if im_end_id is not None and im_end_id != getattr(tokenizer, "unk_token_id", None):
+            if im_end_id is not None and im_end_id != getattr(
+                tokenizer, "unk_token_id", None
+            ):
                 boundaries = []
                 for i, tok in enumerate(full_tokens):
                     if tok == im_end_id:
@@ -1059,11 +1064,16 @@ class BatchedEngine(BaseEngine):
                     prefix_tokens = tokenizer.encode(prefix_prompt)
 
                     # Check if prefix matches the start of full tokens
-                    if len(prefix_tokens) <= len(full_tokens) and prefix_tokens == full_tokens[:len(prefix_tokens)]:
+                    if (
+                        len(prefix_tokens) <= len(full_tokens)
+                        and prefix_tokens == full_tokens[: len(prefix_tokens)]
+                    ):
                         # Add boundary only for:
                         # 1. System message (first message, i==1)
                         # 2. Completed assistant turns (when current message is assistant)
-                        current_role = messages[i - 1].get("role") if i <= len(messages) else None
+                        current_role = (
+                            messages[i - 1].get("role") if i <= len(messages) else None
+                        )
 
                         should_add = False
                         if i == 1:
@@ -1075,7 +1085,9 @@ class BatchedEngine(BaseEngine):
 
                         if should_add:
                             boundary = len(prefix_tokens)
-                            if boundary > 0 and (not boundaries or boundary > boundaries[-1]):
+                            if boundary > 0 and (
+                                not boundaries or boundary > boundaries[-1]
+                            ):
                                 boundaries.append(boundary)
 
             except Exception as e:
@@ -1164,7 +1176,9 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             enable_thinking=enable_thinking,
         )
-        logger.info(f"[turn_cache] stream_chat() computed turn_boundaries={turn_boundaries}")
+        logger.info(
+            f"[turn_cache] stream_chat() computed turn_boundaries={turn_boundaries}"
+        )
         kwargs["turn_boundaries"] = turn_boundaries
 
         async for output in self.stream_generate(

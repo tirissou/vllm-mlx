@@ -439,9 +439,9 @@ class TestSchedulerCacheCleanup:
             "_validate_cache",
         ]
         for name in removed:
-            assert not hasattr(Scheduler, name), (
-                f"Scheduler.{name} should have been removed (now lives in SSDOffloadedCache)"
-            )
+            assert not hasattr(
+                Scheduler, name
+            ), f"Scheduler.{name} should have been removed (now lives in SSDOffloadedCache)"
 
     def test_scheduler_has_no_direct_ssd_tier_attribute(self):
         import inspect

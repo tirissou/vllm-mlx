@@ -19,6 +19,7 @@ def _install_fake_gemma4_lm_modules(monkeypatch):
 
     class _RecordingRope:
         """Records the offset passed on each call."""
+
         def __call__(self, x: mx.array, offset=None) -> mx.array:
             rope_call_log.append({"offset": offset})
             return x
@@ -45,9 +46,15 @@ def _install_fake_gemma4_lm_modules(monkeypatch):
             self.use_k_eq_v = True
 
             dim = self.n_heads * self.head_dim
-            self.q_proj = lambda x: mx.zeros((x.shape[0], x.shape[1], dim), dtype=x.dtype)
-            self.k_proj = lambda x: mx.zeros((x.shape[0], x.shape[1], dim), dtype=x.dtype)
-            self.v_proj = lambda x: mx.zeros((x.shape[0], x.shape[1], dim), dtype=x.dtype)
+            self.q_proj = lambda x: mx.zeros(
+                (x.shape[0], x.shape[1], dim), dtype=x.dtype
+            )
+            self.k_proj = lambda x: mx.zeros(
+                (x.shape[0], x.shape[1], dim), dtype=x.dtype
+            )
+            self.v_proj = lambda x: mx.zeros(
+                (x.shape[0], x.shape[1], dim), dtype=x.dtype
+            )
             self.o_proj = lambda x: x
             self.q_norm = _IdentityNorm()
             self.k_norm = _IdentityNorm()
@@ -74,6 +81,7 @@ def test_patch_returns_true_on_success(monkeypatch):
     if "vllm_mlx.patches.gemma4_llm" in sys.modules:
         del sys.modules["vllm_mlx.patches.gemma4_llm"]
     from vllm_mlx.patches.gemma4_llm import patch_gemma4_attention_for_batching
+
     assert patch_gemma4_attention_for_batching() is True
 
 
@@ -82,6 +90,7 @@ def test_patch_returns_false_when_mlx_lm_unavailable(monkeypatch):
     if "vllm_mlx.patches.gemma4_llm" in sys.modules:
         del sys.modules["vllm_mlx.patches.gemma4_llm"]
     from vllm_mlx.patches.gemma4_llm import patch_gemma4_attention_for_batching
+
     assert patch_gemma4_attention_for_batching() is False
 
 
@@ -90,6 +99,7 @@ def test_patch_is_idempotent(monkeypatch):
     if "vllm_mlx.patches.gemma4_llm" in sys.modules:
         del sys.modules["vllm_mlx.patches.gemma4_llm"]
     from vllm_mlx.patches.gemma4_llm import patch_gemma4_attention_for_batching
+
     assert patch_gemma4_attention_for_batching() is True
     assert patch_gemma4_attention_for_batching() is True
     assert getattr(attention_cls, "_batch_patched", False) is True
@@ -100,6 +110,7 @@ def test_patched_call_returns_3_tuple(monkeypatch):
     if "vllm_mlx.patches.gemma4_llm" in sys.modules:
         del sys.modules["vllm_mlx.patches.gemma4_llm"]
     from vllm_mlx.patches.gemma4_llm import patch_gemma4_attention_for_batching
+
     patch_gemma4_attention_for_batching()
 
     attn = cast(Any, attention_cls())
@@ -121,6 +132,7 @@ def test_offset_snapshotted_before_update_and_fetch(monkeypatch):
     if "vllm_mlx.patches.gemma4_llm" in sys.modules:
         del sys.modules["vllm_mlx.patches.gemma4_llm"]
     from vllm_mlx.patches.gemma4_llm import patch_gemma4_attention_for_batching
+
     patch_gemma4_attention_for_batching()
 
     attn = cast(Any, attention_cls())
@@ -138,9 +150,9 @@ def test_offset_snapshotted_before_update_and_fetch(monkeypatch):
     key_offset, query_offset = rope_log[0]["offset"], rope_log[1]["offset"]
 
     # Both should be the pre-update value (10), not post-update (11)
-    assert int(mx.array(key_offset).flatten()[0]) == 10, (
-        f"Key RoPE used wrong offset: {key_offset}"
-    )
-    assert int(mx.array(query_offset).flatten()[0]) == 10, (
-        f"Query RoPE used wrong offset: {query_offset} — in-place mutation not snapshotted"
-    )
+    assert (
+        int(mx.array(key_offset).flatten()[0]) == 10
+    ), f"Key RoPE used wrong offset: {key_offset}"
+    assert (
+        int(mx.array(query_offset).flatten()[0]) == 10
+    ), f"Query RoPE used wrong offset: {query_offset} — in-place mutation not snapshotted"

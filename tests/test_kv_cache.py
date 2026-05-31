@@ -6,11 +6,19 @@ import pytest
 from unittest.mock import MagicMock
 from mlx_lm.models.cache import KVCache
 
-from vllm_mlx.kv_cache import CacheHit, CacheDiskStore, QuantizedArray, SpillableCache, validate_cache
+from vllm_mlx.kv_cache import (
+    CacheHit,
+    CacheDiskStore,
+    QuantizedArray,
+    SpillableCache,
+    validate_cache,
+)
 from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
 
 
-def _make_quantized_array(seq_len: int = 64, head_dim: int = 64, group_size: int = 64, bits: int = 4):
+def _make_quantized_array(
+    seq_len: int = 64, head_dim: int = 64, group_size: int = 64, bits: int = 4
+):
     keys = mx.random.normal((1, 4, seq_len, head_dim)).astype(mx.bfloat16)
     packed, scales, biases = mx.quantize(keys, group_size=group_size, bits=bits)
     return QuantizedArray(packed=packed, scales=scales, biases=biases)
@@ -58,26 +66,35 @@ class TestSpillableCacheProtocol:
 
     def test_class_with_all_methods_satisfies_protocol(self):
         """A class implementing all PrefixCache methods plus set_spill_delegate should satisfy SpillableCache."""
+
         class FullImpl:
             def fetch(self, request): ...
             def store(self, request, cache): ...
             def release(self, handle): ...
             def get_stats(self): ...
             def clear(self): ...
-            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def on_prefill_checkpoint(
+                self, request, processed_tokens, extracted_cache
+            ): ...
             def set_spill_delegate(self, on_spill, on_promote): ...
+
         assert isinstance(FullImpl(), SpillableCache)
 
     def test_missing_set_spill_delegate_fails_check(self):
         """A class with all PrefixCache methods but missing set_spill_delegate should not satisfy SpillableCache."""
+
         class NoDelegate:
             def fetch(self, request): ...
             def store(self, request, cache): ...
             def release(self, handle): ...
             def get_stats(self): ...
             def clear(self): ...
-            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def on_prefill_checkpoint(
+                self, request, processed_tokens, extracted_cache
+            ): ...
+
             # No set_spill_delegate
+
         assert not isinstance(NoDelegate(), SpillableCache)
 
 
@@ -216,12 +233,14 @@ class TestBatchQuantizedKVCacheAlignment:
 
     def test_extract_returns_quantized_kv_cache(self):
         from mlx_lm.models.cache import QuantizedKVCache
+
         cache = self._make_cache(B=2)
         extracted = cache.extract(0)
         assert isinstance(extracted, QuantizedKVCache)
 
     def test_quantized_kv_cache_merge_returns_batch_quantized(self):
         from mlx_lm.models.cache import QuantizedKVCache
+
         cache = self._make_cache(B=2, T=16)
         e0, e1 = cache.extract(0), cache.extract(1)
         merged = QuantizedKVCache.merge([e0, e1])
@@ -239,6 +258,7 @@ class TestBatchQuantizedKVCacheAlignment:
 
     def test_is_instance_of_base_cache(self):
         from mlx_lm.models.cache import _BaseCache
+
         cache = BatchQuantizedKVCache(left_padding=[0])
         assert isinstance(cache, _BaseCache)
 
@@ -254,6 +274,7 @@ class TestBatchQuantizedKVCacheAlignment:
 
     def test_is_trimmable_returns_true(self):
         from mlx_lm.models.cache import can_trim_prompt_cache
+
         cache = self._make_cache(B=2)
         assert cache.is_trimmable() is True
         assert can_trim_prompt_cache([cache]) is True
@@ -318,6 +339,7 @@ class TestBatchQuantizedKVCacheAlignment:
 # Helpers shared by adapter tests
 # ------------------------------------------------------------------
 
+
 def _make_kv_cache_layers(n_layers=2, seq_len=50, n_heads=4, head_dim=64):
     cache = []
     for _ in range(n_layers):
@@ -337,10 +359,10 @@ def _make_request(tokens):
     return req
 
 
-
 # ------------------------------------------------------------------
 # TurnCacheAdapter
 # ------------------------------------------------------------------
+
 
 def _make_turn_request(tokens, turn_boundaries):
     req = MagicMock()
@@ -355,6 +377,7 @@ class TestTurnCacheAdapterMessages:
 
     def _call(self, tokens, boundaries):
         from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+
         req = _make_turn_request(tokens, boundaries)
         return TurnCacheManager.messages_to_segments(req)
 
@@ -364,6 +387,7 @@ class TestTurnCacheAdapterMessages:
 
     def test_single_boundary_returns_system_and_user(self):
         from vllm_mlx.turn_prefix_cache import Segment
+
         tokens = list(range(60))
         segs = self._call(tokens, [10])
         assert len(segs) == 2
@@ -387,6 +411,7 @@ class TestTurnCacheAdapterFetch:
     def _make_adapter(self):
         from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
         from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+
         inner = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
         return TurnCacheManager(inner), inner
 
@@ -408,6 +433,7 @@ class TestTurnCacheAdapterFetch:
     def test_release_decrements_refcount(self):
         """release(path) decrements ref counts on matched nodes."""
         from vllm_mlx.turn_prefix_cache import Segment
+
         adapter, inner = self._make_adapter()
 
         tokens = list(range(60))
@@ -429,20 +455,22 @@ class TestTurnCacheAdapterFetch:
         assert result is None
 
 
-
 # ---------------------------------------------------------------------------
 # Regression: _extract_recurrent_state must filter QuantizedKVCache (mlx_lm)
 # ---------------------------------------------------------------------------
+
 
 class TestExtractCacheStates:
     """extract_cache_states converts live KV layer objects to serialisable dicts."""
 
     def test_empty_input_returns_empty(self):
         from vllm_mlx.kv_cache import extract_cache_states
+
         assert extract_cache_states([]) == []
 
     def test_kvcache_layer_produces_expected_dict_shape(self):
         from vllm_mlx.kv_cache import extract_cache_states
+
         kv = KVCache()
         kv.keys = mx.zeros((1, 4, 8, 64))
         kv.values = mx.zeros((1, 4, 8, 64))
@@ -471,10 +499,15 @@ class TestReconstructCacheFromStates:
 
     def test_empty_input_returns_none(self):
         from vllm_mlx.kv_cache import reconstruct_cache_from_states
+
         assert reconstruct_cache_from_states([]) is None
 
     def test_kvcache_round_trip(self):
-        from vllm_mlx.kv_cache import extract_cache_states, reconstruct_cache_from_states
+        from vllm_mlx.kv_cache import (
+            extract_cache_states,
+            reconstruct_cache_from_states,
+        )
+
         kv = KVCache()
         kv.keys = mx.zeros((1, 4, 8, 64))
         kv.values = mx.zeros((1, 4, 8, 64))
@@ -502,9 +535,9 @@ def test_extract_recurrent_state_filters_mlx_quantized_kv_cache():
 
     layer = QuantizedKVCache()
     result = _extract_recurrent_state([layer])
-    assert result == [], (
-        "QuantizedKVCache from mlx_lm must be excluded by _extract_recurrent_state"
-    )
+    assert (
+        result == []
+    ), "QuantizedKVCache from mlx_lm must be excluded by _extract_recurrent_state"
 
 
 def test_extract_recurrent_state_keeps_non_kv_layers():
@@ -522,6 +555,7 @@ def test_extract_recurrent_state_keeps_non_kv_layers():
 # ------------------------------------------------------------------
 # CacheDiskStore, SpillableCache protocols and validate_cache
 # ------------------------------------------------------------------
+
 
 class TestValidateCache:
     def test_none_is_invalid(self):
@@ -571,6 +605,7 @@ class TestCacheDiskStoreProtocol:
         class IncompleteStore:
             def write(self, tokens, layers): ...
             def read(self, tokens): ...
+
             # missing has and all_keys
 
         assert not isinstance(IncompleteStore(), CacheDiskStore)
@@ -586,7 +621,9 @@ class TestSpillableCacheProtocol:
             def release(self, handle): ...
             def get_stats(self): ...
             def clear(self): ...
-            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def on_prefill_checkpoint(
+                self, request, processed_tokens, extracted_cache
+            ): ...
             def update_n_minus_one(self, request, prompt_cache, uid_idx): ...
             def set_spill_delegate(self, on_spill, on_promote): ...
 
@@ -594,14 +631,19 @@ class TestSpillableCacheProtocol:
 
     def test_missing_set_spill_delegate_fails_check(self):
         """A class with all PrefixCache methods but missing set_spill_delegate should not satisfy SpillableCache."""
+
         class NoDelegate:
             def fetch(self, request): ...
             def store(self, request, cache): ...
             def release(self, handle): ...
             def get_stats(self): ...
             def clear(self): ...
-            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def on_prefill_checkpoint(
+                self, request, processed_tokens, extracted_cache
+            ): ...
+
             # No set_spill_delegate
+
         assert not isinstance(NoDelegate(), SpillableCache)
 
 
@@ -610,6 +652,7 @@ class TestArraysCacheReferenceSemantics:
 
     def test_setitem_replaces_reference_not_mutates(self):
         from mlx_lm.models.cache import ArraysCache
+
         cache = ArraysCache(2)
         old_array = mx.zeros((1, 4))
         cache[0] = old_array
@@ -624,19 +667,25 @@ class TestArraysCacheReferenceSemantics:
 
     def test_saved_refs_survive_multiple_steps(self):
         from mlx_lm.models.cache import ArraysCache
+
         cache = ArraysCache(3)
         step0 = [mx.full((1, 4), float(i)) for i in range(3)]
         step1 = [mx.full((1, 4), float(i + 10)) for i in range(3)]
         step2 = [mx.full((1, 4), float(i + 20)) for i in range(3)]
-        for i, v in enumerate(step0): cache[i] = v
+        for i, v in enumerate(step0):
+            cache[i] = v
         saved_after_step0 = list(cache.cache)
-        for i, v in enumerate(step1): cache[i] = v
+        for i, v in enumerate(step1):
+            cache[i] = v
         saved_after_step1 = list(cache.cache)
-        for i, v in enumerate(step2): cache[i] = v
+        for i, v in enumerate(step2):
+            cache[i] = v
         mx.eval(*saved_after_step0)
         assert all(float(a[0, 0]) == float(i) for i, a in enumerate(saved_after_step0))
         mx.eval(*saved_after_step1)
-        assert all(float(a[0, 0]) == float(i + 10) for i, a in enumerate(saved_after_step1))
+        assert all(
+            float(a[0, 0]) == float(i + 10) for i, a in enumerate(saved_after_step1)
+        )
 
 
 class TestRotatingKVShadowCorrectness:
@@ -644,6 +693,7 @@ class TestRotatingKVShadowCorrectness:
 
     def test_shadow_mirrors_live_unwrapped(self):
         from mlx_lm.models.cache import RotatingKVCache
+
         max_size, n_heads, head_dim = 8, 2, 4
         live = RotatingKVCache(max_size=max_size, keep=0)
         shadow = RotatingKVCache(max_size=max_size, keep=0)
@@ -663,6 +713,7 @@ class TestRotatingKVShadowCorrectness:
 
     def test_shadow_mirrors_live_wrapped(self):
         from mlx_lm.models.cache import RotatingKVCache
+
         max_size, n_heads, head_dim = 4, 2, 4
         live = RotatingKVCache(max_size=max_size, keep=0)
         shadow = RotatingKVCache(max_size=max_size, keep=0)
@@ -685,6 +736,7 @@ class TestRotatingKVShadowCorrectness:
     def test_shadow_n_minus_one_has_correct_last_token(self):
         import pytest
         from mlx_lm.models.cache import RotatingKVCache
+
         max_size, n_heads, head_dim = 8, 1, 4
         live = RotatingKVCache(max_size=max_size, keep=0)
         shadow = RotatingKVCache(max_size=max_size, keep=0)

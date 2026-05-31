@@ -45,7 +45,9 @@ def _patched_sdpa(
             # Prefill: dequantize this layer's KV and use flash attention.
             # keys / values are (data, scales, biases) tuples from update_and_fetch.
             keys = mx.dequantize(*keys, group_size=cache.group_size, bits=cache.bits)
-            values = mx.dequantize(*values, group_size=cache.group_size, bits=cache.bits)
+            values = mx.dequantize(
+                *values, group_size=cache.group_size, bits=cache.bits
+            )
             return mx.fast.scaled_dot_product_attention(
                 queries, keys, values, scale=scale, mask=mask
             )
@@ -53,8 +55,11 @@ def _patched_sdpa(
             # Decode: score matrix is B × H_q × 1 × C — quantized matmul is fine.
             # Look up via module so we get any already-applied patches (e.g. GQA fix).
             return _base.quantized_scaled_dot_product_attention(
-                queries, keys, values,
-                scale=scale, mask=mask,
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=mask,
                 group_size=cache.group_size,
                 bits=cache.bits,
             )

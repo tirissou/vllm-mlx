@@ -237,10 +237,19 @@ def _dbg_msg_body(msg) -> str:
         for p in content:
             pt = p.get("type") if isinstance(p, dict) else getattr(p, "type", None)
             if pt == "text":
-                t = (p.get("text") if isinstance(p, dict) else getattr(p, "text", "")) or ""
+                t = (
+                    p.get("text") if isinstance(p, dict) else getattr(p, "text", "")
+                ) or ""
                 if t:
                     texts.append(t)
-            elif pt in ("image_url", "image", "video_url", "video", "audio_url", "audio"):
+            elif pt in (
+                "image_url",
+                "image",
+                "video_url",
+                "video",
+                "audio_url",
+                "audio",
+            ):
                 n_media += 1
         content = " ".join(texts) + (f" [{n_media} media]" if n_media else "")
 
@@ -249,10 +258,22 @@ def _dbg_msg_body(msg) -> str:
         parts.append(f"{_DBG_MAGENTA}<think>{_dbg_trunc(rc, 80)}</think>{_DBG_RST}")
     if tcs:
         for tc in tcs:
-            fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
-            name = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "?")) or "?"
-            args = (fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")) or ""
-            parts.append(f"{_DBG_YELLOW}⚙ {name}({_dbg_trunc(str(args), 60)}){_DBG_RST}")
+            fn = (
+                tc.get("function", {})
+                if isinstance(tc, dict)
+                else getattr(tc, "function", None)
+            )
+            name = (
+                fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "?")
+            ) or "?"
+            args = (
+                fn.get("arguments", "")
+                if isinstance(fn, dict)
+                else getattr(fn, "arguments", "")
+            ) or ""
+            parts.append(
+                f"{_DBG_YELLOW}⚙ {name}({_dbg_trunc(str(args), 60)}){_DBG_RST}"
+            )
     if content:
         parts.append(_dbg_trunc(str(content), 110))
 
@@ -278,7 +299,11 @@ def _log_turn_request(request: "ChatCompletionRequest") -> None:
         f" {_DBG_DIM}top_p={request.top_p}"
         f"  top_k={getattr(request, 'top_k', 0)}"
         f"  min_p={getattr(request, 'min_p', 0.0)}"
-        + (f"  response_format={request.response_format}" if request.response_format else "")
+        + (
+            f"  response_format={request.response_format}"
+            if request.response_format
+            else ""
+        )
         + _DBG_RST
     )
 
@@ -295,8 +320,14 @@ def _log_turn_request(request: "ChatCompletionRequest") -> None:
         lines.append(_DBG_SEP)
         tool_names = []
         for t in request.tools:
-            fn = getattr(t, "function", None) if not isinstance(t, dict) else t.get("function", {})
-            name = (fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "?")) or "?"
+            fn = (
+                getattr(t, "function", None)
+                if not isinstance(t, dict)
+                else t.get("function", {})
+            )
+            name = (
+                fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "?")
+            ) or "?"
             tool_names.append(name)
         lines.append(_dbg_row(f" {_DBG_DIM}tools: {', '.join(tool_names)}{_DBG_RST}"))
 
@@ -325,9 +356,11 @@ def _log_turn_response(
     lines = [_DBG_TOP, _dbg_hdr(hdr), _DBG_MID]
 
     if reasoning_text:
-        lines.append(_dbg_row(
-            f" {_DBG_MAGENTA}[think]{_DBG_RST}  {_dbg_trunc(reasoning_text, 105)}"
-        ))
+        lines.append(
+            _dbg_row(
+                f" {_DBG_MAGENTA}[think]{_DBG_RST}  {_dbg_trunc(reasoning_text, 105)}"
+            )
+        )
 
     if tool_calls:
         for tc in tool_calls:
@@ -335,16 +368,20 @@ def _log_turn_response(
             name = getattr(fn, "name", "?") if fn else "?"
             args = getattr(fn, "arguments", "") if fn else ""
             tc_id = getattr(tc, "id", "")
-            lines.append(_dbg_row(
-                f" {_DBG_YELLOW}[tool_call]{_DBG_RST}"
-                f"  {name}({_dbg_trunc(str(args), 75)})"
-                + (f"  {_DBG_DIM}id={tc_id}{_DBG_RST}" if tc_id else "")
-            ))
+            lines.append(
+                _dbg_row(
+                    f" {_DBG_YELLOW}[tool_call]{_DBG_RST}"
+                    f"  {name}({_dbg_trunc(str(args), 75)})"
+                    + (f"  {_DBG_DIM}id={tc_id}{_DBG_RST}" if tc_id else "")
+                )
+            )
 
     if cleaned_text:
-        lines.append(_dbg_row(
-            f" {_DBG_C['assistant']}[text]{_DBG_RST}  {_dbg_trunc(cleaned_text, 105)}"
-        ))
+        lines.append(
+            _dbg_row(
+                f" {_DBG_C['assistant']}[text]{_DBG_RST}  {_dbg_trunc(cleaned_text, 105)}"
+            )
+        )
 
     if not reasoning_text and not tool_calls and not cleaned_text:
         lines.append(_dbg_row(f" {_DBG_DIM}(no output){_DBG_RST}"))
@@ -5773,11 +5810,7 @@ async def stream_chat_completion(
                 completion_tokens = output.completion_tokens
 
             # Use reasoning parser if enabled (skip when enable_thinking=False)
-            if (
-                reasoning_parser
-                and delta_text
-                and request.enable_thinking is not False
-            ):
+            if reasoning_parser and delta_text and request.enable_thinking is not False:
                 previous_text = accumulated_text
                 accumulated_text += delta_text
                 delta_msg = reasoning_parser.extract_reasoning_streaming(
@@ -6099,6 +6132,7 @@ async def stream_chat_completion(
         elapsed = time.perf_counter() - start_time
         if last_output is not None:
             from .engine.base import GenerationOutput as _GO
+
             _stream_out = _GO(
                 text=accumulated_text,
                 prompt_tokens=prompt_tokens,
@@ -6110,6 +6144,7 @@ async def stream_chat_completion(
                 _fpr = locals().get("final_parse_result")
                 if _fpr and getattr(_fpr, "tools_called", False):
                     from .api.models import ToolCall as _TC, FunctionCall as _FC
+
                     _stream_tool_calls = [
                         _TC(
                             id=f"call_{i}",
@@ -6121,7 +6156,12 @@ async def stream_chat_completion(
                         for i, tc in enumerate(getattr(_fpr, "tool_calls", []))
                     ]
             _log_turn_response(
-                _stream_out, None, accumulated_text or None, _stream_tool_calls, elapsed, stream=True
+                _stream_out,
+                None,
+                accumulated_text or None,
+                _stream_tool_calls,
+                elapsed,
+                stream=True,
             )
 
         # Send final chunk with usage if requested

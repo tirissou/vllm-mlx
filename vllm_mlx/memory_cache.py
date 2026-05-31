@@ -687,7 +687,7 @@ class MemoryAwarePrefixCache:
         self._ssd_tier = None
 
         # Spill delegate (set via set_spill_delegate())
-        self._on_spill = None   # Callable[[tuple[int,...], list], Any] | None
+        self._on_spill = None  # Callable[[tuple[int,...], list], Any] | None
         self._on_promote = None  # Callable[[Any], list | None] | None
 
         logger.info(

@@ -49,8 +49,9 @@ _apply_prefill_flash_sdpa()
 _patch_gemma4_llm()
 
 
-from .batch_quantized_kv_cache import make_quantized_cache as _make_quantized_cache  # re-export for tests
-
+from .batch_quantized_kv_cache import (
+    make_quantized_cache as _make_quantized_cache,
+)  # re-export for tests
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -64,7 +65,6 @@ CACHE_CORRUPTION_PATTERNS = [
     "cache",
     "BatchKVCache",
 ]
-
 
 
 class SchedulingPolicy(Enum):
@@ -184,7 +184,15 @@ class _InstrumentedBatchGenerator(BatchGenerator):
     new tokens have been processed since the last save for that uid.
     """
 
-    def __init__(self, *args, mid_prefill_callback=None, save_interval=0, kv_cache_bits=None, kv_cache_group_size=64, **kwargs):
+    def __init__(
+        self,
+        *args,
+        mid_prefill_callback=None,
+        save_interval=0,
+        kv_cache_bits=None,
+        kv_cache_group_size=64,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._mid_prefill_callback = mid_prefill_callback
         self._save_interval = save_interval
@@ -194,12 +202,18 @@ class _InstrumentedBatchGenerator(BatchGenerator):
 
     def _make_new_cache(self):
         from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
         caches = super()._make_new_cache()
         if self._kv_cache_bits is None:
             return caches
         return [
-            QuantizedKVCache(group_size=self._kv_cache_group_size, bits=self._kv_cache_bits)
-            if isinstance(c, KVCache) else c
+            (
+                QuantizedKVCache(
+                    group_size=self._kv_cache_group_size, bits=self._kv_cache_bits
+                )
+                if isinstance(c, KVCache)
+                else c
+            )
             for c in caches
         ]
 
@@ -286,7 +300,9 @@ def _install_mtp(
             hidden_states = skip["hidden"]
             _skip_state[0] = None
         else:
-            model_output = self.model(inputs[:, None], cache=self.prompt_cache, return_hidden=True)
+            model_output = self.model(
+                inputs[:, None], cache=self.prompt_cache, return_hidden=True
+            )
             if not isinstance(model_output, tuple):
                 return _orig_gen_step(self)
             logits, hidden_states = model_output
@@ -297,7 +313,7 @@ def _install_mtp(
             for e in range(batch_size):
                 sl = logits[e : e + 1]
                 for proc in self.logits_processors[e]:
-                    token_ctx = getattr(self, '_token_context', None)
+                    token_ctx = getattr(self, "_token_context", None)
                     token_ctx_e = token_ctx[e] if token_ctx is not None else None
                     sl = proc(token_ctx_e, sl) if token_ctx_e is not None else sl
                 processed.append(sl)
@@ -322,7 +338,9 @@ def _install_mtp(
                 mtp_cache=None,
             )
             draft_logits = draft_logits[:, -1, :]
-            draft_logprobs = draft_logits - mx.logsumexp(draft_logits, axis=-1, keepdims=True)
+            draft_logprobs = draft_logits - mx.logsumexp(
+                draft_logits, axis=-1, keepdims=True
+            )
             draft_tokens = _draft_sampler(draft_logprobs)
 
             _rnn_snapshots = {}
@@ -337,7 +355,9 @@ def _install_mtp(
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
-            verify_output = self.model(verify_input, cache=self.prompt_cache, return_hidden=True)
+            verify_output = self.model(
+                verify_input, cache=self.prompt_cache, return_hidden=True
+            )
             if isinstance(verify_output, tuple):
                 verify_logits, verify_hidden = verify_output
             else:
@@ -353,8 +373,10 @@ def _install_mtp(
                         verify_logits[:, 0, :], axis=-1, keepdims=True
                     )
                     mx.async_eval(
-                        _skip_state[0]["logits"], _skip_state[0]["hidden"],
-                        draft_tokens, verify_lp,
+                        _skip_state[0]["logits"],
+                        _skip_state[0]["hidden"],
+                        draft_tokens,
+                        verify_lp,
                     )
                     for e in range(batch_size):
                         uid = current_uids[e]
@@ -390,30 +412,46 @@ def _install_mtp(
                 else:
                     if _rnn_snapshots:
                         for c in self.prompt_cache:
-                            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
                                 c.trim(2)
                         for _ci, _snap in _rnn_snapshots.items():
                             self.prompt_cache[_ci].state = _snap
-                        rerun = self.model(primary_tokens[:, None], cache=self.prompt_cache, return_hidden=True)
+                        rerun = self.model(
+                            primary_tokens[:, None],
+                            cache=self.prompt_cache,
+                            return_hidden=True,
+                        )
                         if isinstance(rerun, tuple):
                             _, rerun_hidden = rerun
                             _skip_state[0] = {
                                 "logits": verify_logits[:, 0, :],
                                 "hidden": rerun_hidden[:, -1:, :],
                             }
-                            mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
+                            mx.async_eval(
+                                _skip_state[0]["logits"], _skip_state[0]["hidden"]
+                            )
                         else:
                             _skip_state[0] = None
                     else:
                         for c in self.prompt_cache:
-                            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
                                 c.trim(1)
                         if verify_hidden is not None:
                             _skip_state[0] = {
                                 "logits": verify_logits[:, 0, :],
                                 "hidden": verify_hidden[:, 0:1, :],
                             }
-                            mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
+                            mx.async_eval(
+                                _skip_state[0]["logits"], _skip_state[0]["hidden"]
+                            )
                         else:
                             _skip_state[0] = None
                     for uid in current_uids:
@@ -429,11 +467,11 @@ def _install_mtp(
         self._next_logprobs = list(logprobs)
         mx.async_eval(self._next_tokens, self._next_logprobs)
 
-        mx.eval(inputs, getattr(self, '_current_logprobs', None) or [])
+        mx.eval(inputs, getattr(self, "_current_logprobs", None) or [])
         inputs_list = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs_list):
             sti.append(ti)
-        return inputs_list, getattr(self, '_current_logprobs', None) or list(logprobs)
+        return inputs_list, getattr(self, "_current_logprobs", None) or list(logprobs)
 
     def _mtp_next(self=batch_gen):
         """Wrapper around _next that emits deferred MTP draft tokens."""
@@ -482,6 +520,7 @@ def _install_mtp(
                         draft_end_uids.add(uid)
 
                 from dataclasses import replace as _dc_replace
+
                 draft_r = _dc_replace(
                     r,
                     token=draft_t,
@@ -492,7 +531,11 @@ def _install_mtp(
                 augmented.append(draft_r)
 
         if draft_end_uids and self._generation_batch.uids:
-            keep = [e for e, u in enumerate(self._generation_batch.uids) if u not in draft_end_uids]
+            keep = [
+                e
+                for e, u in enumerate(self._generation_batch.uids)
+                if u not in draft_end_uids
+            ]
             self._generation_batch.filter(keep)
 
         return prompt_responses, augmented
@@ -518,9 +561,10 @@ def _install_mtp(
 @dataclass
 class _PrefixCacheBundle:
     """All prefix-cache objects produced by _build_prefix_cache."""
-    adapter: Any = None            # PrefixCache protocol adapter
+
+    adapter: Any = None  # PrefixCache protocol adapter
     memory_aware_cache: Any = None
-    prefix_cache: Any = None       # legacy PrefixCacheManager
+    prefix_cache: Any = None  # legacy PrefixCacheManager
     paged_cache_manager: Any = None
     block_aware_cache: Any = None
     ssd_tier: Any = None
@@ -574,11 +618,14 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
 
     elif config.use_turn_cache:
         from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
-        turn_cache = TurnPrefixCache(TurnPrefixCacheConfig(
-            checkpoint_stride=config.turn_cache_stride,
-            max_memory_gb=config.turn_cache_memory_gb,
-            ssd_max_gb=config.turn_cache_ssd_gb,
-        ))
+
+        turn_cache = TurnPrefixCache(
+            TurnPrefixCacheConfig(
+                checkpoint_stride=config.turn_cache_stride,
+                max_memory_gb=config.turn_cache_memory_gb,
+                ssd_max_gb=config.turn_cache_ssd_gb,
+            )
+        )
         bundle.turn_cache = turn_cache
         bundle.adapter = TurnCacheManager(
             turn_cache,
@@ -739,6 +786,7 @@ class Scheduler:
         if not path:
             return
         import json, time as _t
+
         record = {
             "ts": _t.time(),
             "op": op,
@@ -800,11 +848,17 @@ class Scheduler:
 
         save_interval = self.config.mid_prefill_save_interval
         mid_prefill_cb = None
-        if self._prefix_cache is not None and (save_interval > 0 or self.turn_cache is not None):
+        if self._prefix_cache is not None and (
+            save_interval > 0 or self.turn_cache is not None
+        ):
             mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
             logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
 
-        kv_bits = self.config.kv_cache_quantization_bits if self.config.use_turn_cache else None
+        kv_bits = (
+            self.config.kv_cache_quantization_bits
+            if self.config.use_turn_cache
+            else None
+        )
         bg = _InstrumentedBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
@@ -849,6 +903,7 @@ class Scheduler:
         Dispatches to self._prefix_cache.on_prefill_checkpoint() which handles
         both memory-cache throttling/storage and turn-cache boundary capture.
         """
+
         def _mid_prefill_save(uid, processed_tokens, prompt_cache):
             request_id = self.uid_to_request_id.get(uid)
             if not request_id:
@@ -862,6 +917,7 @@ class Scheduler:
             if extracted:
                 total = (request._cache_state.cached_tokens or 0) + processed_tokens
                 self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
+
         return _mid_prefill_save
 
     def _close_batch_generator(self) -> None:
@@ -1087,14 +1143,22 @@ class Scheduler:
             # Fetch cache on the worker thread so all MLX ops (dequantize,
             # reconstruct) are enqueued on the correct stream.
             if request._cache_state.remaining_tokens is None:
-                hit = self._prefix_cache.fetch(request) if self._prefix_cache is not None else None
+                hit = (
+                    self._prefix_cache.fetch(request)
+                    if self._prefix_cache is not None
+                    else None
+                )
                 if hit is not None:
                     request._cache_state.hit_type = hit.hit_type
                     request._cache_state.cache = hit.cache
                     request._cache_state.cached_tokens = hit.cached_tokens
                     request._cache_state.remaining_tokens = hit.remaining_tokens
-                    request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
-                    self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
+                    request._cache_state.prefill_boundaries = (
+                        self._prefix_cache.boundaries(request)
+                    )
+                    self._log_cache_key(
+                        "get", request.request_id, list(request.prompt_token_ids)
+                    )
                     logger.info(
                         f"[cache_fetch] request={request.request_id[:12]} HIT "
                         f"cached={request._cache_state.cached_tokens} remaining={len(hit.remaining_tokens)}"
@@ -1102,8 +1166,12 @@ class Scheduler:
                 else:
                     request._cache_state.hit_type = "miss"
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
-                    self._log_cache_key("get", request.request_id, list(request.prompt_token_ids))
+                    request._cache_state.prefill_boundaries = (
+                        self._prefix_cache.boundaries(request)
+                    )
+                    self._log_cache_key(
+                        "get", request.request_id, list(request.prompt_token_ids)
+                    )
                     logger.info(
                         f"[cache_fetch] request={request.request_id[:12]} MISS "
                         f"prompt_tokens={len(request.prompt_token_ids)}"
@@ -1191,7 +1259,9 @@ class Scheduler:
                 segments.append(tokens[prev:])
                 return [s for s in segments if s]
 
-            prefill_bds = request._cache_state.prefill_boundaries if request._cache_state else []
+            prefill_bds = (
+                request._cache_state.prefill_boundaries if request._cache_state else []
+            )
             segments = _split_at_boundaries(tokens_to_process, prefill_bds)
             use_segments = len(segments) > 1
 
@@ -1221,9 +1291,13 @@ class Scheduler:
                     request._cache_state.hit_type = "miss"
                     request._cache_state.cached_tokens = 0
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = self._prefix_cache.boundaries(request)
+                    request._cache_state.prefill_boundaries = (
+                        self._prefix_cache.boundaries(request)
+                    )
                     tokens_to_process = request.prompt_token_ids
-                    segments = _split_at_boundaries(tokens_to_process, request._cache_state.prefill_boundaries)
+                    segments = _split_at_boundaries(
+                        tokens_to_process, request._cache_state.prefill_boundaries
+                    )
                     use_segments = len(segments) > 1
                     insert_kwargs["caches"] = None
                     if use_segments:
@@ -1383,20 +1457,21 @@ class Scheduler:
                                     f"no prompt_cache on finished response"
                                 )
                     except Exception as e:
-                        logger.warning(f"[paged_cache] request={request_id[:12]} extract exception: {e}")
+                        logger.warning(
+                            f"[paged_cache] request={request_id[:12]} extract exception: {e}"
+                        )
 
                     # Normalize to dict form if raw objects were assigned
-                    if (
-                        request._cache_state.decoded_cache
-                        and not isinstance(request._cache_state.decoded_cache[0], dict)
+                    if request._cache_state.decoded_cache and not isinstance(
+                        request._cache_state.decoded_cache[0], dict
                     ):
                         request._cache_state.decoded_cache = extract_cache_states(
                             request._cache_state.decoded_cache
                         )
 
                     if request._cache_state.decoded_cache:
-                        _full_tokens = (
-                            list(request.prompt_token_ids) + list(request.output_token_ids)
+                        _full_tokens = list(request.prompt_token_ids) + list(
+                            request.output_token_ids
                         )
 
                 self.total_completion_tokens += request.num_output_tokens
@@ -1417,15 +1492,23 @@ class Scheduler:
             request = self.running.get(request_id)
 
             # Store cache for future reuse
-            if request is not None and request.prompt_token_ids and self._prefix_cache is not None:
+            if (
+                request is not None
+                and request.prompt_token_ids
+                and self._prefix_cache is not None
+            ):
                 _store_cache = request._cache_state.decoded_cache
                 if _store_cache:
-                    _full_tokens = list(request.prompt_token_ids) + list(request.output_token_ids)
+                    _full_tokens = list(request.prompt_token_ids) + list(
+                        request.output_token_ids
+                    )
                     _store_tokens = _full_tokens
                     try:
                         self._prefix_cache.store(request, _store_tokens, _store_cache)
                     except Exception as e:
-                        logger.debug(f"[cache_store] store failed for {request_id}: {e}")
+                        logger.debug(
+                            f"[cache_store] store failed for {request_id}: {e}"
+                        )
                 _handle = request._cache_state.turn_path
                 try:
                     self._prefix_cache.release(_handle)
@@ -1436,10 +1519,7 @@ class Scheduler:
             # Evaluate stored cache tensors incrementally (per-layer) to prevent
             # a deferred batch evaluation spike when all lazy ops resolve at once.
             # This spreads the VRAM cost across smaller per-layer evaluations.
-            if (
-                request is not None
-                and request._cache_state.decoded_cache
-            ):
+            if request is not None and request._cache_state.decoded_cache:
                 for layer in request._cache_state.decoded_cache:
                     if isinstance(layer, dict) and "state" in layer:
                         keys, values = layer["state"]
@@ -1452,12 +1532,18 @@ class Scheduler:
 
             # Evaluate boundary-captured tensors (defensive against lazy MLX GC)
             for _state_attr in ("_sys_prompt_state", "_conv_end_state"):
-                _state = getattr(request, _state_attr, None) if request is not None else None
+                _state = (
+                    getattr(request, _state_attr, None) if request is not None else None
+                )
                 if _state and isinstance(_state, list):
                     for layer_dict in _state:
                         if isinstance(layer_dict, dict) and "state" in layer_dict:
                             mx.eval(*layer_dict["state"])
-            _b_states = getattr(request, "_boundary_states", None) if request is not None else None
+            _b_states = (
+                getattr(request, "_boundary_states", None)
+                if request is not None
+                else None
+            )
             if _b_states and isinstance(_b_states, dict):
                 for _bstate in _b_states.values():
                     if isinstance(_bstate, list):
@@ -1615,7 +1701,9 @@ class Scheduler:
                             _rid = self.uid_to_request_id.get(_uid)
                             _req = self.running.get(_rid) if _rid else None
                             if _req is not None and self._prefix_cache is not None:
-                                self._prefix_cache.update_n_minus_one(_req, _gb.prompt_cache, _e)
+                                self._prefix_cache.update_n_minus_one(
+                                    _req, _gb.prompt_cache, _e
+                                )
                     # if logger.isEnabledFor(logging.DEBUG):
                     #     for req in self.running.values():
                     #         all_ids = list(req.prompt_token_ids) + list(req.output_token_ids)
@@ -1899,6 +1987,7 @@ class Scheduler:
 
         if self.turn_cache is not None:
             import os
+
             turn_dir = os.path.join(cache_dir, "turn_cache")
             try:
                 self.turn_cache.save(turn_dir)
@@ -1919,6 +2008,7 @@ class Scheduler:
 
         if self.turn_cache is not None:
             import os
+
             turn_dir = os.path.join(cache_dir, "turn_cache")
             try:
                 self.turn_cache.load(turn_dir)
@@ -1976,5 +2066,3 @@ class Scheduler:
             if extracted:
                 total = (request._cache_state.cached_tokens or 0) + processed
                 self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
-
-

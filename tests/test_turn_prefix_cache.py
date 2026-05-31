@@ -4,7 +4,13 @@ import json
 import tempfile
 from pathlib import Path
 from vllm_mlx.turn_prefix_cache import (
-    Segment, TurnNode, SSDRef, TurnPrefixCacheConfig, TurnPrefixCache, _context_hash, _node_data_bytes,
+    Segment,
+    TurnNode,
+    SSDRef,
+    TurnPrefixCacheConfig,
+    TurnPrefixCache,
+    _context_hash,
+    _node_data_bytes,
 )
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager as TurnCacheAdapter
 
@@ -15,6 +21,7 @@ def seg(token_ids, role="user"):
 
 class _MockKVLayer:
     """Mock KV cache layer for testing."""
+
     def __init__(self, n_tokens):
         self.n_tokens = n_tokens
 
@@ -22,12 +29,7 @@ class _MockKVLayer:
 def _make_extracted_state(n_layers, n_tokens):
     """Create mock extracted cache state (list of layer dicts)."""
     return [
-        {
-            "state": (
-                mx.zeros((1, n_tokens, 128)),
-                mx.zeros((1, n_tokens, 128))
-            )
-        }
+        {"state": (mx.zeros((1, n_tokens, 128)), mx.zeros((1, n_tokens, 128)))}
         for _ in range(n_layers)
     ]
 
@@ -38,6 +40,7 @@ def _make_minimal_scheduler_new():
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
     from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
     from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+
     sched = object.__new__(Scheduler)
     sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
     sched.memory_aware_cache = None
@@ -61,16 +64,34 @@ def test_context_hash_different_tokens():
 
 
 def test_turn_node_is_leaf_when_no_children():
-    node = TurnNode(token_ids=[1], context_hash=1, kv_data=[], recurrent_data=None,
-                    tokens_since_checkpoint=0, parent=None)
+    node = TurnNode(
+        token_ids=[1],
+        context_hash=1,
+        kv_data=[],
+        recurrent_data=None,
+        tokens_since_checkpoint=0,
+        parent=None,
+    )
     assert node.is_leaf
 
 
 def test_turn_node_not_leaf_when_has_children():
-    parent = TurnNode(token_ids=[], context_hash=0, kv_data=None, recurrent_data=None,
-                      tokens_since_checkpoint=0, parent=None)
-    child = TurnNode(token_ids=[1], context_hash=1, kv_data=[], recurrent_data=None,
-                     tokens_since_checkpoint=1, parent=parent)
+    parent = TurnNode(
+        token_ids=[],
+        context_hash=0,
+        kv_data=None,
+        recurrent_data=None,
+        tokens_since_checkpoint=0,
+        parent=None,
+    )
+    child = TurnNode(
+        token_ids=[1],
+        context_hash=1,
+        kv_data=[],
+        recurrent_data=None,
+        tokens_since_checkpoint=1,
+        parent=parent,
+    )
     parent.children[1] = child
     assert not parent.is_leaf
 
@@ -149,12 +170,18 @@ from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 
 def make_cache(stride=512, max_gb=8.0, kv_dtype="bf16", recurrent_dtype="bf16"):
-    return TurnPrefixCache(TurnPrefixCacheConfig(
-        checkpoint_stride=stride, max_memory_gb=max_gb, kv_dtype=kv_dtype, recurrent_dtype=recurrent_dtype
-    ))
+    return TurnPrefixCache(
+        TurnPrefixCacheConfig(
+            checkpoint_stride=stride,
+            max_memory_gb=max_gb,
+            kv_dtype=kv_dtype,
+            recurrent_dtype=recurrent_dtype,
+        )
+    )
 
 
 # --- has_recurrent_state flag ---
+
 
 def test_has_recurrent_state_starts_false():
     cache = make_cache()
@@ -163,25 +190,41 @@ def test_has_recurrent_state_starts_false():
 
 def test_has_recurrent_state_not_set_for_kv_only_insert():
     cache = make_cache(stride=0)
-    cache.insert(cache.root, seg([1, 2, 3]), kv_data=[], recurrent_data=None, is_system_prompt=True)
+    cache.insert(
+        cache.root,
+        seg([1, 2, 3]),
+        kv_data=[],
+        recurrent_data=None,
+        is_system_prompt=True,
+    )
     assert not cache.has_recurrent_state
 
 
 def test_has_recurrent_state_set_on_hybrid_insert():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((2, 3))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
-    cache.insert(cache.root, seg([1, 2, 3]), kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    cache.insert(
+        cache.root,
+        seg([1, 2, 3]),
+        kv_data=[],
+        recurrent_data=rec,
+        is_system_prompt=True,
+    )
     assert cache.has_recurrent_state
 
 
 def test_has_recurrent_state_survives_clear():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((2, 3))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
-    cache.insert(cache.root, seg([1]), kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    cache.insert(
+        cache.root, seg([1]), kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
     assert cache.has_recurrent_state
     cache.clear()
     assert cache.has_recurrent_state
@@ -189,10 +232,17 @@ def test_has_recurrent_state_survives_clear():
 
 def test_load_sets_has_recurrent_state_for_hybrid_cache(tmp_path):
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache1 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     state = mx.zeros((2, 3))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
-    cache1.insert(cache1.root, seg([1, 2, 3], role="system"), kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    cache1.insert(
+        cache1.root,
+        seg([1, 2, 3], role="system"),
+        kv_data=[],
+        recurrent_data=rec,
+        is_system_prompt=True,
+    )
     cache1.save(str(tmp_path))
 
     cache2 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
@@ -203,7 +253,13 @@ def test_load_sets_has_recurrent_state_for_hybrid_cache(tmp_path):
 
 def test_load_leaves_has_recurrent_state_false_for_kv_only_cache(tmp_path):
     cache1 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
-    cache1.insert(cache1.root, seg([1, 2, 3], role="system"), kv_data=[], recurrent_data=None, is_system_prompt=True)
+    cache1.insert(
+        cache1.root,
+        seg([1, 2, 3], role="system"),
+        kv_data=[],
+        recurrent_data=None,
+        is_system_prompt=True,
+    )
     cache1.save(str(tmp_path))
 
     cache2 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
@@ -215,7 +271,13 @@ def test_find_checkpoint_ancestor_kv_only_returns_deepest_kv_node():
     """In KV-only mode, find_checkpoint_ancestor returns the deepest node with kv_data."""
     cache = make_cache(stride=0)
     kv_data = _make_kv_data()
-    n1 = cache.insert(cache.root, seg([1], role="system"), kv_data=kv_data, recurrent_data=None, is_system_prompt=True)
+    n1 = cache.insert(
+        cache.root,
+        seg([1], role="system"),
+        kv_data=kv_data,
+        recurrent_data=None,
+        is_system_prompt=True,
+    )
     n2 = cache.insert(n1, seg([2]), kv_data=kv_data, recurrent_data=None)
     assert not cache.has_recurrent_state  # confirm KV-only mode
 
@@ -229,7 +291,13 @@ def test_find_checkpoint_ancestor_kv_only_returns_deepest_kv_node():
 def test_find_checkpoint_ancestor_kv_only_returns_none_when_no_kv():
     """In KV-only mode, returns None if no node in path has kv_data."""
     cache = make_cache(stride=0)
-    n1 = cache.insert(cache.root, seg([1], role="system"), kv_data=[], recurrent_data=None, is_system_prompt=True)
+    n1 = cache.insert(
+        cache.root,
+        seg([1], role="system"),
+        kv_data=[],
+        recurrent_data=None,
+        is_system_prompt=True,
+    )
     assert not cache.has_recurrent_state
 
     path, _ = cache.match([seg([1], role="system")])
@@ -287,6 +355,7 @@ def test_insert_context_hash_differs_at_different_depths():
 
 def test_leaf_gets_recurrent_state():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -296,6 +365,7 @@ def test_leaf_gets_recurrent_state():
 
 def test_temp_recurrent_pruned_on_non_stride_inner():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -309,6 +379,7 @@ def test_temp_recurrent_pruned_on_non_stride_inner():
 
 def test_permanent_checkpoint_at_stride():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -322,12 +393,17 @@ def test_permanent_checkpoint_at_stride():
 
 def test_system_prompt_always_permanent():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=10000)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     # Only 50 tokens but is_system_prompt=True
-    n = cache.insert(cache.root, seg(list(range(50)), role="system"), recurrent_data=rec,
-                     is_system_prompt=True)
+    n = cache.insert(
+        cache.root,
+        seg(list(range(50)), role="system"),
+        recurrent_data=rec,
+        is_system_prompt=True,
+    )
     assert n.is_permanent_checkpoint
     cache.insert(n, seg([99]), recurrent_data=rec)
     assert n.recurrent_data is not None
@@ -335,6 +411,7 @@ def test_system_prompt_always_permanent():
 
 def test_tokens_since_resets_after_permanent():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=100)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -348,6 +425,7 @@ def test_tokens_since_resets_after_permanent():
 
 def test_stride_zero_makes_every_node_permanent():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -393,6 +471,7 @@ def test_match_updates_last_used():
 
 def test_match_reports_has_recurrent():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -432,6 +511,7 @@ def test_release_all_nodes_in_path():
 
 def test_find_checkpoint_ancestor_returns_self_if_has_recurrent():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -451,6 +531,7 @@ def test_find_checkpoint_ancestor_returns_none_when_no_checkpoint():
 
 def test_find_checkpoint_ancestor_returns_leaf_if_leaf_has_recurrent():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=10000)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -463,6 +544,7 @@ def test_find_checkpoint_ancestor_returns_leaf_if_leaf_has_recurrent():
 
 def test_find_checkpoint_ancestor_skips_ssdref_nodes():
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -484,15 +566,23 @@ def _make_kv_data(n_tokens=1):
     """Small KVLayerSegment for memory-tracked tests."""
     from vllm_mlx.cache_types import KVLayerSegment
     from vllm_mlx.kv_cache import QuantizedArray
+
     keys = _make_kv(n_tokens)
     values = _make_kv(n_tokens)
     q_keys = QuantizedArray(*mx.quantize(keys, group_size=64, bits=8))
     q_values = QuantizedArray(*mx.quantize(values, group_size=64, bits=8))
-    return [KVLayerSegment(
-        keys=q_keys,
-        values=q_values,
-        metadata={'layer_index': 0, 'merge_strategy': 'concatenate', 'class_name': 'KVCache', 'n_tokens': n_tokens},
-    )]
+    return [
+        KVLayerSegment(
+            keys=q_keys,
+            values=q_values,
+            metadata={
+                "layer_index": 0,
+                "merge_strategy": "concatenate",
+                "class_name": "KVCache",
+                "n_tokens": n_tokens,
+            },
+        )
+    ]
 
 
 def test_lru_evicts_oldest_leaf():
@@ -503,9 +593,11 @@ def test_lru_evicts_oldest_leaf():
     n2.last_used = 2.0
     # Set budget to allow only the newer (n2) node, forcing n1's eviction
     node_size = _node_data_bytes(n1)
-    cache.config.max_memory_gb = (node_size + 512) / (1024**3)  # Budget for ~1 node plus buffer
+    cache.config.max_memory_gb = (node_size + 512) / (
+        1024**3
+    )  # Budget for ~1 node plus buffer
     cache._evict_if_needed()
-    assert n1.kv_data is None      # evicted (oldest)
+    assert n1.kv_data is None  # evicted (oldest)
     assert n2.kv_data is not None  # kept (newer)
 
 
@@ -543,8 +635,8 @@ def test_cascade_stops_at_sibling():
     node_size = _node_data_bytes(n2a)
     cache.config.max_memory_gb = (node_size * 2 + 512) / (1024**3)
     cache._evict_if_needed()
-    assert n2a.kv_data is None      # evicted (oldest leaf)
-    assert n1.kv_data is not None   # n1 still has n2b, so cascade stops
+    assert n2a.kv_data is None  # evicted (oldest leaf)
+    assert n1.kv_data is not None  # n1 still has n2b, so cascade stops
 
 
 def test_evicted_node_removed_from_parent_children():
@@ -558,11 +650,14 @@ def test_evicted_node_removed_from_parent_children():
 
 def test_save_and_load_roundtrip(tmp_path):
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((2, 3))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     seg1 = seg(list(range(10)), role="system")
-    cache.insert(cache.root, seg1, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    cache.insert(
+        cache.root, seg1, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
 
     cache.save(str(tmp_path))
 
@@ -597,13 +692,15 @@ def test_load_missing_kv_file_skips_node(tmp_path):
 
 
 def make_ssd_cache(tmp_path, stride=512):
-    return TurnPrefixCache(TurnPrefixCacheConfig(
-        checkpoint_stride=stride,
-        max_memory_gb=8.0,
-        kv_dtype="bf16",
-        ssd_max_gb=10.0,
-        ssd_dir=str(tmp_path),
-    ))
+    return TurnPrefixCache(
+        TurnPrefixCacheConfig(
+            checkpoint_stride=stride,
+            max_memory_gb=8.0,
+            kv_dtype="bf16",
+            ssd_max_gb=10.0,
+            ssd_dir=str(tmp_path),
+        )
+    )
 
 
 def test_spill_replaces_kv_with_ssdref(tmp_path):
@@ -644,10 +741,15 @@ def test_promote_returns_false_on_missing_file(tmp_path):
 def test_promote_restores_recurrent_state(tmp_path):
     """Regression test: recurrent state is properly reconstructed from SSD."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_ssd_cache(tmp_path)
     kv_data = _make_kv_data(n_tokens=3)
-    rec_data = [RecurrentLayerSegment(arrays=[mx.ones((2, 3)), mx.ones((4, 5))], metadata={})]
-    node = cache.insert(cache.root, seg([1, 2, 3]), kv_data=kv_data, recurrent_data=rec_data)
+    rec_data = [
+        RecurrentLayerSegment(arrays=[mx.ones((2, 3)), mx.ones((4, 5))], metadata={})
+    ]
+    node = cache.insert(
+        cache.root, seg([1, 2, 3]), kv_data=kv_data, recurrent_data=rec_data
+    )
 
     # Verify before spill
     assert isinstance(node.recurrent_data, list)
@@ -671,11 +773,14 @@ from unittest.mock import MagicMock
 def test_scheduler_integration_fetch_hits_cache():
     """Verify that matching path and recurrent state are set on the request."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     sys_seg = seg(list(range(20)), role="system")
-    cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    cache.insert(
+        cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
 
     # Simulate what _fetch_turn_cache does
     segments = [sys_seg]
@@ -691,11 +796,14 @@ def test_scheduler_integration_fetch_hits_cache():
 def test_scheduler_integration_store_extends_trie():
     """Verify that inserting new segments after match extends the trie."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     sys_seg = seg(list(range(10)), role="system")
-    n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    n_sys = cache.insert(
+        cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
 
     # Match found sys_node; now store new user segment
     user_seg = seg([100, 101, 102])
@@ -725,6 +833,7 @@ def test_concurrent_ref_counts():
 def test_scheduler_stores_and_serves_cache():
     """Verify that segments are stored and served correctly in a realistic flow."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -733,7 +842,9 @@ def test_scheduler_stores_and_serves_cache():
     sys_seg = seg(list(range(10)), role="system")
     user_seg = seg([100, 101])
 
-    n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    n_sys = cache.insert(
+        cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
     n_user = cache.insert(n_sys, user_seg, kv_data=[], recurrent_data=rec)
 
     # Verify nodes were created
@@ -766,6 +877,7 @@ def test_scheduler_stores_and_serves_cache():
 def test_multiturn_continuation():
     """Session A stores [sys, u1, a1]; session A extended gets full hit on all three."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -774,7 +886,9 @@ def test_multiturn_continuation():
     u1_seg = seg([100, 101, 102])
     a1_seg = seg([200, 201])
 
-    n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    n_sys = cache.insert(
+        cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
     n_u1 = cache.insert(n_sys, u1_seg, kv_data=[], recurrent_data=rec)
     n_a1 = cache.insert(n_u1, a1_seg, kv_data=[], recurrent_data=rec)
 
@@ -791,12 +905,17 @@ def test_multiturn_continuation():
 def test_cross_session_system_prompt_reuse():
     """Session B with same system prompt gets immediate recurrent state hit."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
-    cache = make_cache(stride=10000)  # high stride so only sys_prompt gets permanent checkpoint
+
+    cache = make_cache(
+        stride=10000
+    )  # high stride so only sys_prompt gets permanent checkpoint
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
 
     sys_seg = seg(list(range(50)), role="system")
-    n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    n_sys = cache.insert(
+        cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
     assert n_sys.is_permanent_checkpoint
 
     # Session B: same system prompt
@@ -809,6 +928,7 @@ def test_cross_session_system_prompt_reuse():
 def test_mid_session_branching():
     """Two sessions share [sys, u1, a1] but diverge at u2."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = make_cache(stride=0)
     state = mx.zeros((1,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
@@ -816,10 +936,12 @@ def test_mid_session_branching():
     sys_seg = seg(list(range(10)), role="system")
     u1_seg = seg([100])
     a1_seg = seg([200])
-    u2a_seg = seg([300])   # branch A
-    u2b_seg = seg([400])   # branch B
+    u2a_seg = seg([300])  # branch A
+    u2b_seg = seg([400])  # branch B
 
-    n_sys = cache.insert(cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    n_sys = cache.insert(
+        cache.root, sys_seg, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
     n_u1 = cache.insert(n_sys, u1_seg, kv_data=[], recurrent_data=rec)
     n_a1 = cache.insert(n_u1, a1_seg, kv_data=[], recurrent_data=rec)
     n_u2a = cache.insert(n_a1, u2a_seg, kv_data=[], recurrent_data=rec)
@@ -916,6 +1038,7 @@ def test_turn_cache_requires_chunked_prefill_nonzero():
     """Scheduler raises ValueError if use_turn_cache=True and chunked_prefill_tokens=0."""
     from unittest.mock import MagicMock
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
     with pytest.raises(ValueError, match="chunked-prefill-tokens"):
         Scheduler(
             model=MagicMock(),
@@ -928,6 +1051,7 @@ def test_turn_cache_with_chunked_prefill_does_not_raise():
     """Scheduler does not raise when use_turn_cache=True and chunked_prefill_tokens>0."""
     from unittest.mock import MagicMock
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
     # Should raise something else (missing model internals) but NOT ValueError about chunked prefill
     try:
         Scheduler(
@@ -936,7 +1060,9 @@ def test_turn_cache_with_chunked_prefill_does_not_raise():
             config=SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192),
         )
     except ValueError as e:
-        assert "chunked-prefill-tokens" not in str(e), f"Unexpected chunked-prefill error: {e}"
+        assert "chunked-prefill-tokens" not in str(
+            e
+        ), f"Unexpected chunked-prefill error: {e}"
     except Exception:
         pass  # Other init errors from MagicMock model are expected
 
@@ -945,6 +1071,7 @@ def test_turn_cache_disables_memory_aware_cache():
     """When use_turn_cache=True, memory_aware_cache must be None."""
     from unittest.mock import MagicMock
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
     sched = object.__new__(Scheduler)
     sched.config = SchedulerConfig(
         use_turn_cache=True,
@@ -962,15 +1089,16 @@ def test_turn_cache_disables_memory_aware_cache():
 
     # Re-run just the cache-init logic by calling the relevant section inline
     from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
     if sched.config.enable_prefix_cache:
         if sched.config.use_memory_aware_cache and not sched.config.use_turn_cache:
             sched.memory_aware_cache = MemoryAwarePrefixCache(
                 model=MagicMock(), config=MemoryCacheConfig()
             )
 
-    assert sched.memory_aware_cache is None, (
-        "memory_aware_cache should be None when use_turn_cache=True"
-    )
+    assert (
+        sched.memory_aware_cache is None
+    ), "memory_aware_cache should be None when use_turn_cache=True"
 
 
 def _make_minimal_scheduler_with_turn_cache():
@@ -978,6 +1106,7 @@ def _make_minimal_scheduler_with_turn_cache():
     from unittest.mock import MagicMock
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
     from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
     sched = object.__new__(Scheduler)
     sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=8192)
     sched.memory_aware_cache = None
@@ -989,6 +1118,7 @@ def _make_minimal_scheduler_with_turn_cache():
 
 class _MockKVLayer:
     """Minimal KVCache-like object with .state and .meta_state."""
+
     def __init__(self, n_tokens):
         self._n = n_tokens
 
@@ -1007,6 +1137,7 @@ def _make_extracted_state(n_layers=2, n_tokens=10):
     head_dim=64 ensures divisibility by _split_cache_arrays' group_size=64.
     """
     from mlx_lm.models.cache import KVCache
+
     return [
         {
             "state": (mx.zeros([1, 4, n_tokens, 64]), mx.zeros([1, 4, n_tokens, 64])),
@@ -1021,13 +1152,16 @@ def _make_extracted_state(n_layers=2, n_tokens=10):
 def test_save_and_load_recurrent_data_roundtrip(tmp_path):
     """TurnNode with RecurrentLayerSegment survives a save/load round-trip."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     state = mx.zeros((2, 3))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
     mx.eval(state)
 
     seg_sys = Segment(role="system", token_ids=list(range(10)))
-    cache.insert(cache.root, seg_sys, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    cache.insert(
+        cache.root, seg_sys, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
 
     cache.save(str(tmp_path))
 
@@ -1045,6 +1179,7 @@ def test_save_and_load_recurrent_data_roundtrip(tmp_path):
 # Multi-turn diagnostic tests
 # ---------------------------------------------------------------------------
 
+
 def test_segment1_tokens_stable_across_turns_new():
     """Segment 1 (sys) has identical token_ids for turn 1, 2, and 3 using new boundaries."""
     from vllm_mlx.scheduler import Scheduler
@@ -1052,8 +1187,10 @@ def test_segment1_tokens_stable_across_turns_new():
     sched = object.__new__(Scheduler)
 
     sys_tokens = list(range(100))
-    u1 = list(range(100, 120)); a1 = list(range(200, 250))
-    u2 = list(range(300, 315)); a2 = list(range(400, 430))
+    u1 = list(range(100, 120))
+    a1 = list(range(200, 250))
+    u2 = list(range(300, 315))
+    a2 = list(range(400, 430))
     u3 = list(range(500, 510))
     B_sys = len(sys_tokens)
 
@@ -1061,7 +1198,9 @@ def test_segment1_tokens_stable_across_turns_new():
     B_1 = B_sys + len(u1) + len(a1)
     req2 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2, [B_sys, B_1])
     B_2 = B_1 + len(u2) + len(a2)
-    req3 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2])
+    req3 = _make_request_with_boundaries(
+        sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2]
+    )
 
     segs1 = TurnCacheAdapter.messages_to_segments(req1)
     segs2 = TurnCacheAdapter.messages_to_segments(req2)
@@ -1071,7 +1210,12 @@ def test_segment1_tokens_stable_across_turns_new():
     assert segs2[0].token_ids == sys_tokens
     assert segs3[0].token_ids == sys_tokens
 
-    from vllm_mlx.turn_prefix_cache import _context_hash, TurnPrefixCache, TurnPrefixCacheConfig
+    from vllm_mlx.turn_prefix_cache import (
+        _context_hash,
+        TurnPrefixCache,
+        TurnPrefixCacheConfig,
+    )
+
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     h1 = _context_hash(cache.root.context_hash, segs1[0].token_ids)
     h2 = _context_hash(cache.root.context_hash, segs2[0].token_ids)
@@ -1088,8 +1232,10 @@ def test_multi_turn_sys_hit_each_turn_new():
     sched.turn_cache = cache
 
     sys_tokens = list(range(50))
-    u1 = list(range(50, 60)); a1 = list(range(100, 120))
-    u2 = list(range(200, 210)); a2 = list(range(300, 315))
+    u1 = list(range(50, 60))
+    a1 = list(range(100, 120))
+    u2 = list(range(200, 210))
+    a2 = list(range(300, 315))
     u3 = list(range(400, 405))
     B_sys = len(sys_tokens)
 
@@ -1113,7 +1259,9 @@ def test_multi_turn_sys_hit_each_turn_new():
 
     # Turn 3 fetch: sys hit
     B_2 = B_1 + len(u2) + len(a2)
-    req3 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2])
+    req3 = _make_request_with_boundaries(
+        sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2]
+    )
     segs3 = TurnCacheAdapter.messages_to_segments(req3)
     assert len(segs3) == 4
     path3, _ = cache.match(segs3)
@@ -1129,15 +1277,19 @@ def test_conv_segment_grows_each_turn_new():
     sched = object.__new__(Scheduler)
 
     sys_tokens = list(range(20))
-    u1 = list(range(20, 25)); a1 = list(range(100, 105))
-    u2 = list(range(200, 203)); a2 = list(range(300, 306))
+    u1 = list(range(20, 25))
+    a1 = list(range(100, 105))
+    u2 = list(range(200, 203))
+    a2 = list(range(300, 306))
     u3 = list(range(400, 402))
     B_sys = len(sys_tokens)
     B_1 = B_sys + len(u1) + len(a1)
     B_2 = B_1 + len(u2) + len(a2)
 
     req2 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2, [B_sys, B_1])
-    req3 = _make_request_with_boundaries(sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2])
+    req3 = _make_request_with_boundaries(
+        sys_tokens + u1 + a1 + u2 + a2 + u3, [B_sys, B_1, B_2]
+    )
 
     segs2 = TurnCacheAdapter.messages_to_segments(req2)
     segs3 = TurnCacheAdapter.messages_to_segments(req3)
@@ -1167,7 +1319,8 @@ def test_multi_turn_conv_stored_after_turn2_new():
     sched.turn_cache = cache
 
     sys_tokens = list(range(20))
-    u1 = list(range(20, 25)); a1 = list(range(100, 105))
+    u1 = list(range(20, 25))
+    a1 = list(range(100, 105))
     u2 = list(range(200, 203))
     B_sys = len(sys_tokens)
     B_1 = B_sys + len(u1) + len(a1)
@@ -1228,14 +1381,18 @@ def test_multi_turn_conv_stored_after_turn2_new():
 
 # ── _compute_turn_boundaries tests (tokenizer-only, no model) ──────────────
 
+
 class _MockTok:
     """Char-level tokenizer with a minimal chat template."""
+
     unk_token_id = None
 
     def encode(self, text):
         return list(text.encode("utf-8"))
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
         parts = []
         for m in messages:
             role = m.get("role", "user")
@@ -1249,6 +1406,7 @@ class _MockTok:
 def _make_engine_with_mock_tok():
     """Return a BatchedEngine stub with the mock tokenizer wired in."""
     from vllm_mlx.engine.batched import BatchedEngine
+
     eng = object.__new__(BatchedEngine)
     eng._is_mllm = False
     eng._tokenizer = _MockTok()
@@ -1256,12 +1414,23 @@ def _make_engine_with_mock_tok():
     eng._model_name = "mock"
 
     # Add _apply_chat_template method for boundary detection
-    def _apply_chat_template(messages, tools=None, num_images=0, num_audios=0,
-                           chat_template_kwargs=None, enable_thinking=None):
+    def _apply_chat_template(
+        messages,
+        tools=None,
+        num_images=0,
+        num_audios=0,
+        chat_template_kwargs=None,
+        enable_thinking=None,
+    ):
         return eng._tokenizer.apply_chat_template(
             messages,
-            **((chat_template_kwargs or {}) if isinstance(chat_template_kwargs, dict) else {})
+            **(
+                (chat_template_kwargs or {})
+                if isinstance(chat_template_kwargs, dict)
+                else {}
+            ),
         )
+
     eng._apply_chat_template = _apply_chat_template
 
     return eng
@@ -1278,9 +1447,9 @@ def test_compute_turn_boundaries_single_turn():
     assert len(boundaries) == 1, f"Expected 1 boundary, got {boundaries}"
     # B_sys should be the byte-length of "<system>SYS</system>"
     expected_sys_text = "<system>SYS</system>"
-    assert boundaries[0] == len(expected_sys_text.encode("utf-8")), (
-        f"B_sys={boundaries[0]}, expected {len(expected_sys_text.encode('utf-8'))}"
-    )
+    assert boundaries[0] == len(
+        expected_sys_text.encode("utf-8")
+    ), f"B_sys={boundaries[0]}, expected {len(expected_sys_text.encode('utf-8'))}"
 
 
 def test_compute_turn_boundaries_two_turns():
@@ -1296,9 +1465,9 @@ def test_compute_turn_boundaries_two_turns():
     ]
     boundaries = eng._compute_turn_boundaries(messages)
     assert len(boundaries) == 3, f"Expected 3 boundaries, got {boundaries}"
-    assert boundaries[0] < boundaries[1] < boundaries[2], (
-        f"Boundaries not strictly increasing: {boundaries}"
-    )
+    assert (
+        boundaries[0] < boundaries[1] < boundaries[2]
+    ), f"Boundaries not strictly increasing: {boundaries}"
 
 
 def test_compute_turn_boundaries_no_system():
@@ -1324,9 +1493,7 @@ def test_compute_turn_boundaries_exact_position():
     tok = _MockTok()
     closed_text = "<system>SYS</system><user>U1</user><assistant>A1</assistant>"
     expected_b1 = len(closed_text.encode("utf-8"))
-    assert boundaries[1] == expected_b1, (
-        f"B_1={boundaries[1]}, expected {expected_b1}"
-    )
+    assert boundaries[1] == expected_b1, f"B_1={boundaries[1]}, expected {expected_b1}"
 
 
 def test_compute_turn_boundaries_strictly_increasing():
@@ -1345,9 +1512,9 @@ def test_compute_turn_boundaries_strictly_increasing():
     boundaries = eng._compute_turn_boundaries(messages)
     assert len(boundaries) == 4  # B_sys + 3 completed turns
     for i in range(len(boundaries) - 1):
-        assert boundaries[i] < boundaries[i + 1], (
-            f"boundaries[{i}]={boundaries[i]} >= boundaries[{i+1}]={boundaries[i+1]}"
-        )
+        assert (
+            boundaries[i] < boundaries[i + 1]
+        ), f"boundaries[{i}]={boundaries[i]} >= boundaries[{i+1}]={boundaries[i+1]}"
 
 
 def test_compute_turn_boundaries_last_boundary_less_than_full():
@@ -1361,17 +1528,21 @@ def test_compute_turn_boundaries_last_boundary_less_than_full():
     ]
     boundaries = eng._compute_turn_boundaries(messages)
     tok = _MockTok()
-    full_tokens = tok.encode(tok.apply_chat_template(messages, add_generation_prompt=True))
-    assert boundaries[-1] < len(full_tokens), (
-        f"Last boundary {boundaries[-1]} >= full_tokens length {len(full_tokens)}"
+    full_tokens = tok.encode(
+        tok.apply_chat_template(messages, add_generation_prompt=True)
     )
+    assert boundaries[-1] < len(
+        full_tokens
+    ), f"Last boundary {boundaries[-1]} >= full_tokens length {len(full_tokens)}"
 
 
 # ── Request dataclass field tests ──────────────────────────────────────────
 
+
 def test_request_has_turn_boundaries_field():
     """Request must have _turn_boundaries field (new)."""
     from vllm_mlx.request import Request, SamplingParams
+
     req = Request(
         request_id="test",
         prompt="hi",
@@ -1383,6 +1554,7 @@ def test_request_has_turn_boundaries_field():
 def test_request_turn_boundaries_field_set():
     """Request._turn_boundaries defaults to empty list and can be set."""
     from vllm_mlx.request import Request, SamplingParams
+
     req = Request(
         request_id="test",
         prompt="hi",
@@ -1399,14 +1571,21 @@ def test_request_turn_boundaries_field_set():
 def test_request_no_old_boundary_fields():
     """Request must NOT have the old boundary fields (prefix_boundary, sys_end_boundary, turn_boundaries)."""
     from vllm_mlx.request import Request, SamplingParams
+
     req = Request(
         request_id="test",
         prompt="hi",
         sampling_params=SamplingParams(),
     )
-    assert not hasattr(req, "prefix_boundary"), "Request should not have prefix_boundary field"
-    assert not hasattr(req, "sys_end_boundary"), "Request should not have sys_end_boundary field"
-    assert not hasattr(req, "turn_boundaries"), "Request should not have turn_boundaries field"
+    assert not hasattr(
+        req, "prefix_boundary"
+    ), "Request should not have prefix_boundary field"
+    assert not hasattr(
+        req, "sys_end_boundary"
+    ), "Request should not have sys_end_boundary field"
+    assert not hasattr(
+        req, "turn_boundaries"
+    ), "Request should not have turn_boundaries field"
 
 
 def test_engine_core_add_request_accepts_turn_boundaries():
@@ -1442,9 +1621,11 @@ def test_engine_core_add_request_accepts_turn_boundaries():
 
 # ── _messages_to_segments (new implementation) tests ──────────────────────
 
+
 def _make_request_with_boundaries(prompt_token_ids, turn_boundaries):
     """Create a MagicMock request with _turn_boundaries."""
     from unittest.mock import MagicMock
+
     req = MagicMock()
     req.prompt_token_ids = prompt_token_ids
     req._turn_boundaries = turn_boundaries
@@ -1454,6 +1635,7 @@ def _make_request_with_boundaries(prompt_token_ids, turn_boundaries):
 def test_messages_to_segments_new_single_turn():
     """Single turn: [B_sys] → [system, user] segments."""
     from vllm_mlx.scheduler import Scheduler
+
     sched = object.__new__(Scheduler)
 
     # full_tokens = [0..9=sys, 10..14=user]
@@ -1473,6 +1655,7 @@ def test_messages_to_segments_new_single_turn():
 def test_messages_to_segments_new_two_boundaries():
     """Two boundaries: [B_sys, B_1] → [system, conversation, user]."""
     from vllm_mlx.scheduler import Scheduler
+
     sched = object.__new__(Scheduler)
 
     # full = [0..9=sys, 10..14=conv, 15..19=user]
@@ -1494,6 +1677,7 @@ def test_messages_to_segments_new_two_boundaries():
 def test_messages_to_segments_new_no_boundaries():
     """No boundaries → empty list."""
     from vllm_mlx.scheduler import Scheduler
+
     sched = object.__new__(Scheduler)
 
     req = _make_request_with_boundaries(
@@ -1508,6 +1692,7 @@ def test_messages_to_segments_new_no_boundaries():
 def test_messages_to_segments_new_boundary_at_end():
     """Boundary at end of tokens → system-only segment (entire prompt is the system prefix)."""
     from vllm_mlx.scheduler import Scheduler
+
     sched = object.__new__(Scheduler)
 
     req = _make_request_with_boundaries(
@@ -1523,6 +1708,7 @@ def test_messages_to_segments_new_boundary_at_end():
 def test_messages_to_segments_new_three_boundaries():
     """Three boundaries: [B_sys, B_1, B_2] → [system, conv, conv, user]."""
     from vllm_mlx.scheduler import Scheduler
+
     sched = object.__new__(Scheduler)
 
     # full = [0..4=sys, 5..9=conv1, 10..14=conv2, 15..19=user]
@@ -1546,6 +1732,7 @@ def test_messages_to_segments_new_three_boundaries():
 def test_messages_to_segments_new_sys_stable():
     """System segment is stable across requests with different user messages."""
     from vllm_mlx.scheduler import Scheduler
+
     sched = object.__new__(Scheduler)
 
     sys_tokens = list(range(10))
@@ -1590,7 +1777,9 @@ def test_mid_prefill_eagerly_inserts_turn_at_boundary():
 
     req = SimpleRequest()
     req.request_id = "test-1"
-    req.prompt_token_ids = list(range(100))  # 100 tokens; B_sys=50 → sys=[0-49], user=[50-99]
+    req.prompt_token_ids = list(
+        range(100)
+    )  # 100 tokens; B_sys=50 → sys=[0-49], user=[50-99]
     req._turn_boundaries = [50]
     req._mid_prefill_last_save = 0
     req._cache_state = RequestCacheState()
@@ -1599,7 +1788,7 @@ def test_mid_prefill_eagerly_inserts_turn_at_boundary():
     sched.uid_to_request_id[123] = "test-1"
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
-    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
+    with patch("vllm_mlx.scheduler.extract_cache_states", return_value=mock_extracted):
         callback(123, 50, MagicMock())
 
     # System turn eagerly inserted into trie
@@ -1629,7 +1818,7 @@ def test_mid_prefill_does_not_insert_away_from_boundary():
     sched.uid_to_request_id[124] = "test-2"
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
-    with patch('vllm_mlx.scheduler.extract_cache_states', return_value=mock_extracted):
+    with patch("vllm_mlx.scheduler.extract_cache_states", return_value=mock_extracted):
         callback(124, 30, MagicMock())  # total=30, not in [50] → no insert
 
     assert len(sched.turn_cache.root.children) == 0
@@ -1660,7 +1849,7 @@ def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
 
     for boundary, n_tok in [(50, 50), (100, 100), (150, 150)]:
         extracted = _make_extracted_state(n_layers=2, n_tokens=n_tok)
-        with patch('vllm_mlx.scheduler.extract_cache_states', return_value=extracted):
+        with patch("vllm_mlx.scheduler.extract_cache_states", return_value=extracted):
             callback(125, boundary, MagicMock())
 
     # Three turns inserted, chained: root → sys → conv1 → conv2
@@ -1673,17 +1862,13 @@ def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
     assert len(conv1_node.children) == 1
 
 
-
-
 def test_chunked_prefill_boundary_aware_first_chunk():
     """When _turn_boundaries=[B_sys] and B_sys <= budget, first chunk lands exactly on B_sys."""
     from unittest.mock import MagicMock, patch
     from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 
     sched = object.__new__(Scheduler)
-    sched.config = SchedulerConfig(
-        use_turn_cache=True, chunked_prefill_tokens=100
-    )
+    sched.config = SchedulerConfig(use_turn_cache=True, chunked_prefill_tokens=100)
 
     # Simulate a request with B_sys=40, budget=100, prompt=80 tokens
     req = MagicMock()
@@ -1735,11 +1920,16 @@ def test_chunked_prefill_boundary_aware_continuation_lands_on_boundary():
 def _make_bf16_kvcache_extracted(n_layers=2, n_tokens=10, head_dim=256, n_kv_heads=4):
     """Create extracted_cache in KVCache (bf16) format matching _extract_cache_states output."""
     from mlx_lm.models.cache import KVCache
+
     return [
         {
             "state": (
-                mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(mx.bfloat16),
-                mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(mx.bfloat16),
+                mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(
+                    mx.bfloat16
+                ),
+                mx.random.normal([1, n_kv_heads, n_tokens, head_dim]).astype(
+                    mx.bfloat16
+                ),
             ),
             "meta_state": (str(n_tokens),),
             "class_name": "KVCache",
@@ -1761,14 +1951,15 @@ def test_find_checkpoint_ancestor_rejects_empty_recurrent_data():
         parent=cache.root,
     )
     result = cache.find_checkpoint_ancestor([node])
-    assert result is None, (
-        "find_checkpoint_ancestor must return None for a node with recurrent_data=[]"
-    )
+    assert (
+        result is None
+    ), "find_checkpoint_ancestor must return None for a node with recurrent_data=[]"
 
 
 def test_find_checkpoint_ancestor_accepts_nonempty_recurrent_data():
     """Sanity check: nodes with actual recurrent data are still selected."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     cache.has_recurrent_state = True
     node = TurnNode(
@@ -1791,9 +1982,12 @@ def test_save_load_multi_node_parent_child(tmp_path):
     s_sys = seg(list(range(10)), role="system")
     s_usr = seg([100, 101], role="user")
     from vllm_mlx.cache_types import RecurrentLayerSegment
+
     state = mx.zeros((2,))
     rec = [RecurrentLayerSegment(arrays=[state], metadata={})]
-    n_sys = cache.insert(cache.root, s_sys, kv_data=[], recurrent_data=rec, is_system_prompt=True)
+    n_sys = cache.insert(
+        cache.root, s_sys, kv_data=[], recurrent_data=rec, is_system_prompt=True
+    )
     cache.insert(n_sys, s_usr, kv_data=[], recurrent_data=rec)
 
     cache.save(str(tmp_path))
@@ -1804,5 +1998,3 @@ def test_save_load_multi_node_parent_child(tmp_path):
     assert len(path) == 2
     assert path[1].parent is path[0]
     assert path[0].parent is cache2.root
-
-

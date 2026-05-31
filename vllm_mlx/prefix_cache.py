@@ -367,7 +367,9 @@ class BlockCacheEntry:
     block_table: BlockTable
     cache_data: List[Any]  # Actual KV cache data per block
     last_access: float
-    borrowed_block_ids: "set[int]" = None  # block_ids with an extra ref owned by this request
+    borrowed_block_ids: "set[int]" = (
+        None  # block_ids with an extra ref owned by this request
+    )
 
     def __post_init__(self):
         if self.borrowed_block_ids is None:
@@ -486,7 +488,7 @@ class BlockAwarePrefixCache:
                     block_table.block_ids.append(block_id)
                     block_table.num_tokens += block.token_count
 
-            remaining = list(tokens[len(matched_tokens):])
+            remaining = list(tokens[len(matched_tokens) :])
             self._hits += 1
             self._tokens_saved += len(matched_tokens)
 
@@ -851,7 +853,9 @@ class BlockAwarePrefixCache:
             self.paged_cache.free_block(block_id)
 
         if borrowed:
-            logger.debug(f"Released {len(borrowed)} borrowed block refs for {request_id}")
+            logger.debug(
+                f"Released {len(borrowed)} borrowed block refs for {request_id}"
+            )
 
     def fork_cache(
         self,

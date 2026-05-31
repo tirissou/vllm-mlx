@@ -22,6 +22,7 @@ def _tiny_config():
 
 def _fake_layers():
     import numpy as np
+
     return [{"keys": np.zeros((1, 4, 8)), "values": np.zeros((1, 4, 8))}]
 
 
@@ -58,7 +59,9 @@ class TestMemoryAwarePrefixCacheSpillDelegate:
         req1 = _fake_request([1, 2, 3], "req-1")
         req2 = _fake_request([4, 5, 6], "req-2")
         cache.store(list(req1.prompt_token_ids), _fake_layers())
-        cache.store(list(req2.prompt_token_ids), _fake_layers())  # triggers eviction of req1
+        cache.store(
+            list(req2.prompt_token_ids), _fake_layers()
+        )  # triggers eviction of req1
 
         on_spill.assert_called_once()
         tokens_arg, layers_arg = on_spill.call_args[0]
@@ -78,6 +81,7 @@ class TestMemoryAwarePrefixCacheSpillDelegate:
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
+
 def _seg(token_ids, role="user"):
     return Segment(role=role, token_ids=token_ids)
 
@@ -85,14 +89,17 @@ def _seg(token_ids, role="user"):
 def _make_turn_cache(tmp_path=None):
     """Create a TurnPrefixCache with SSD dir (needed for legacy spill path tests)."""
     import tempfile, os
+
     ssd_dir = str(tmp_path) if tmp_path else tempfile.mkdtemp()
-    return TurnPrefixCache(TurnPrefixCacheConfig(
-        checkpoint_stride=0,
-        max_memory_gb=8.0,
-        kv_dtype="bf16",
-        ssd_max_gb=10.0,
-        ssd_dir=ssd_dir,
-    ))
+    return TurnPrefixCache(
+        TurnPrefixCacheConfig(
+            checkpoint_stride=0,
+            max_memory_gb=8.0,
+            kv_dtype="bf16",
+            ssd_max_gb=10.0,
+            ssd_dir=ssd_dir,
+        )
+    )
 
 
 class TestTurnPrefixCacheSpillDelegate:

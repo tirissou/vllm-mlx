@@ -170,6 +170,7 @@ class TestIncrementalCacheEval:
 
         # Create a mock request with extracted cache (dict-state format)
         from vllm_mlx.kv_cache import RequestCacheState
+
         mock_request = MagicMock()
         mock_request.prompt_token_ids = [1, 2, 3]
         mock_request.output_token_ids = [4, 5]
@@ -177,10 +178,12 @@ class TestIncrementalCacheEval:
         mock_values_1 = MagicMock()
         mock_keys_2 = MagicMock()
         mock_values_2 = MagicMock()
-        mock_request._cache_state = RequestCacheState(decoded_cache=[
-            {"state": (mock_keys_1, mock_values_1)},
-            {"state": (mock_keys_2, mock_values_2)},
-        ])
+        mock_request._cache_state = RequestCacheState(
+            decoded_cache=[
+                {"state": (mock_keys_1, mock_values_1)},
+                {"state": (mock_keys_2, mock_values_2)},
+            ]
+        )
 
         scheduler.running["req-1"] = mock_request
 
@@ -200,6 +203,7 @@ class TestIncrementalCacheEval:
         scheduler = _make_scheduler()
 
         from vllm_mlx.kv_cache import RequestCacheState
+
         mock_request = MagicMock()
         mock_request.prompt_token_ids = [1, 2, 3]
         mock_request.output_token_ids = [4, 5]

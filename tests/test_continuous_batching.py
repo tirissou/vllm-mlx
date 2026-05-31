@@ -206,13 +206,17 @@ class TestContinuousBatchingIntegration:
             request_ids = [
                 await engine.add_request(p, params) for p in formatted_prompts
             ]
-            results = await asyncio.gather(*[get_result(engine, r) for r in request_ids])
+            results = await asyncio.gather(
+                *[get_result(engine, r) for r in request_ids]
+            )
             batch_time = time.perf_counter() - start
 
         batch_tokens = sum(results)
         batch_throughput = batch_tokens / batch_time
 
-        print(f"\nBatch:      {len(prompts)} requests in {batch_time:.2f}s, {batch_throughput:.1f} tok/s")
+        print(
+            f"\nBatch:      {len(prompts)} requests in {batch_time:.2f}s, {batch_throughput:.1f} tok/s"
+        )
 
         # Sequential pass: one request at a time
         async with AsyncEngineCore(model, tokenizer, config) as engine:
@@ -227,7 +231,9 @@ class TestContinuousBatchingIntegration:
 
         seq_throughput = seq_tokens / seq_time
 
-        print(f"Sequential: {len(prompts)} requests in {seq_time:.2f}s, {seq_throughput:.1f} tok/s")
+        print(
+            f"Sequential: {len(prompts)} requests in {seq_time:.2f}s, {seq_throughput:.1f} tok/s"
+        )
         print(f"Speedup: {batch_throughput / seq_throughput:.2f}x")
 
         assert all(t > 0 for t in results)

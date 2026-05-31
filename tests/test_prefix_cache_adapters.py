@@ -9,13 +9,16 @@ from vllm_mlx.prefix_cache_adapters import TurnCacheManager
 
 def test_cache_manager_is_abstract():
     from vllm_mlx.prefix_cache_adapters import CacheManager
+
     assert issubclass(CacheManager, ABC)
 
 
 def test_cache_manager_abstract_methods():
     from vllm_mlx.prefix_cache_adapters import CacheManager
+
     abstract = {
-        name for name, val in inspect.getmembers(CacheManager)
+        name
+        for name, val in inspect.getmembers(CacheManager)
         if getattr(val, "__isabstractmethod__", False)
     }
     assert "boundaries" in abstract
@@ -25,6 +28,7 @@ def test_cache_manager_abstract_methods():
 
 def test_cache_manager_cannot_be_instantiated():
     from vllm_mlx.prefix_cache_adapters import CacheManager
+
     try:
         CacheManager()
         assert False, "Expected TypeError"
@@ -57,6 +61,7 @@ def _make_turn_cache_request(
     prompt_token_ids, output_token_ids, turn_boundaries, boundary_states=None, path=None
 ):
     from vllm_mlx.kv_cache import RequestCacheState
+
     req = MagicMock()
     req.prompt_token_ids = prompt_token_ids
     req.output_token_ids = output_token_ids
@@ -132,6 +137,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     from vllm_mlx.kv_cache import RequestCacheState
     from vllm_mlx.cache_types import KVLayerSegment
     from vllm_mlx.kv_cache import QuantizedArray
+
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
     new_node = MagicMock(n_tokens=5)
@@ -141,16 +147,23 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     request = MagicMock()
     cs = RequestCacheState(cached_tokens=0, turn_path=[])
     request._cache_state = cs
-    request.prompt_token_ids = list(range(10))  # 10 tokens; B_sys=5 → sys=[0-4], user=[5-9]
+    request.prompt_token_ids = list(
+        range(10)
+    )  # 10 tokens; B_sys=5 → sys=[0-4], user=[5-9]
     request._turn_boundaries = [5]
 
     # Patch _segment so it returns empty sparse lists without needing real arrays
     import mlx.core as mx
-    qa = QuantizedArray(packed=mx.zeros((1,1,1,1), dtype=mx.uint32),
-                        scales=mx.zeros((1,1,1,1), dtype=mx.bfloat16),
-                        biases=mx.zeros((1,1,1,1), dtype=mx.bfloat16))
-    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={'layer_index': 0})
-    with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])):
+
+    qa = QuantizedArray(
+        packed=mx.zeros((1, 1, 1, 1), dtype=mx.uint32),
+        scales=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+        biases=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+    )
+    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={"layer_index": 0})
+    with patch.object(
+        TurnCacheManager, "_segment", return_value=([kv_placeholder], [None])
+    ):
         extracted = [{"state": (None, None), "class_name": "KVCache"}]
         adapter.on_prefill_checkpoint(request, 5, extracted)
 
@@ -161,6 +174,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
 
 def test_turn_cache_adapter_on_prefill_checkpoint_ignores_non_boundary():
     from vllm_mlx.kv_cache import RequestCacheState
+
     inner = MagicMock()
     inner.root = MagicMock(n_tokens=0)
     inner.split_cache_arrays.return_value = ([], None)
@@ -180,6 +194,7 @@ import mlx.core as mx
 
 def _make_kv_cache():
     from mlx_lm.models.cache import KVCache
+
     c = KVCache()
     c.keys = mx.zeros((1, 8, 4, 64))
     c.values = mx.zeros((1, 8, 4, 64))
@@ -189,13 +204,16 @@ def _make_kv_cache():
 
 def _make_recurrent_layer():
     """A fake recurrent cache layer (no .offset or .keys attributes)."""
+
     class FakeRecurrent:
         pass
+
     return FakeRecurrent()
 
 
 def test_extract_recurrent_state_returns_only_non_kv_layers():
     from vllm_mlx.kv_cache import extract_recurrent_state as _extract_recurrent_state
+
     kv = _make_kv_cache()
     recur = _make_recurrent_layer()
     result = _extract_recurrent_state([kv, recur, kv])
@@ -205,6 +223,7 @@ def test_extract_recurrent_state_returns_only_non_kv_layers():
 
 def test_extract_recurrent_state_empty_for_pure_kv():
     from vllm_mlx.kv_cache import extract_recurrent_state as _extract_recurrent_state
+
     result = _extract_recurrent_state([_make_kv_cache(), _make_kv_cache()])
     assert result == []
 
@@ -214,8 +233,11 @@ class TestBuildPrefixCache:
 
     def _config(self, **kwargs):
         from vllm_mlx.scheduler import SchedulerConfig
+
         # Disable all backends by default so tests opt-in explicitly
-        base = dict(use_paged_cache=False, use_memory_aware_cache=False, use_turn_cache=False)
+        base = dict(
+            use_paged_cache=False, use_memory_aware_cache=False, use_turn_cache=False
+        )
         base.update(kwargs)
         return SchedulerConfig(**base)
 
@@ -225,7 +247,9 @@ class TestBuildPrefixCache:
 
         mock_tc = MagicMock()
         with patch("vllm_mlx.turn_prefix_cache.TurnPrefixCache", return_value=mock_tc):
-            bundle = _build_prefix_cache(self._config(use_turn_cache=True), model=object())
+            bundle = _build_prefix_cache(
+                self._config(use_turn_cache=True), model=object()
+            )
 
         assert isinstance(bundle.adapter, TurnCacheManager)
         assert bundle.turn_cache is mock_tc
@@ -233,13 +257,15 @@ class TestBuildPrefixCache:
         assert bundle.prefix_cache is None
 
 
-
 def test_request_cache_state_is_single_attribute():
     """After wiring, all cache state lives at request._cache_state."""
     from vllm_mlx.kv_cache import RequestCacheState
+
     cs = RequestCacheState(hit_type="hit", cached_tokens=42)
+
     class FakeRequest:
         pass
+
     req = FakeRequest()
     req._cache_state = cs
     assert req._cache_state.hit_type == "hit"
@@ -249,14 +275,14 @@ def test_request_cache_state_is_single_attribute():
 from vllm_mlx.scheduler import _build_prefix_cache, SchedulerConfig
 from unittest.mock import MagicMock
 
-
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Task 4: TurnCacheManager new interface tests
 # ════════════════════════════════════════════════════════════════════════════
 
-def _make_request(prompt_token_ids, turn_boundaries, output_token_ids=None, cached_tokens=0):
+
+def _make_request(
+    prompt_token_ids, turn_boundaries, output_token_ids=None, cached_tokens=0
+):
     req = MagicMock()
     req.prompt_token_ids = prompt_token_ids
     req.output_token_ids = output_token_ids or []
@@ -274,6 +300,7 @@ def _make_inner():
 
 
 # ── boundaries() ─────────────────────────────────────────────────────────────
+
 
 def test_boundaries_no_hit_returns_raw_turn_boundaries():
     adapter = TurnCacheManager(_make_inner())
@@ -319,6 +346,7 @@ def test_boundaries_empty_when_no_turn_boundaries():
 
 # ── messages_to_segments() ───────────────────────────────────────────────────
 
+
 def test_messages_to_segments_system_only_prompt_returns_one_segment():
     """System-only prompt (boundary at or beyond token count) should cache the system segment."""
     req = _make_request(
@@ -360,6 +388,7 @@ def test_messages_to_segments_boundary_at_zero_returns_empty():
 
 
 # ── fetch() ──────────────────────────────────────────────────────────────────
+
 
 def test_fetch_miss_returns_none():
     inner = _make_inner()
@@ -407,6 +436,7 @@ def test_fetch_does_not_set_prefill_boundaries():
 
 # ── store() ──────────────────────────────────────────────────────────────────
 
+
 def test_store_uses_explicit_tokens_not_cache_state():
     """store(request, tokens, cache) must not read store_tokens from cs."""
     inner = _make_inner()
@@ -432,7 +462,10 @@ def test_store_reads_turn_path_from_cache_state():
     req = _make_request(
         prompt_token_ids=[1, 2, 3, 4, 5],
         turn_boundaries=[3],
-        output_token_ids=[6, 7],   # must be non-empty — store() returns False with no output
+        output_token_ids=[
+            6,
+            7,
+        ],  # must be non-empty — store() returns False with no output
     )
     req._cache_state.turn_path = [parent_node]
     adapter.store(req, [1, 2, 3, 4, 5, 6], [])
@@ -444,9 +477,11 @@ def test_store_reads_turn_path_from_cache_state():
 
 # ── on_prefill_checkpoint() ───────────────────────────────────────────────────
 
+
 def test_on_prefill_checkpoint_at_boundary_inserts_node():
     from vllm_mlx.cache_types import KVLayerSegment
     from vllm_mlx.kv_cache import QuantizedArray
+
     inner = _make_inner()
     new_node = MagicMock(n_tokens=10)
     inner.insert.return_value = new_node
@@ -457,14 +492,23 @@ def test_on_prefill_checkpoint_at_boundary_inserts_node():
         cached_tokens=0,
     )
     req._cache_state.turn_path = []
-    extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}]
+    extracted = [
+        {"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}
+    ]
     import mlx.core as mx
-    qa = QuantizedArray(packed=mx.zeros((1,1,1,1), dtype=mx.uint32),
-                        scales=mx.zeros((1,1,1,1), dtype=mx.bfloat16),
-                        biases=mx.zeros((1,1,1,1), dtype=mx.bfloat16))
-    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={'layer_index': 0})
-    with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])):
-        adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
+
+    qa = QuantizedArray(
+        packed=mx.zeros((1, 1, 1, 1), dtype=mx.uint32),
+        scales=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+        biases=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+    )
+    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={"layer_index": 0})
+    with patch.object(
+        TurnCacheManager, "_segment", return_value=([kv_placeholder], [None])
+    ):
+        adapter.on_prefill_checkpoint(
+            req, total_tokens_prefilled=10, extracted_cache=extracted
+        )
     assert inner.insert.called
     assert new_node in req._cache_state.turn_path
 
@@ -477,8 +521,12 @@ def test_on_prefill_checkpoint_not_at_boundary_is_noop():
         turn_boundaries=[10],
         cached_tokens=0,
     )
-    extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}]
-    adapter.on_prefill_checkpoint(req, total_tokens_prefilled=7, extracted_cache=extracted)
+    extracted = [
+        {"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("5",)}
+    ]
+    adapter.on_prefill_checkpoint(
+        req, total_tokens_prefilled=7, extracted_cache=extracted
+    )
     inner.insert.assert_not_called()
 
 
@@ -486,6 +534,7 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     """Prefill boundaries store cache @ N, not N-1; n_minus_one_state must be ignored."""
     from vllm_mlx.cache_types import KVLayerSegment
     from vllm_mlx.kv_cache import QuantizedArray
+
     inner = _make_inner()
     adapter = TurnCacheManager(inner)
     req = _make_request(
@@ -493,16 +542,27 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
         turn_boundaries=[10],
         cached_tokens=0,
     )
-    extracted = [{"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}]
+    extracted = [
+        {"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}
+    ]
     # Verify that on_prefill_checkpoint delegates to _segment (not inner.split_cache_arrays)
     import mlx.core as mx
-    qa = QuantizedArray(packed=mx.zeros((1,1,1,1), dtype=mx.uint32),
-                        scales=mx.zeros((1,1,1,1), dtype=mx.bfloat16),
-                        biases=mx.zeros((1,1,1,1), dtype=mx.bfloat16))
-    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={'layer_index': 0})
-    with patch.object(TurnCacheManager, '_segment', return_value=([kv_placeholder], [None])) as mock_seg:
-        adapter.on_prefill_checkpoint(req, total_tokens_prefilled=10, extracted_cache=extracted)
+
+    qa = QuantizedArray(
+        packed=mx.zeros((1, 1, 1, 1), dtype=mx.uint32),
+        scales=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+        biases=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
+    )
+    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={"layer_index": 0})
+    with patch.object(
+        TurnCacheManager, "_segment", return_value=([kv_placeholder], [None])
+    ) as mock_seg:
+        adapter.on_prefill_checkpoint(
+            req, total_tokens_prefilled=10, extracted_cache=extracted
+        )
     # _segment should have been called with extracted_cache plus group_size and bits
-    mock_seg.assert_called_once_with(extracted, adapter._kv_group_size, adapter._kv_bits)
+    mock_seg.assert_called_once_with(
+        extracted, adapter._kv_group_size, adapter._kv_bits
+    )
     # inner.split_cache_arrays must NOT be called (it was the old API)
     inner.split_cache_arrays.assert_not_called()

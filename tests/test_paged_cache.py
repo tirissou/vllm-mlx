@@ -981,11 +981,16 @@ class TestBlockAwarePrefixCache:
         for i, layer in enumerate(reconstructed):
             assert isinstance(layer, KVCache), f"layer {i} is {type(layer)}"
             assert layer.keys is not None
-            assert layer.keys.shape == (1, n_kv_heads, seq_len, head_dim), \
-                f"layer {i} keys shape {layer.keys.shape}"
+            assert layer.keys.shape == (
+                1,
+                n_kv_heads,
+                seq_len,
+                head_dim,
+            ), f"layer {i} keys shape {layer.keys.shape}"
             # Verify the reconstructed keys match what was stored
-            assert layer.keys.tolist() == raw_cache[i].keys.tolist(), \
-                f"layer {i} keys mismatch"
+            assert (
+                layer.keys.tolist() == raw_cache[i].keys.tolist()
+            ), f"layer {i} keys mismatch"
 
     def test_hybrid_model_terminal_block_match(self):
         """Hybrid recurrent+attention models (e.g. Qwen3-Next) store recurrent
@@ -1014,9 +1019,9 @@ class TestBlockAwarePrefixCache:
         head_dim = 4
 
         # KVCache layer: 4D (1, H, L, D) — sliceable per block
-        kv_keys = mx.arange(1 * n_kv_heads * total_tokens * head_dim, dtype=mx.float32).reshape(
-            1, n_kv_heads, total_tokens, head_dim
-        )
+        kv_keys = mx.arange(
+            1 * n_kv_heads * total_tokens * head_dim, dtype=mx.float32
+        ).reshape(1, n_kv_heads, total_tokens, head_dim)
         kv_values = kv_keys * 2
 
         kv_layer = KVCache()
@@ -1025,7 +1030,7 @@ class TestBlockAwarePrefixCache:
         kv_layer.offset = total_tokens
 
         # ArraysCache layer: recurrent state — NOT sliceable (mixed 3D/4D shapes)
-        conv_state = mx.ones((1, 3, 8))    # 3D — conv buffer
+        conv_state = mx.ones((1, 3, 8))  # 3D — conv buffer
         ssm_state = mx.ones((1, 2, 3, 4))  # 4D — SSM state
 
         arrays_layer = ArraysCache(size=2)
@@ -1058,17 +1063,20 @@ class TestBlockAwarePrefixCache:
         second_tokens = tokens + [999, 1000]
         block_table2, remaining = cache.fetch_cache("req-2", second_tokens)
 
-        assert block_table2 is not None, \
-            "Expected cache hit including terminal block"
-        assert remaining == [999, 1000], \
-            f"Expected only the 2 new tokens remaining, got {remaining}"
-        assert block_table2.num_tokens == total_tokens, \
-            f"Expected {total_tokens} cached tokens, got {block_table2.num_tokens}"
+        assert block_table2 is not None, "Expected cache hit including terminal block"
+        assert remaining == [
+            999,
+            1000,
+        ], f"Expected only the 2 new tokens remaining, got {remaining}"
+        assert (
+            block_table2.num_tokens == total_tokens
+        ), f"Expected {total_tokens} cached tokens, got {block_table2.num_tokens}"
 
         reconstructed = cache.reconstruct_cache(block_table2)
 
-        assert reconstructed is not None, \
-            "reconstruct_cache must succeed when terminal block is included"
+        assert (
+            reconstructed is not None
+        ), "reconstruct_cache must succeed when terminal block is included"
         assert len(reconstructed) == 2
 
         # KVCache layer: keys should cover all total_tokens

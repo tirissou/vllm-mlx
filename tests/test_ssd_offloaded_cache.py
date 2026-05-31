@@ -64,7 +64,9 @@ class TestSSDOffloadedCacheFetch:
     def test_returns_inner_hit_when_inner_has_cache(self):
         inner = _make_inner()
         store = _make_store()
-        hit = CacheHit(cache=[[1]], cached_tokens=3, remaining_tokens=[], hit_type="hit")
+        hit = CacheHit(
+            cache=[[1]], cached_tokens=3, remaining_tokens=[], hit_type="hit"
+        )
         inner.fetch.return_value = hit
         cache = SSDOffloadedCache(inner, store)
         req = _make_request([1, 2, 3])

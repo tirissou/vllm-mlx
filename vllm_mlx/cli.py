@@ -294,7 +294,11 @@ def serve_command(args):
             print(
                 f"Turn cache: stride={getattr(args, 'turn_cache_stride', 512)} tokens, "
                 f"memory={getattr(args, 'turn_cache_memory_gb', 20.0)}GB"
-                + (f", SSD={getattr(args, 'turn_cache_ssd_gb', 50.0)}GB" if getattr(args, "turn_cache_ssd_gb", 50.0) > 0 else "")
+                + (
+                    f", SSD={getattr(args, 'turn_cache_ssd_gb', 50.0)}GB"
+                    if getattr(args, "turn_cache_ssd_gb", 50.0) > 0
+                    else ""
+                )
             )
     else:
         print("Mode: Simple (maximum throughput)")
@@ -331,6 +335,7 @@ def serve_command(args):
         cache_key_log = getattr(args, "cache_key_log", None)
         if cache_key_log and scheduler_config is None:
             from .scheduler import SchedulerConfig
+
             scheduler_config = SchedulerConfig(cache_key_log_path=cache_key_log)
         load_model(
             args.model,
@@ -1161,7 +1166,7 @@ Examples:
         action="store_true",
         default=False,
         help="Enable TurnPrefixCache (conversation-turn-level prefix trie). "
-             "Recommended for hybrid models (Qwen3.5-27B, etc.).",
+        "Recommended for hybrid models (Qwen3.5-27B, etc.).",
     )
     serve_parser.add_argument(
         "--turn-cache-stride",
@@ -1169,7 +1174,7 @@ Examples:
         default=512,
         metavar="N",
         help="Tokens between permanent recurrent checkpoints in TurnPrefixCache. "
-             "0 = checkpoint every turn (eager). Default: 512.",
+        "0 = checkpoint every turn (eager). Default: 512.",
     )
     serve_parser.add_argument(
         "--turn-cache-memory-gb",
@@ -1542,7 +1547,7 @@ Examples:
         action="store_true",
         default=False,
         help="Enable TurnPrefixCache (conversation-turn-level prefix trie). "
-             "Recommended for hybrid models (Qwen3.5-27B, etc.).",
+        "Recommended for hybrid models (Qwen3.5-27B, etc.).",
     )
     bench_parser.add_argument(
         "--turn-cache-stride",
@@ -1550,7 +1555,7 @@ Examples:
         default=512,
         metavar="N",
         help="Tokens between permanent recurrent checkpoints in TurnPrefixCache. "
-             "0 = checkpoint every turn (eager). Default: 512.",
+        "0 = checkpoint every turn (eager). Default: 512.",
     )
     bench_parser.add_argument(
         "--turn-cache-memory-gb",

@@ -641,7 +641,9 @@ class EngineCore:
         executor = self._worker_executor
         if executor is not None:
             try:
-                return executor.submit(self.scheduler.save_cache_to_disk, cache_dir).result()
+                return executor.submit(
+                    self.scheduler.save_cache_to_disk, cache_dir
+                ).result()
             except RuntimeError:
                 pass  # executor already shut down
         return self.scheduler.save_cache_to_disk(cache_dir)

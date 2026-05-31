@@ -366,21 +366,23 @@ class TestMakeQuantizedCache:
 
         model = self._fake_model_layers(n=4)
         left_padding = [0, 0]
-        cache = _make_quantized_cache(model, left_padding, max_kv_size=None,
-                                      group_size=64, bits=4)
+        cache = _make_quantized_cache(
+            model, left_padding, max_kv_size=None, group_size=64, bits=4
+        )
         assert len(cache) == 4
         for layer in cache:
-            assert isinstance(layer, BatchQuantizedKVCache), (
-                f"Expected BatchQuantizedKVCache, got {type(layer)}"
-            )
+            assert isinstance(
+                layer, BatchQuantizedKVCache
+            ), f"Expected BatchQuantizedKVCache, got {type(layer)}"
 
     def test_group_size_and_bits_propagated(self):
         from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
         from vllm_mlx.scheduler import _make_quantized_cache
 
         model = self._fake_model_layers(n=2)
-        cache = _make_quantized_cache(model, [0], max_kv_size=None,
-                                      group_size=32, bits=8)
+        cache = _make_quantized_cache(
+            model, [0], max_kv_size=None, group_size=32, bits=8
+        )
         for layer in cache:
             assert layer.group_size == 32
             assert layer.bits == 8
@@ -398,8 +400,9 @@ class TestMakeQuantizedCache:
             layers = [FakeLayer() for _ in range(3)]
             # no make_cache method
 
-        cache = _make_quantized_cache(SimpleModel(), [0, 0, 0], max_kv_size=None,
-                                      group_size=64, bits=4)
+        cache = _make_quantized_cache(
+            SimpleModel(), [0, 0, 0], max_kv_size=None, group_size=64, bits=4
+        )
         assert len(cache) == 3
         for layer in cache:
             assert isinstance(layer, BatchQuantizedKVCache)
@@ -417,16 +420,19 @@ class TestMakeQuantizedCache:
                 arrays = ArraysCache(size=1)
                 return [KVCache(), arrays]
 
-        cache = _make_quantized_cache(FakeModel(), [0], max_kv_size=None,
-                                      group_size=64, bits=4)
+        cache = _make_quantized_cache(
+            FakeModel(), [0], max_kv_size=None, group_size=64, bits=4
+        )
         assert isinstance(cache[0], BatchQuantizedKVCache)
         assert isinstance(cache[1], ArraysCache)
-
 
     def test_kvcache_subclass_gets_replaced(self):
         """isinstance check: a KVCache subclass must be converted to BatchQuantizedKVCache."""
         from mlx_lm.models.cache import KVCache
-        from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache, make_quantized_cache
+        from vllm_mlx.batch_quantized_kv_cache import (
+            BatchQuantizedKVCache,
+            make_quantized_cache,
+        )
 
         class MyKVCache(KVCache):
             pass
@@ -438,9 +444,9 @@ class TestMakeQuantizedCache:
                 return [MyKVCache()]
 
         cache = make_quantized_cache(FakeModel(), [0], max_kv_size=None)
-        assert isinstance(cache[0], BatchQuantizedKVCache), (
-            f"Expected BatchQuantizedKVCache, got {type(cache[0])}"
-        )
+        assert isinstance(
+            cache[0], BatchQuantizedKVCache
+        ), f"Expected BatchQuantizedKVCache, got {type(cache[0])}"
 
 
 class TestInstallChunkedPrefillAcceptsKvQuantParams:
@@ -452,7 +458,9 @@ class TestInstallChunkedPrefillAcceptsKvQuantParams:
 
         bg = MagicMock()
         bg._next = MagicMock()
-        _install_chunked_prefill(bg, budget=256, kv_quant=True, kv_bits=4, kv_group_size=64)
+        _install_chunked_prefill(
+            bg, budget=256, kv_quant=True, kv_bits=4, kv_group_size=64
+        )
 
     def test_accepts_kv_quant_false(self):
         from unittest.mock import MagicMock

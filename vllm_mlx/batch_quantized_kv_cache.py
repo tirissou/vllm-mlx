@@ -57,17 +57,21 @@ class BatchQuantizedKVCache(_BaseCache):
                 )
 
             def expand_quant(qa: QuantizedArray) -> QuantizedArray:
-                return QuantizedArray(*[
-                    mx.concatenate(
-                        [c, mx.zeros((*shape, c.shape[-1]), dtype=c.dtype)], axis=2
-                    )
-                    for c in qa
-                ])
+                return QuantizedArray(
+                    *[
+                        mx.concatenate(
+                            [c, mx.zeros((*shape, c.shape[-1]), dtype=c.dtype)], axis=2
+                        )
+                        for c in qa
+                    ]
+                )
 
             if self.keys is not None:
                 if prev % self.step != 0:
                     self.keys = QuantizedArray(*[k[..., :prev, :] for k in self.keys])
-                    self.values = QuantizedArray(*[v[..., :prev, :] for v in self.values])
+                    self.values = QuantizedArray(
+                        *[v[..., :prev, :] for v in self.values]
+                    )
                 self.keys = expand_quant(self.keys)
                 self.values = expand_quant(self.values)
             else:
@@ -119,9 +123,9 @@ class BatchQuantizedKVCache(_BaseCache):
             return
 
         def roll_qa(qa):
-            return QuantizedArray(*[
-                dynamic_roll(c, padding[:, None], axis=2) for c in qa
-            ])
+            return QuantizedArray(
+                *[dynamic_roll(c, padding[:, None], axis=2) for c in qa]
+            )
 
         self.keys = roll_qa(self.keys)
         self.values = roll_qa(self.values)
@@ -184,8 +188,12 @@ class BatchQuantizedKVCache(_BaseCache):
         min_left_pad = self.left_padding.min().item()
         if min_left_pad > 0:
             if self.keys is not None:
-                self.keys = QuantizedArray(*[k[..., min_left_pad:, :] for k in self.keys])
-                self.values = QuantizedArray(*[v[..., min_left_pad:, :] for v in self.values])
+                self.keys = QuantizedArray(
+                    *[k[..., min_left_pad:, :] for k in self.keys]
+                )
+                self.values = QuantizedArray(
+                    *[v[..., min_left_pad:, :] for v in self.values]
+                )
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 
@@ -216,14 +224,24 @@ class BatchQuantizedKVCache(_BaseCache):
             left = max_idx - c._idx
             if c.keys is None:
                 Bc = c.offset.shape[0]
-                k_pads = QuantizedArray(*[
-                    mx.zeros((Bc, ref_keys[i].shape[1], max_size, ref_keys[i].shape[-1]), dtype=ref_keys[i].dtype)
-                    for i in range(3)
-                ])
-                v_pads = QuantizedArray(*[
-                    mx.zeros((Bc, ref_vals[i].shape[1], max_size, ref_vals[i].shape[-1]), dtype=ref_vals[i].dtype)
-                    for i in range(3)
-                ])
+                k_pads = QuantizedArray(
+                    *[
+                        mx.zeros(
+                            (Bc, ref_keys[i].shape[1], max_size, ref_keys[i].shape[-1]),
+                            dtype=ref_keys[i].dtype,
+                        )
+                        for i in range(3)
+                    ]
+                )
+                v_pads = QuantizedArray(
+                    *[
+                        mx.zeros(
+                            (Bc, ref_vals[i].shape[1], max_size, ref_vals[i].shape[-1]),
+                            dtype=ref_vals[i].dtype,
+                        )
+                        for i in range(3)
+                    ]
+                )
                 return k_pads, v_pads, c.offset, c.left_padding + left
 
             right = max_size - c.keys.packed.shape[2] - left
@@ -245,8 +263,12 @@ class BatchQuantizedKVCache(_BaseCache):
         sk, sv, so, slp = _pad_cache(self)
         ok, ov, oo, olp = _pad_cache(other)
 
-        self.keys = QuantizedArray(*[mx.concatenate([s, o], axis=0) for s, o in zip(sk, ok)])
-        self.values = QuantizedArray(*[mx.concatenate([s, o], axis=0) for s, o in zip(sv, ov)])
+        self.keys = QuantizedArray(
+            *[mx.concatenate([s, o], axis=0) for s, o in zip(sk, ok)]
+        )
+        self.values = QuantizedArray(
+            *[mx.concatenate([s, o], axis=0) for s, o in zip(sv, ov)]
+        )
         self.offset = mx.concatenate([so, oo])
         self.left_padding = mx.concatenate([slp, olp])
         self._idx = max_idx
@@ -301,7 +323,7 @@ class BatchQuantizedKVCache(_BaseCache):
             arrays = []
             for p, l, c in zip(padding, lengths, caches):
                 comp = getattr(c, attr)[comp_idx]  # [1, H, T_alloc, D']
-                comp = comp[..., :l, :]            # slice to actual tokens
+                comp = comp[..., :l, :]  # slice to actual tokens
                 if p > 0:
                     pad_shape = list(comp.shape)
                     pad_shape[2] = p
@@ -313,7 +335,9 @@ class BatchQuantizedKVCache(_BaseCache):
 
         result = cls(padding, group_size=group_size, bits=bits)
         result.keys = QuantizedArray(*[merge_component(i, "keys") for i in range(3)])
-        result.values = QuantizedArray(*[merge_component(i, "values") for i in range(3)])
+        result.values = QuantizedArray(
+            *[merge_component(i, "values") for i in range(3)]
+        )
         result._idx = max_length
         result.offset += max_length  # -padding + max_length = lengths
         return result
@@ -349,11 +373,15 @@ class BatchQuantizedKVCache(_BaseCache):
         k = bkv.keys[..., : bkv._idx, :]
         v = bkv.values[..., : bkv._idx, :]
         result.keys = QuantizedArray(*mx.quantize(k, group_size=group_size, bits=bits))
-        result.values = QuantizedArray(*mx.quantize(v, group_size=group_size, bits=bits))
+        result.values = QuantizedArray(
+            *mx.quantize(v, group_size=group_size, bits=bits)
+        )
         return result
 
 
-def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4):
+def make_quantized_cache(
+    model, left_padding, max_kv_size, group_size: int = 64, bits: int = 4
+):
     """Like mlx-lm's _make_cache but emits BatchQuantizedKVCache for KV layers.
 
     ArraysCache (recurrent) and RotatingKVCache layers are left unchanged
@@ -386,13 +414,16 @@ def make_quantized_cache(model, left_padding, max_kv_size, group_size: int = 64,
         return [to_quantized_batch(c) for c in model.make_cache()]
     if max_kv_size is not None:
         from mlx_lm.models.cache import BatchRotatingKVCache
+
         return [BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers]
-    return [BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
-            for _ in model.layers]
+    return [
+        BatchQuantizedKVCache(left_padding, group_size=group_size, bits=bits)
+        for _ in model.layers
+    ]
 
 
 # Patch QuantizedKVCache.merge so that single-sequence caches extracted from a batch
 # merge back into BatchQuantizedKVCache — following the mlx-lm KVCache↔BatchKVCache pattern.
-QuantizedKVCache.merge = classmethod(lambda cls, caches: BatchQuantizedKVCache.merge(caches))
-
-
+QuantizedKVCache.merge = classmethod(
+    lambda cls, caches: BatchQuantizedKVCache.merge(caches)
+)

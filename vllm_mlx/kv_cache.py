@@ -19,9 +19,9 @@ class QuantizedArray(NamedTuple):
     NamedTuple so mx.eval traverses it as a pytree — critical for chunked prefill.
     """
 
-    packed: mx.array   # uint32
-    scales: mx.array   # bfloat16
-    biases: mx.array   # bfloat16
+    packed: mx.array  # uint32
+    scales: mx.array  # bfloat16
+    biases: mx.array  # bfloat16
 
     @property
     def nbytes(self) -> int:
@@ -44,10 +44,14 @@ class RequestCacheState:
 
     # Set by Scheduler during decode / cleanup pipeline
     decoded_cache: list | None = None
-    prev_recurrent: list | None = None   # N-1 recurrent snapshot; was set dynamically before
+    prev_recurrent: list | None = (
+        None  # N-1 recurrent snapshot; was set dynamically before
+    )
 
     # Owned by TurnCacheManager across the request lifecycle
-    turn_path: list = field(default_factory=list)   # list[TurnNode]; typed replacement for adapter_state
+    turn_path: list = field(
+        default_factory=list
+    )  # list[TurnNode]; typed replacement for adapter_state
 
 
 @dataclass
@@ -56,6 +60,7 @@ class CacheIndexMap:
 
     Designed for future save/load: plain index lists, cleanly serializable.
     """
+
     kv_indices: list[int]
     rotating_indices: list[int]
     recurrent_indices: list[int]
@@ -65,10 +70,10 @@ class CacheIndexMap:
 class CacheHit:
     """Returned by PrefixCache.fetch on a successful prefix match."""
 
-    cache: list                    # per-layer KV state
+    cache: list  # per-layer KV state
     cached_tokens: int
-    remaining_tokens: list         # tokens not yet covered by cache
-    handle: Any = None             # opaque value passed back to release()
+    remaining_tokens: list  # tokens not yet covered by cache
+    handle: Any = None  # opaque value passed back to release()
     hit_type: str = "hit"
     prefill_boundaries: list = field(default_factory=list)
 
@@ -221,6 +226,7 @@ def extract_layer_state(layer) -> dict | None:
     # (slicing, _segment) can assume a uniform (keys, values) structure.
     if isinstance(raw_state[0], (list, tuple)):
         from mlx_lm.models.cache import QuantizedKVCache
+
         if isinstance(layer, QuantizedKVCache):
             dq_keys = mx.dequantize(
                 *raw_state[0], group_size=layer.group_size, bits=layer.bits
@@ -245,9 +251,16 @@ def _build_batch_kv_types() -> tuple:
     recurrent (non-KV) layers in a batch generator's prompt_cache list.
     """
     from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache, QuantizedKVCache
+
     try:
         from .batch_quantized_kv_cache import BatchQuantizedKVCache
-        return (BatchKVCache, BatchRotatingKVCache, QuantizedKVCache, BatchQuantizedKVCache)
+
+        return (
+            BatchKVCache,
+            BatchRotatingKVCache,
+            QuantizedKVCache,
+            BatchQuantizedKVCache,
+        )
     except ImportError:
         return (BatchKVCache, BatchRotatingKVCache, QuantizedKVCache)
 
@@ -261,10 +274,25 @@ def extract_recurrent_state(cache: list) -> list:
     KV layers have an `offset` attribute and a `keys` attribute.
     Recurrent layers (Mamba, DeltaRNN) have neither.
     """
-    from mlx_lm.models.cache import KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache
+    from mlx_lm.models.cache import (
+        KVCache,
+        BatchKVCache,
+        RotatingKVCache,
+        QuantizedKVCache,
+    )
+
     try:
-        from .batch_quantized_kv_cache import BatchQuantizedKVCache as _QuantizedCacheWrapper
-        kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache, _QuantizedCacheWrapper)
+        from .batch_quantized_kv_cache import (
+            BatchQuantizedKVCache as _QuantizedCacheWrapper,
+        )
+
+        kv_types = (
+            KVCache,
+            BatchKVCache,
+            RotatingKVCache,
+            QuantizedKVCache,
+            _QuantizedCacheWrapper,
+        )
     except ImportError:
         kv_types = (KVCache, BatchKVCache, RotatingKVCache, QuantizedKVCache)
     return [layer for layer in cache if not isinstance(layer, kv_types)]
@@ -334,14 +362,25 @@ def reconstruct_cache_from_states(extracted_states: list) -> list | None:
 
             if class_name == "QuantizedRotatingKVCache":
                 from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
+
                 (w_k, s_k, b_k), (w_v, s_v, b_v) = state
                 n_tokens = int(meta_state[0]) if meta_state else 0
-                group_size = int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
+                group_size = (
+                    int(meta_state[1]) if meta_state and len(meta_state) > 1 else 64
+                )
                 bits = int(meta_state[2]) if meta_state and len(meta_state) > 2 else 4
-                max_size = int(meta_state[3]) if meta_state and len(meta_state) > 3 else n_tokens
+                max_size = (
+                    int(meta_state[3])
+                    if meta_state and len(meta_state) > 3
+                    else n_tokens
+                )
                 keep = int(meta_state[4]) if meta_state and len(meta_state) > 4 else 0
                 # meta_state[5] is total tokens seen (true offset); n_tokens is buffer size.
-                total_offset = int(meta_state[5]) if meta_state and len(meta_state) > 5 else n_tokens
+                total_offset = (
+                    int(meta_state[5])
+                    if meta_state and len(meta_state) > 5
+                    else n_tokens
+                )
                 keys = mx.dequantize(w_k, s_k, b_k, group_size=group_size, bits=bits)
                 values = mx.dequantize(w_v, s_v, b_v, group_size=group_size, bits=bits)
                 if keys.shape[2] > max_size:
@@ -357,6 +396,7 @@ def reconstruct_cache_from_states(extracted_states: list) -> list | None:
                     BatchKVCache as _BatchKVCache,
                     KVCache as _KVCache,
                 )
+
                 if cache_cls is _BatchKVCache:
                     keys, values = state[0], state[1]
                     cache = _KVCache()
@@ -372,9 +412,7 @@ def reconstruct_cache_from_states(extracted_states: list) -> list | None:
                     return None
                 cache = KVCache()
                 cache.keys, cache.values = state
-                cache.offset = (
-                    int(meta_state[0]) if meta_state else cache.keys.shape[2]
-                )
+                cache.offset = int(meta_state[0]) if meta_state else cache.keys.shape[2]
 
             caches.append(cache)
 

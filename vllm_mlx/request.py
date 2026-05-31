@@ -116,8 +116,12 @@ class Request:
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
-    _turn_boundaries: List[int] = field(default_factory=list)  # [B_sys, B_1, ..., B_{N-1}]
-    _boundary_states: Dict[int, Any] = field(default_factory=dict)  # boundary → extracted KV state
+    _turn_boundaries: List[int] = field(
+        default_factory=list
+    )  # [B_sys, B_1, ..., B_{N-1}]
+    _boundary_states: Dict[int, Any] = field(
+        default_factory=dict
+    )  # boundary → extracted KV state
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache

@@ -5,6 +5,7 @@ Verifies via the public interface (fetch / on_prefill_checkpoint / store) that
 using the cache system does not introduce numerical errors beyond the expected
 int8 quantization tolerance.
 """
+
 import math
 
 import mlx.core as mx
@@ -34,7 +35,7 @@ def _make_manager():
 def _make_request(request_id, token_ids, boundaries):
     req = Request(
         request_id=request_id,
-        prompt='',
+        prompt="",
         sampling_params=SamplingParams(),
         prompt_token_ids=token_ids,
         _turn_boundaries=boundaries,
@@ -47,7 +48,7 @@ class TestKVCacheRoundtrip:
     def test_cache_miss_on_first_request(self):
         """fetch returns None when nothing has been stored yet."""
         manager = _make_manager()
-        req = _make_request('r1', [0, 1, 2, 3], boundaries=[2])
+        req = _make_request("r1", [0, 1, 2, 3], boundaries=[2])
         assert manager.fetch(req) is None
 
     def test_cached_decode_attention_matches_fresh(self):
@@ -82,13 +83,15 @@ class TestKVCacheRoundtrip:
         mx.eval(logits_fresh)
 
         # --- Populate cache via public interface ---
-        req1 = _make_request('r1', token_ids, boundaries)
+        req1 = _make_request("r1", token_ids, boundaries)
         assert manager.fetch(req1) is None
 
         kv_sys = KVCache()
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
             kv_sys.update_and_fetch(k, v)
-        manager.on_prefill_checkpoint(req1, total_tokens_prefilled=n_sys, extracted_cache=[kv_sys])
+        manager.on_prefill_checkpoint(
+            req1, total_tokens_prefilled=n_sys, extracted_cache=[kv_sys]
+        )
 
         kv_full = KVCache()
         for k, v in zip(k_per_tok, v_per_tok):
@@ -97,7 +100,7 @@ class TestKVCacheRoundtrip:
         manager.store(req1, cache=[kv_full])
 
         # --- Cached path: fetch, prefill remaining, decode ---
-        req2 = _make_request('r2', token_ids, boundaries)
+        req2 = _make_request("r2", token_ids, boundaries)
         hit = manager.fetch(req2)
 
         assert hit is not None
@@ -107,8 +110,12 @@ class TestKVCacheRoundtrip:
         # hit.cache[0] is a QuantizedKVCache covering the first n_sys tokens
         assembled = hit.cache[0]
         raw_state = assembled.state
-        k_cached = mx.dequantize(*raw_state[0], group_size=assembled.group_size, bits=assembled.bits)
-        v_cached = mx.dequantize(*raw_state[1], group_size=assembled.group_size, bits=assembled.bits)
+        k_cached = mx.dequantize(
+            *raw_state[0], group_size=assembled.group_size, bits=assembled.bits
+        )
+        v_cached = mx.dequantize(
+            *raw_state[1], group_size=assembled.group_size, bits=assembled.bits
+        )
 
         k_remaining = mx.concatenate(k_per_tok[n_sys:], axis=-2)
         v_remaining = mx.concatenate(v_per_tok[n_sys:], axis=-2)
@@ -151,13 +158,15 @@ class TestRotatingKVCacheRoundtrip:
         mx.eval(logits_fresh)
 
         # --- Populate cache via public interface ---
-        req1 = _make_request('r1', token_ids, boundaries)
+        req1 = _make_request("r1", token_ids, boundaries)
         assert manager.fetch(req1) is None
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=0)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
             rk_sys.update_and_fetch(k, v)
-        manager.on_prefill_checkpoint(req1, total_tokens_prefilled=n_sys, extracted_cache=[rk_sys])
+        manager.on_prefill_checkpoint(
+            req1, total_tokens_prefilled=n_sys, extracted_cache=[rk_sys]
+        )
 
         rk_full = RotatingKVCache(max_size=max_size, keep=0)
         for k, v in zip(k_per_tok, v_per_tok):
@@ -166,7 +175,7 @@ class TestRotatingKVCacheRoundtrip:
         manager.store(req1, cache=[rk_full])
 
         # --- Cached path: fetch, continue with assembled cache ---
-        req2 = _make_request('r2', token_ids, boundaries)
+        req2 = _make_request("r2", token_ids, boundaries)
         hit = manager.fetch(req2)
 
         assert hit is not None
@@ -198,8 +207,8 @@ class TestRotatingKVCacheRoundtrip:
 
         manager = _make_manager()
 
-        max_size = 4   # small buffer so wrapping happens quickly
-        n_sys = 6      # n_sys > max_size — the ring has wrapped by the time we checkpoint
+        max_size = 4  # small buffer so wrapping happens quickly
+        n_sys = 6  # n_sys > max_size — the ring has wrapped by the time we checkpoint
         n_user = 2
         n_heads, head_dim = 1, 64
         token_ids = list(range(n_sys + n_user))
@@ -222,7 +231,7 @@ class TestRotatingKVCacheRoundtrip:
         mx.eval(logits_fresh)
 
         # --- Cached path ---
-        req1 = _make_request('r1', token_ids, boundaries)
+        req1 = _make_request("r1", token_ids, boundaries)
         assert manager.fetch(req1) is None
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=0)
@@ -238,7 +247,7 @@ class TestRotatingKVCacheRoundtrip:
         req1.output_token_ids = [999]
         manager.store(req1, cache=[rk_full])
 
-        req2 = _make_request('r2', token_ids, boundaries)
+        req2 = _make_request("r2", token_ids, boundaries)
         hit = manager.fetch(req2)
 
         assert hit is not None
@@ -277,22 +286,25 @@ class TestMultiTurnRoundtrip:
 
         n_sys, n_user1, n_asst1, n_user2 = 2, 2, 2, 2
         n_heads, head_dim = 2, 64
-        n_cached = n_sys + n_user1 + n_asst1   # positions covered by stored cache
-        n_total = n_cached + n_user2             # all turn-2 prefill positions
+        n_cached = n_sys + n_user1 + n_asst1  # positions covered by stored cache
+        n_total = n_cached + n_user2  # all turn-2 prefill positions
 
         # Token IDs equal position indices for clarity
-        turn1_prompt_ids = list(range(n_sys + n_user1))          # [0,1,2,3]
-        asst1_output_ids = list(range(n_sys + n_user1,
-                                       n_cached))                 # [4,5]
-        turn2_ids = list(range(n_total))                          # [0..7]
+        turn1_prompt_ids = list(range(n_sys + n_user1))  # [0,1,2,3]
+        asst1_output_ids = list(range(n_sys + n_user1, n_cached))  # [4,5]
+        turn2_ids = list(range(n_total))  # [0..7]
 
         # Boundaries: turn1 has sys boundary only; turn2 has sys + end-of-asst1
         boundaries_turn1 = [n_sys]
         boundaries_turn2 = [n_sys, n_cached]
 
         mx.random.seed(2)
-        k_per_tok = [mx.random.normal((1, n_heads, 1, head_dim)) for _ in range(n_total)]
-        v_per_tok = [mx.random.normal((1, n_heads, 1, head_dim)) for _ in range(n_total)]
+        k_per_tok = [
+            mx.random.normal((1, n_heads, 1, head_dim)) for _ in range(n_total)
+        ]
+        v_per_tok = [
+            mx.random.normal((1, n_heads, 1, head_dim)) for _ in range(n_total)
+        ]
         q_decode = mx.random.normal((1, n_heads, 1, head_dim))
         k_decode = mx.random.normal((1, n_heads, 1, head_dim))
         v_decode = mx.random.normal((1, n_heads, 1, head_dim))
@@ -307,7 +319,7 @@ class TestMultiTurnRoundtrip:
         mx.eval(logits_fresh)
 
         # --- Turn 1: miss → checkpoint at sys → store (cache covers positions 0-5) ---
-        req1 = _make_request('r1', turn1_prompt_ids, boundaries_turn1)
+        req1 = _make_request("r1", turn1_prompt_ids, boundaries_turn1)
         assert manager.fetch(req1) is None
 
         kv_sys = KVCache()
@@ -325,7 +337,7 @@ class TestMultiTurnRoundtrip:
         manager.store(req1, cache=[kv_full])
 
         # --- Turn 2: fetch → cache covers positions 0-5; prefill user2; decode ---
-        req2 = _make_request('r2', turn2_ids, boundaries_turn2)
+        req2 = _make_request("r2", turn2_ids, boundaries_turn2)
         hit = manager.fetch(req2)
 
         assert hit is not None
