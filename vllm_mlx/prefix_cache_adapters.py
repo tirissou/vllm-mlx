@@ -365,24 +365,25 @@ class TurnCacheManager(CacheManager):
 
         return [result[li] for li in sorted(result)]
 
+    def _set_miss_state(self, request) -> None:
+        """Populate request._cache_state with miss values."""
+        cs = getattr(request, "_cache_state", None)
+        if cs is not None:
+            cs.hit_type = "miss"
+            cs.cached_tokens = 0
+            cs.turn_path = []
+            cs.remaining_tokens = request.prompt_token_ids
+            cs.prefill_boundaries = self.boundaries(request)
+
     def fetch(self, request) -> bool:
         segments = self.messages_to_segments(request)
         if not segments:
-            cs = getattr(request, "_cache_state", None)
-            if cs is not None:
-                cs.hit_type = "miss"
-                cs.remaining_tokens = request.prompt_token_ids
-                cs.prefill_boundaries = self.boundaries(request)
+            self._set_miss_state(request)
             return False
 
         path, _ = self._inner.match(segments)
         if not path:
-            self._inner.release(path)
-            cs = getattr(request, "_cache_state", None)
-            if cs is not None:
-                cs.hit_type = "miss"
-                cs.remaining_tokens = request.prompt_token_ids
-                cs.prefill_boundaries = self.boundaries(request)
+            self._set_miss_state(request)
             return False
 
         cs = getattr(request, "_cache_state", None)
@@ -391,11 +392,9 @@ class TurnCacheManager(CacheManager):
 
         ancestor = self._inner.find_checkpoint_ancestor(path)
         if ancestor is None:
-            self._inner.release(path)
-            if cs is not None:
-                cs.hit_type = "miss"
-                cs.remaining_tokens = request.prompt_token_ids
-                cs.prefill_boundaries = self.boundaries(request)
+            if path:
+                self._inner.release(path)
+            self._set_miss_state(request)
             return False
 
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
