@@ -392,13 +392,15 @@ def test_messages_to_segments_boundary_at_zero_returns_empty():
 # ── fetch() ──────────────────────────────────────────────────────────────────
 
 
-def test_fetch_miss_returns_none():
+def test_fetch_miss_returns_false():
     inner = _make_inner()
     inner.match.return_value = ([], None)
     adapter = TurnCacheManager(inner)
     req = _make_request(prompt_token_ids=list(range(10)), turn_boundaries=[])
     result = adapter.fetch(req)
-    assert result is None
+    assert result is False
+    assert req._cache_state.hit_type == "miss"
+    assert req._cache_state.remaining_tokens == list(range(10))
 
 
 def test_fetch_hit_populates_turn_path_on_cache_state():
@@ -406,34 +408,49 @@ def test_fetch_hit_populates_turn_path_on_cache_state():
     node = MagicMock()
     node.n_tokens = 5
     inner.match.return_value = ([node], None)
-    inner.find_checkpoint_ancestor.return_value = None
-    adapter = TurnCacheManager(inner)
-    req = _make_request(
-        prompt_token_ids=list(range(10)),
-        turn_boundaries=[5],
-        cached_tokens=0,
-    )
-    hit = adapter.fetch(req)
-    assert hit is not None
+    ancestor = MagicMock()
+    ancestor.n_tokens = 5
+    inner.find_checkpoint_ancestor.return_value = ancestor
+    # Mock collect_path_data to return empty lists (no real MLX arrays needed)
+    inner.collect_path_data.return_value = ([], [])
+    # Patch _assemble to return empty cache without needing real MLX eval
+    with patch.object(TurnCacheManager, "_assemble", return_value=[]):
+        adapter = TurnCacheManager(inner)
+        req = _make_request(
+            prompt_token_ids=list(range(10)),
+            turn_boundaries=[5],
+            cached_tokens=0,
+        )
+        result = adapter.fetch(req)
+    assert result is True
     assert req._cache_state.turn_path == [node]
+    assert req._cache_state.hit_type == "hit"
+    assert req._cache_state.cached_tokens == 5
 
 
-def test_fetch_does_not_set_prefill_boundaries():
-    """fetch() must NOT set cs.prefill_boundaries — that is boundaries()'s job."""
+def test_fetch_sets_prefill_boundaries_via_boundaries():
+    """fetch() now populates prefill_boundaries by calling boundaries()."""
     inner = _make_inner()
     node = MagicMock()
     node.n_tokens = 5
     inner.match.return_value = ([node], None)
-    inner.find_checkpoint_ancestor.return_value = None
-    adapter = TurnCacheManager(inner)
-    req = _make_request(
-        prompt_token_ids=list(range(10)),
-        turn_boundaries=[5],
-        cached_tokens=0,
-    )
-    adapter.fetch(req)
-    # prefill_boundaries must still be the default empty list
-    assert req._cache_state.prefill_boundaries == []
+    ancestor = MagicMock()
+    ancestor.n_tokens = 5
+    inner.find_checkpoint_ancestor.return_value = ancestor
+    inner.collect_path_data.return_value = ([], [])
+    with patch.object(TurnCacheManager, "_assemble", return_value=[]):
+        adapter = TurnCacheManager(inner)
+        # Use boundaries [5, 8] so cached=5 excludes 5 but keeps 8 → [8-5]=[3]
+        req = _make_request(
+            prompt_token_ids=list(range(10)),
+            turn_boundaries=[5, 8],
+            cached_tokens=0,
+        )
+        result = adapter.fetch(req)
+    # boundaries() adjusts for cached_tokens: [5,8] with cached=5 → [8-5]=[3]
+    # Boundary at 5 is excluded because 5 > 5 is False
+    assert result is True
+    assert req._cache_state.prefill_boundaries == [3]
 
 
 # ── store() ──────────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ import mlx.core as mx
 from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
-from .kv_cache import CacheHit, CacheIndexMap, _BATCH_KV_TYPES
+from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES
 from .cache_types import KVLayerSegment, RecurrentLayerSegment
 
 
@@ -44,11 +44,11 @@ class CacheManager(ABC):
         ...
 
     @abstractmethod
-    def fetch(self, request) -> "CacheHit | None":
+    def fetch(self, request) -> bool:
         """Look up a cached prefix for this request.
 
-        On a hit, populates request._cache_state.turn_path and returns a CacheHit.
-        On a miss, returns None.
+        On a hit, populates request._cache_state.turn_path and returns True.
+        On a miss, populates request._cache_state for miss and returns False.
         """
         ...
 
@@ -365,15 +365,25 @@ class TurnCacheManager(CacheManager):
 
         return [result[li] for li in sorted(result)]
 
-    def fetch(self, request) -> CacheHit | None:
+    def fetch(self, request) -> bool:
         segments = self.messages_to_segments(request)
         if not segments:
-            return None
+            cs = getattr(request, "_cache_state", None)
+            if cs is not None:
+                cs.hit_type = "miss"
+                cs.remaining_tokens = request.prompt_token_ids
+                cs.prefill_boundaries = self.boundaries(request)
+            return False
 
         path, _ = self._inner.match(segments)
         if not path:
             self._inner.release(path)
-            return None
+            cs = getattr(request, "_cache_state", None)
+            if cs is not None:
+                cs.hit_type = "miss"
+                cs.remaining_tokens = request.prompt_token_ids
+                cs.prefill_boundaries = self.boundaries(request)
+            return False
 
         cs = getattr(request, "_cache_state", None)
         if cs is not None:
@@ -381,18 +391,15 @@ class TurnCacheManager(CacheManager):
 
         ancestor = self._inner.find_checkpoint_ancestor(path)
         if ancestor is None:
-            return CacheHit(
-                cache=[],
-                cached_tokens=0,
-                remaining_tokens=list(request.prompt_token_ids),
-                handle=path,
-                hit_type="hit",
-            )
+            self._inner.release(path)
+            if cs is not None:
+                cs.hit_type = "miss"
+                cs.remaining_tokens = request.prompt_token_ids
+                cs.prefill_boundaries = self.boundaries(request)
+            return False
 
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
-        reconstructed = self._assemble(
-            kv_data, rec_data, self._kv_group_size, self._kv_bits
-        )
+        reconstructed = self._assemble(kv_data, rec_data, self._kv_group_size, self._kv_bits)
         del kv_data, rec_data
         # Materialize the KVCache arrays now so the lazy computation graph
         # is freed before decode starts.
@@ -411,19 +418,13 @@ class TurnCacheManager(CacheManager):
         if arrays_to_eval:
             mx.eval(*arrays_to_eval)
         cached_tokens = ancestor.n_tokens
-        remaining = list(request.prompt_token_ids[cached_tokens:])
-        _turn_boundaries = getattr(request, "_turn_boundaries", None) or []
-        prefill_boundaries = sorted(
-            b - cached_tokens for b in _turn_boundaries if b > cached_tokens
-        )
-        return CacheHit(
-            cache=reconstructed,
-            cached_tokens=cached_tokens,
-            remaining_tokens=remaining,
-            handle=path,
-            hit_type="hit",
-            prefill_boundaries=prefill_boundaries,
-        )
+        if cs is not None:
+            cs.hit_type = "hit"
+            cs.cache = reconstructed
+            cs.cached_tokens = cached_tokens
+            cs.remaining_tokens = list(request.prompt_token_ids[cached_tokens:])
+            cs.prefill_boundaries = self.boundaries(request)
+        return True
 
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:
         from .turn_prefix_cache import Segment
