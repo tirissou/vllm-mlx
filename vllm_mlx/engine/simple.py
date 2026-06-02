@@ -537,6 +537,7 @@ class SimpleEngine(BaseEngine):
                 )
                 completion_tokens += 1
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                print(new_text, end="", flush=True)
                 accumulated_text += new_text
 
                 finished = (
@@ -993,6 +994,7 @@ class SimpleEngine(BaseEngine):
                     ):
                         _cancel_check()
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                        print(new_text, end="", flush=True)
                         results.append(
                             SimpleNamespace(
                                 text=new_text,
@@ -1020,6 +1022,7 @@ class SimpleEngine(BaseEngine):
             ):
                 _cancel_check()
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                print(new_text, end="", flush=True)
                 results.append(
                     SimpleNamespace(
                         text=new_text,
@@ -1717,6 +1720,7 @@ class SimpleEngine(BaseEngine):
 
                 token_count += 1
                 new_text = resp.text if hasattr(resp, "text") else str(resp)
+                print(new_text, end="", flush=True)
                 accumulated_text += new_text
 
                 stop_hit = False
