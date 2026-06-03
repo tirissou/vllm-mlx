@@ -1285,6 +1285,7 @@ class Scheduler:
                     request._cache_state.cached_tokens = 0
                     request._cache_state.turn_path = []
                     request._cache_state.remaining_tokens = request.prompt_token_ids
+                    # Recovery: full prefill without cache → no segments needed
                     request._cache_state.prefill_boundaries = []
                     tokens_to_process = request.prompt_token_ids
                     segments = _split_at_boundaries(
