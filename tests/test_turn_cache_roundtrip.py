@@ -49,7 +49,7 @@ class TestKVCacheRoundtrip:
         """fetch returns None when nothing has been stored yet."""
         manager = _make_manager()
         req = _make_request("r1", [0, 1, 2, 3], boundaries=[2])
-        assert manager.fetch(req) is None
+        assert manager.fetch(req) is False
 
     def test_cached_decode_attention_matches_fresh(self):
         """Decode step using TurnCacheManager fetch produces same attention as fresh prefill.
@@ -84,7 +84,7 @@ class TestKVCacheRoundtrip:
 
         # --- Populate cache via public interface ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         kv_sys = KVCache()
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -101,14 +101,15 @@ class TestKVCacheRoundtrip:
 
         # --- Cached path: fetch, prefill remaining, decode ---
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_sys
-        assert hit.remaining_tokens == token_ids[n_sys:]
+        assert cs.hit_type == "hit"
+        assert cs.cached_tokens == n_sys
+        assert cs.remaining_tokens == token_ids[n_sys:]
 
-        # hit.cache[0] is a QuantizedKVCache covering the first n_sys tokens
-        assembled = hit.cache[0]
+        # cs.cache[0] is a QuantizedKVCache covering the first n_sys tokens
+        assembled = cs.cache[0]
         raw_state = assembled.state
         k_cached = mx.dequantize(
             *raw_state[0], group_size=assembled.group_size, bits=assembled.bits
@@ -125,7 +126,6 @@ class TestKVCacheRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
 
@@ -159,7 +159,7 @@ class TestRotatingKVCacheRoundtrip:
 
         # --- Populate cache via public interface ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=0)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -176,14 +176,14 @@ class TestRotatingKVCacheRoundtrip:
 
         # --- Cached path: fetch, continue with assembled cache ---
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_sys
+        assert cs.cached_tokens == n_sys
 
         # For RotatingKVCache the assembled cache is a RotatingKVCache object;
         # update_and_fetch appends the remaining and decode tokens.
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         assert isinstance(assembled, RotatingKVCache)
 
         for k, v in zip(k_per_tok[n_sys:], v_per_tok[n_sys:]):
@@ -192,7 +192,6 @@ class TestRotatingKVCacheRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
     def test_wrapped_ring_buffer_cached_decode_matches_fresh(self):
@@ -232,7 +231,7 @@ class TestRotatingKVCacheRoundtrip:
 
         # --- Cached path ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=0)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -248,12 +247,12 @@ class TestRotatingKVCacheRoundtrip:
         manager.store(req1, cache=[rk_full])
 
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_sys
+        assert cs.cached_tokens == n_sys
 
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         assert isinstance(assembled, RotatingKVCache)
 
         for k, v in zip(k_per_tok[n_sys:], v_per_tok[n_sys:]):
@@ -262,7 +261,6 @@ class TestRotatingKVCacheRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
 
@@ -298,7 +296,7 @@ class TestRotatingKVCacheKeepRoundtrip:
 
         # --- Populate cache ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=keep)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -315,10 +313,10 @@ class TestRotatingKVCacheKeepRoundtrip:
 
         # --- Cached path ---
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         assert isinstance(assembled, RotatingKVCache)
 
         for k, v in zip(k_per_tok[n_sys:], v_per_tok[n_sys:]):
@@ -327,7 +325,6 @@ class TestRotatingKVCacheKeepRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
     def test_keep_gt_zero_wrapped(self):
@@ -362,7 +359,7 @@ class TestRotatingKVCacheKeepRoundtrip:
 
         # --- Populate cache ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=keep)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -379,10 +376,10 @@ class TestRotatingKVCacheKeepRoundtrip:
 
         # --- Cached path ---
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         assert isinstance(assembled, RotatingKVCache)
 
         for k, v in zip(k_per_tok[n_sys:], v_per_tok[n_sys:]):
@@ -391,7 +388,6 @@ class TestRotatingKVCacheKeepRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
 
@@ -441,7 +437,7 @@ class TestMultiLayerRoundtrip:
 
         # --- Populate cache ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         kv_sys_layers = []
         for li in range(n_layers):
@@ -464,15 +460,15 @@ class TestMultiLayerRoundtrip:
 
         # --- Cached path ---
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_sys
-        assert len(hit.cache) == n_layers
+        assert cs.cached_tokens == n_sys
+        assert len(cs.cache) == n_layers
 
         logits_cached = []
         for li in range(n_layers):
-            assembled = hit.cache[li]
+            assembled = cs.cache[li]
             raw_state = assembled.state
             k_cached = mx.dequantize(
                 *raw_state[0], group_size=assembled.group_size, bits=assembled.bits
@@ -487,7 +483,6 @@ class TestMultiLayerRoundtrip:
             logits_cached.append(_attention(q_decode[li], k_all, v_all))
         mx.eval(*logits_cached)
 
-        manager.release(hit.handle)
         for li in range(n_layers):
             assert float(mx.max(mx.abs(logits_cached[li] - logits_fresh[li]))) < ATOL, (
                 f"Layer {li} attention mismatch"
@@ -538,7 +533,7 @@ class TestFullCacheHitRoundtrip:
 
         # --- Turn 1: populate cache ---
         req1 = _make_request("r1", turn1_ids, boundaries_turn1)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         kv_sys = KVCache()
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -557,16 +552,16 @@ class TestFullCacheHitRoundtrip:
 
         # --- Turn 2: fetch — cached node covers all turn-2 prompt tokens ---
         req2 = _make_request("r2", turn2_ids, boundaries_turn2)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_total, (
-            f"expected cached_tokens={n_total}, got {hit.cached_tokens}; "
+        assert cs.cached_tokens == n_total, (
+            f"expected cached_tokens={n_total}, got {cs.cached_tokens}; "
             "response node in trie should cover all turn-2 prompt tokens"
         )
-        assert hit.remaining_tokens == []
+        assert cs.remaining_tokens == []
 
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         raw_state = assembled.state
         k_cached = mx.dequantize(
             *raw_state[0], group_size=assembled.group_size, bits=assembled.bits
@@ -580,7 +575,6 @@ class TestFullCacheHitRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
 
@@ -620,7 +614,7 @@ class TestRotatingCacheSecondWrapRoundtrip:
 
         # --- Populate cache ---
         req1 = _make_request("r1", token_ids, boundaries)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=0)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -637,12 +631,12 @@ class TestRotatingCacheSecondWrapRoundtrip:
 
         # --- Cached path ---
         req2 = _make_request("r2", token_ids, boundaries)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_sys
+        assert cs.cached_tokens == n_sys
 
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         assert isinstance(assembled, RotatingKVCache)
 
         for k, v in zip(k_per_tok[n_sys:], v_per_tok[n_sys:]):
@@ -651,7 +645,6 @@ class TestRotatingCacheSecondWrapRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
 
@@ -709,7 +702,7 @@ class TestMultiTurnRoundtrip:
 
         # --- Turn 1: miss → checkpoint at sys → store (cache covers positions 0-5) ---
         req1 = _make_request("r1", turn1_prompt_ids, boundaries_turn1)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         kv_sys = KVCache()
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -727,14 +720,14 @@ class TestMultiTurnRoundtrip:
 
         # --- Turn 2: fetch → cache covers positions 0-5; prefill user2; decode ---
         req2 = _make_request("r2", turn2_ids, boundaries_turn2)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
         # Stored response node covers sys+user1+asst1 = n_cached positions
-        assert hit.cached_tokens == n_cached
-        assert hit.remaining_tokens == turn2_ids[n_cached:]
+        assert cs.cached_tokens == n_cached
+        assert cs.remaining_tokens == turn2_ids[n_cached:]
 
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         raw_state = assembled.state
         k_cached_arr = mx.dequantize(
             *raw_state[0], group_size=assembled.group_size, bits=assembled.bits
@@ -751,7 +744,6 @@ class TestMultiTurnRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
     def test_second_turn_rotating_cache_matches_fresh_decode(self):
@@ -803,7 +795,7 @@ class TestMultiTurnRoundtrip:
 
         # --- Turn 1: miss → checkpoint at sys → store ---
         req1 = _make_request("r1", turn1_prompt_ids, boundaries_turn1)
-        assert manager.fetch(req1) is None
+        assert manager.fetch(req1) is False
 
         rk_sys = RotatingKVCache(max_size=max_size, keep=0)
         for k, v in zip(k_per_tok[:n_sys], v_per_tok[:n_sys]):
@@ -820,13 +812,13 @@ class TestMultiTurnRoundtrip:
 
         # --- Turn 2: fetch → assembled covers 0-7; prefill user2; decode ---
         req2 = _make_request("r2", turn2_ids, boundaries_turn2)
-        hit = manager.fetch(req2)
+        assert manager.fetch(req2) is True
+        cs = req2._cache_state
 
-        assert hit is not None
-        assert hit.cached_tokens == n_cached
-        assert hit.remaining_tokens == turn2_ids[n_cached:]
+        assert cs.cached_tokens == n_cached
+        assert cs.remaining_tokens == turn2_ids[n_cached:]
 
-        assembled = hit.cache[0]
+        assembled = cs.cache[0]
         assert isinstance(assembled, RotatingKVCache)
 
         for k, v in zip(k_per_tok[n_cached:], v_per_tok[n_cached:]):
@@ -835,5 +827,4 @@ class TestMultiTurnRoundtrip:
         logits_cached = _attention(q_decode, k_all_cached, v_all_cached)
         mx.eval(logits_cached)
 
-        manager.release(hit.handle)
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL

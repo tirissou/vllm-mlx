@@ -406,7 +406,7 @@ class TestTurnCacheAdapterMessages:
 
 
 class TestTurnCacheAdapterFetch:
-    """TurnCacheManager.fetch path as handle; miss returns None."""
+    """TurnCacheManager.fetch returns bool; miss returns False."""
 
     def _make_adapter(self):
         from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
@@ -415,16 +415,16 @@ class TestTurnCacheAdapterFetch:
         inner = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
         return TurnCacheManager(inner), inner
 
-    def test_miss_returns_none(self):
+    def test_miss_returns_false(self):
         adapter, _ = self._make_adapter()
         tokens = list(range(60))
         req = _make_turn_request(tokens, [10])
-        assert adapter.fetch(req) is None
+        assert adapter.fetch(req) is False
 
-    def test_no_segments_returns_none(self):
+    def test_no_segments_returns_false(self):
         adapter, _ = self._make_adapter()
         req = _make_turn_request(list(range(50)), [])  # no boundaries → no segments
-        assert adapter.fetch(req) is None
+        assert adapter.fetch(req) is False
 
     def test_release_noop_on_none_handle(self):
         adapter, _ = self._make_adapter()
@@ -450,9 +450,9 @@ class TestTurnCacheAdapterFetch:
         # No match yet; release empty path
         inner.release(path)
 
-        # After fetch miss the handle should be None and release is a noop
+        # After fetch miss the handle should be empty and release is a noop
         result = adapter.fetch(req)
-        assert result is None
+        assert result is False
 
 
 # ---------------------------------------------------------------------------

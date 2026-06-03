@@ -1143,39 +1143,32 @@ class Scheduler:
             # Fetch cache on the worker thread so all MLX ops (dequantize,
             # reconstruct) are enqueued on the correct stream.
             if request._cache_state.remaining_tokens is None:
-                hit = (
-                    self._prefix_cache.fetch(request)
-                    if self._prefix_cache is not None
-                    else None
-                )
-                if hit is not None:
-                    request._cache_state.hit_type = hit.hit_type
-                    request._cache_state.cache = hit.cache
-                    request._cache_state.cached_tokens = hit.cached_tokens
-                    request._cache_state.remaining_tokens = hit.remaining_tokens
-                    request._cache_state.prefill_boundaries = (
-                        self._prefix_cache.boundaries(request)
-                    )
-                    self._log_cache_key(
-                        "get", request.request_id, list(request.prompt_token_ids)
-                    )
-                    logger.info(
-                        f"[cache_fetch] request={request.request_id[:12]} HIT "
-                        f"cached={request._cache_state.cached_tokens} remaining={len(hit.remaining_tokens)}"
-                    )
+                hit_occurred = False
+                if self._prefix_cache is not None:
+                    hit_occurred = self._prefix_cache.fetch(request)
+                    if hit_occurred:
+                        self._log_cache_key(
+                            "get", request.request_id, list(request.prompt_token_ids)
+                        )
+                        logger.info(
+                            f"[cache_fetch] request={request.request_id[:12]} HIT "
+                            f"cached={request._cache_state.cached_tokens} "
+                            f"remaining={len(request._cache_state.remaining_tokens)}"
+                        )
+                    else:
+                        self._log_cache_key(
+                            "get", request.request_id, list(request.prompt_token_ids)
+                        )
+                        logger.info(
+                            f"[cache_fetch] request={request.request_id[:12]} MISS "
+                            f"prompt_tokens={len(request.prompt_token_ids)}"
+                        )
                 else:
                     request._cache_state.hit_type = "miss"
+                    request._cache_state.cached_tokens = 0
+                    request._cache_state.turn_path = []
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = (
-                        self._prefix_cache.boundaries(request)
-                    )
-                    self._log_cache_key(
-                        "get", request.request_id, list(request.prompt_token_ids)
-                    )
-                    logger.info(
-                        f"[cache_fetch] request={request.request_id[:12]} MISS "
-                        f"prompt_tokens={len(request.prompt_token_ids)}"
-                    )
+                    request._cache_state.prefill_boundaries = []
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -1290,10 +1283,9 @@ class Scheduler:
                     request._cache_state.cache = None
                     request._cache_state.hit_type = "miss"
                     request._cache_state.cached_tokens = 0
+                    request._cache_state.turn_path = []
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = (
-                        self._prefix_cache.boundaries(request)
-                    )
+                    request._cache_state.prefill_boundaries = []
                     tokens_to_process = request.prompt_token_ids
                     segments = _split_at_boundaries(
                         tokens_to_process, request._cache_state.prefill_boundaries
