@@ -27,10 +27,6 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from vllm_mlx.turn_prefix_cache import Segment
 
-from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
-from .paged_cache import PagedCacheManager
-from .ssd_cache import SSDCacheConfig, SSDCacheTier
-from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .kv_cache import (
     RequestCacheState,
@@ -665,13 +661,7 @@ class Scheduler:
 
         # Prefix cache for KV state reuse — attributes set by _init_cache_bundle()
         self._prefix_cache = None
-        self.prefix_cache: Optional[PrefixCacheManager] = None
-        self.paged_cache_manager: Optional[PagedCacheManager] = None
-        self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
-        self._ssd_offloaded_cache = None
         self.turn_cache: Optional[TurnPrefixCache] = None
-        self.memory_aware_cache: Any = None  # deprecated, removed in Task 4
-        self._ssd_tier: Any = None  # deprecated, removed in Task 4
         self._init_cache_bundle()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
