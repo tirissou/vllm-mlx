@@ -850,7 +850,7 @@ class Scheduler:
                 return
             if self._prefix_cache is None:
                 return
-            extracted = extract_cache_states(prompt_cache)
+            extracted = self._prefix_cache.extract_cache(prompt_cache)
             if extracted:
                 total = (request._cache_state.cached_tokens or 0) + processed_tokens
                 self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
@@ -1363,22 +1363,10 @@ class Scheduler:
                         if raw_cache:
                             # For paged cache, extract actual tensor states
                             # This allows cache to survive BatchGenerator recreation
-                            if self.block_aware_cache is not None:
-                                extracted_cache = extract_cache_states(raw_cache)
-                                if extracted_cache:
-                                    request._cache_state.decoded_cache = extracted_cache
-                                    logger.info(
-                                        f"[paged_cache] request={request_id[:12]} "
-                                        f"EXTRACTED {len(extracted_cache)} layers "
-                                        f"(type={type(raw_cache[0]).__name__})"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"[paged_cache] request={request_id[:12]} "
-                                        f"EXTRACT FAILED raw_cache={len(raw_cache)} layers "
-                                        f"(type={type(raw_cache[0]).__name__ if raw_cache else 'empty'})"
-                                    )
-                            else:
+                            if raw_cache:
+                                extracted = self._prefix_cache.extract_cache(raw_cache)
+                                if extracted:
+                                    request._cache_state.decoded_cache = extracted
                                 # Standard cache stores object references
                                 request._cache_state.decoded_cache = raw_cache
                         else:
@@ -1392,13 +1380,7 @@ class Scheduler:
                             f"[paged_cache] request={request_id[:12]} extract exception: {e}"
                         )
 
-                    # Normalize to dict form if raw objects were assigned
-                    if request._cache_state.decoded_cache and not isinstance(
-                        request._cache_state.decoded_cache[0], dict
-                    ):
-                        request._cache_state.decoded_cache = extract_cache_states(
-                            request._cache_state.decoded_cache
-                        )
+                    # No second extraction needed — extract_cache handles format normalization
 
                     if request._cache_state.decoded_cache:
                         _full_tokens = list(request.prompt_token_ids) + list(
@@ -1993,7 +1975,7 @@ class Scheduler:
                 continue
             idx = pb.uids.index(uid)
             per_uid_cache = pb.extract_cache(idx)
-            extracted = extract_cache_states(per_uid_cache)
+            extracted = self._prefix_cache.extract_cache(per_uid_cache)
             if extracted:
                 total = (request._cache_state.cached_tokens or 0) + processed
                 self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
