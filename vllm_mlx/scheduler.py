@@ -660,12 +660,6 @@ class Scheduler:
         # Prefix cache for KV state reuse — attributes set by _init_cache_bundle()
         self._prefix_cache = None
         self.turn_cache: Optional[TurnPrefixCache] = None
-        # Deprecated attrs — default None to prevent AttributeError (removed in Tasks 5-8)
-        self.prefix_cache: Any = None
-        self.block_aware_cache: Any = None
-        self._ssd_offloaded_cache: Any = None
-        self.memory_aware_cache: Any = None
-        self._ssd_tier: Any = None
         self._init_cache_bundle()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
@@ -1350,21 +1344,14 @@ class Scheduler:
                         else:
                             raw_cache = response.prompt_cache
 
-                        if raw_cache:
-                            # For paged cache, extract actual tensor states
-                            # This allows cache to survive BatchGenerator recreation
-                            if raw_cache:
-                                extracted = self._prefix_cache.extract_cache(raw_cache)
-                                if extracted:
-                                    request._cache_state.decoded_cache = extracted
-                                # Standard cache stores object references
+                        if raw_cache and self._prefix_cache is not None:
+                            # Extract actual tensor states for cache persistence
+                            # across BatchGenerator recreation
+                            extracted = self._prefix_cache.extract_cache(raw_cache)
+                            if extracted:
+                                request._cache_state.decoded_cache = extracted
+                            else:
                                 request._cache_state.decoded_cache = raw_cache
-                        else:
-                            if self.block_aware_cache is not None:
-                                logger.info(
-                                    f"[paged_cache] request={request_id[:12]} "
-                                    f"no prompt_cache on finished response"
-                                )
                     except Exception as e:
                         logger.warning(
                             f"[paged_cache] request={request_id[:12]} extract exception: {e}"
