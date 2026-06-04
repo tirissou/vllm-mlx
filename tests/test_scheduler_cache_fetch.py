@@ -117,8 +117,7 @@ def test_fetch_hit_populates_cache_state_in_place():
     # _cache_state.remaining_tokens starts as None
     assert req._cache_state.remaining_tokens is None
 
-    with patch("vllm_mlx.scheduler.validate_cache", return_value=True):
-        scheduler._schedule_waiting()
+    scheduler._schedule_waiting()
 
     # fetch() should have been called exactly once
     mock_cache.fetch.assert_called_once_with(req)
@@ -202,10 +201,7 @@ def test_cache_insert_error_resets_state_with_turn_path_clear():
     # Patch _ensure_batch_generator to not recreate the batch generator,
     # otherwise our mock gets replaced with a real BatchGenerator.
     with patch.object(scheduler, "_ensure_batch_generator", return_value=None):
-        with patch(
-            "vllm_mlx.scheduler.validate_cache", return_value=True
-        ):
-            result = scheduler._schedule_waiting()
+        result = scheduler._schedule_waiting()
 
     # The request should have been scheduled after retry
     assert len(result) == 1

@@ -32,7 +32,6 @@ from .kv_cache import (
     RequestCacheState,
     _BATCH_KV_TYPES,
     extract_cache_states,
-    validate_cache,
 )
 from .utils.mamba_cache import ensure_mamba_support
 from .mllm_batch_generator import _eval_prompt_cache
