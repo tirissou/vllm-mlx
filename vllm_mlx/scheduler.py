@@ -1892,67 +1892,25 @@ class Scheduler:
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
-        result = False
-        if self.memory_aware_cache is not None:
-            result = self.memory_aware_cache.save_to_disk(cache_dir)
-        else:
-            logger.info("[cache_persist] no memory-aware cache to save")
-
-        if self.turn_cache is not None:
-            import os
-
-            turn_dir = os.path.join(cache_dir, "turn_cache")
-            try:
-                self.turn_cache.save(turn_dir)
-                logger.info(f"[cache_persist] TurnPrefixCache saved to {turn_dir}")
-                result = True
-            except Exception as e:
-                logger.error(f"[cache_persist] TurnPrefixCache save failed: {e}")
-
-        return result
+        if self._prefix_cache is not None:
+            return self._prefix_cache.save(cache_dir)
+        return False
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
-        count = 0
-        if self.memory_aware_cache is not None:
-            count = self.memory_aware_cache.load_from_disk(cache_dir)
-        else:
-            logger.info("[cache_persist] no memory-aware cache to load into")
-
-        if self.turn_cache is not None:
-            import os
-
-            turn_dir = os.path.join(cache_dir, "turn_cache")
-            try:
-                self.turn_cache.load(turn_dir)
-                logger.info(f"[cache_persist] TurnPrefixCache loaded from {turn_dir}")
-            except Exception as e:
-                logger.error(f"[cache_persist] TurnPrefixCache load failed: {e}")
-
-        return count
+        if self._prefix_cache is not None:
+            return self._prefix_cache.load(cache_dir)
+        return 0
 
     def clear_prefix_cache(self) -> None:
         """Clear the in-memory prefix cache (keeps disk cache untouched)."""
-        if self.memory_aware_cache is not None and hasattr(
-            self.memory_aware_cache, "clear"
-        ):
-            self.memory_aware_cache.clear()
-            logger.info("[clear_prefix_cache] memory-aware cache cleared")
-            return
-        if self.prefix_cache is not None and hasattr(self.prefix_cache, "clear"):
-            self.prefix_cache.clear()
-            logger.info("[clear_prefix_cache] prefix cache cleared")
+        if self._prefix_cache is not None:
+            self._prefix_cache.clear()
 
     def close_ssd_tier(self) -> None:
         """Shut down the SSD cache tier if present."""
-        if self._ssd_offloaded_cache is not None:
-            self._ssd_offloaded_cache.close()
-            self._ssd_offloaded_cache = None
-            logger.info("SSD offloaded cache closed")
-        if self._ssd_tier is not None:
-            self._ssd_tier.close()
-            self._ssd_tier = None
-            logger.info("SSD cache tier closed")
+        if self._prefix_cache is not None:
+            self._prefix_cache.close()
 
     def _handle_prompt_segment_ends(self, prompt_responses) -> None:
         """Save turn-cache state at each completed prompt segment boundary."""
