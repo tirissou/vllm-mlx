@@ -662,6 +662,12 @@ class Scheduler:
         # Prefix cache for KV state reuse — attributes set by _init_cache_bundle()
         self._prefix_cache = None
         self.turn_cache: Optional[TurnPrefixCache] = None
+        # Deprecated attrs — default None to prevent AttributeError (removed in Tasks 5-8)
+        self.prefix_cache: Any = None
+        self.block_aware_cache: Any = None
+        self._ssd_offloaded_cache: Any = None
+        self.memory_aware_cache: Any = None
+        self._ssd_tier: Any = None
         self._init_cache_bundle()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
