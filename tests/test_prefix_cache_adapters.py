@@ -267,6 +267,14 @@ def test_turn_cache_manager_validate_empty_cache():
         assert adapter.validate([]) is False
 
 
+def test_turn_cache_manager_validate_none_layer():
+    """validate() returns False if any layer is None."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    with patch('vllm_mlx.prefix_cache_adapters.validate_cache', return_value=False):
+        assert adapter.validate([None]) is False
+
+
 # ── extract_cache() ──────────────────────────────────────────────────────────
 
 
