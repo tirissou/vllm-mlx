@@ -670,6 +670,8 @@ class Scheduler:
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self._ssd_offloaded_cache = None
         self.turn_cache: Optional[TurnPrefixCache] = None
+        self.memory_aware_cache: Any = None  # deprecated, removed in Task 4
+        self._ssd_tier: Any = None  # deprecated, removed in Task 4
         self._init_cache_bundle()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
