@@ -1132,16 +1132,17 @@ class Scheduler:
                 )
 
             # Validate cache before using it
-            if cache_to_use is not None and not validate_cache(cache_to_use):
-                logger.debug(
-                    f"Request {request.request_id}: invalid cache detected, "
-                    f"proceeding without cache"
-                )
-                cache_to_use = None
-                request._cache_state.cache = None
-                request._cache_state.cached_tokens = 0
-                request._cache_state.remaining_tokens = request.prompt_token_ids
-                tokens_to_process = request.prompt_token_ids
+            if cache_to_use is not None and self._prefix_cache is not None:
+                if not self._prefix_cache.validate(cache_to_use):
+                    logger.debug(
+                        f"Request {request.request_id}: invalid cache detected, "
+                        f"proceeding without cache"
+                    )
+                    cache_to_use = None
+                    request._cache_state.cache = None
+                    request._cache_state.cached_tokens = 0
+                    request._cache_state.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
 
             # Build per-request logits_processors from repetition_penalty and
             # any caller-supplied extras (e.g. JSON schema constrained
