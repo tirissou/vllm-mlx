@@ -230,6 +230,123 @@ def test_extract_recurrent_state_empty_for_pure_kv():
     assert result == []
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Task 1: TurnCacheManager validate, extract_cache, close, error handling
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── validate() ───────────────────────────────────────────────────────────────
+
+
+def test_turn_cache_manager_validate_valid_cache():
+    """validate() returns True for valid cache (list of layers with keys/values)."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    valid_cache = [
+        MagicMock(
+            keys=MagicMock(shape=(1, 8, 4, 64)),
+            values=MagicMock(shape=(1, 8, 4, 64)),
+        )
+    ]
+    with patch("vllm_mlx.prefix_cache_adapters.validate_cache", return_value=True):
+        assert adapter.validate(valid_cache) is True
+
+
+def test_turn_cache_manager_validate_none_cache():
+    """validate() returns False for None cache."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    with patch("vllm_mlx.prefix_cache_adapters.validate_cache", return_value=False):
+        assert adapter.validate(None) is False
+
+
+def test_turn_cache_manager_validate_empty_cache():
+    """validate() returns False for empty list cache."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    with patch("vllm_mlx.prefix_cache_adapters.validate_cache", return_value=False):
+        assert adapter.validate([]) is False
+
+
+# ── extract_cache() ──────────────────────────────────────────────────────────
+
+
+def test_turn_cache_manager_extract_cache_valid():
+    """extract_cache() forwards to extract_cache_states."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    raw_cache = [
+        MagicMock(state=(MagicMock(), MagicMock()), meta_state=())
+    ]
+    with patch(
+        "vllm_mlx.prefix_cache_adapters.extract_cache_states",
+        return_value=[{"k": "v"}],
+    ) as mock_extract:
+        result = adapter.extract_cache(raw_cache)
+        assert result == [{"k": "v"}]
+        mock_extract.assert_called_once_with(raw_cache)
+
+
+def test_turn_cache_manager_extract_cache_empty():
+    """extract_cache() returns None for empty list."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    with patch(
+        "vllm_mlx.prefix_cache_adapters.extract_cache_states", return_value=None
+    ):
+        assert adapter.extract_cache([]) is None
+
+
+# ── save() / load() (updated with error handling) ────────────────────────────
+
+
+def test_turn_cache_manager_save_forwards_to_inner():
+    """save() forwards to inner.save()."""
+    inner = MagicMock()
+    inner.save.return_value = True
+    adapter = TurnCacheManager(inner)
+    result = adapter.save("/tmp/cache")
+    assert result is True
+    inner.save.assert_called_once_with("/tmp/cache")
+
+
+def test_turn_cache_manager_save_fails():
+    """save() returns False when inner.save() raises."""
+    inner = MagicMock()
+    inner.save.side_effect = OSError("disk full")
+    adapter = TurnCacheManager(inner)
+    result = adapter.save("/tmp/cache")
+    assert result is False
+
+
+def test_turn_cache_manager_load_forwards_to_inner():
+    """load() forwards to inner.load()."""
+    inner = MagicMock()
+    inner.load.return_value = 42
+    adapter = TurnCacheManager(inner)
+    result = adapter.load("/tmp/cache")
+    assert result == 0
+
+
+def test_turn_cache_manager_load_fails():
+    """load() returns 0 when inner.load() raises."""
+    inner = MagicMock()
+    inner.load.side_effect = OSError("disk full")
+    adapter = TurnCacheManager(inner)
+    result = adapter.load("/tmp/cache")
+    assert result == 0
+
+
+# ── close() ──────────────────────────────────────────────────────────────────
+
+
+def test_turn_cache_manager_close_is_noop():
+    """close() does nothing (TurnPrefixCache has no external resources)."""
+    inner = MagicMock()
+    adapter = TurnCacheManager(inner)
+    adapter.close()  # must not raise
+    inner.close.assert_not_called()
+
+
 class TestBuildPrefixCache:
     """_build_prefix_cache selects the right adapter for each SchedulerConfig variant."""
 

@@ -589,11 +589,28 @@ class TurnCacheManager(CacheManager):
         if cs is not None:
             cs.turn_path.append(new_node)
 
-    # PersistableCache extension
+    # ── Updated: save() / load() with error handling ──────────────────────────
+
     def save(self, cache_dir: str) -> bool:
-        self._inner.save(cache_dir)
-        return True
+        try:
+            return self._inner.save(cache_dir)
+        except Exception:
+            return False
 
     def load(self, cache_dir: str) -> int:
-        self._inner.load(cache_dir)
-        return 0
+        try:
+            self._inner.load(cache_dir)
+            return 0
+        except Exception:
+            return 0
+
+    # ── New: validate, extract_cache, close ──────────────────────────────────
+
+    def validate(self, cache: list) -> bool:
+        return validate_cache(cache)
+
+    def extract_cache(self, raw_cache: list) -> list | None:
+        return extract_cache_states(raw_cache)
+
+    def close(self) -> None:
+        pass
