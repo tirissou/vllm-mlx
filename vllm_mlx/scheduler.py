@@ -562,61 +562,20 @@ def _install_mtp(
 class _PrefixCacheBundle:
     """All prefix-cache objects produced by _build_prefix_cache."""
 
-    adapter: Any = None  # PrefixCache protocol adapter
-    memory_aware_cache: Any = None
-    prefix_cache: Any = None  # legacy PrefixCacheManager
-    paged_cache_manager: Any = None
-    block_aware_cache: Any = None
-    ssd_tier: Any = None
-    turn_cache: Any = None
-    ssd_offloaded_cache: Any = None  # typed reference to SSDOffloadedCache when active
+    adapter: "CacheManager | None" = None
+    turn_cache: "TurnPrefixCache | None" = None
 
 
 def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBundle:
     """Construct the appropriate prefix-cache adapter from SchedulerConfig.
 
-    Encapsulates the four-way selection (paged / memory-aware / turn / legacy)
-    so that Scheduler.__init__ is not responsible for cache-backend wiring.
+    Only TurnPrefixCache is supported. All other backends have been removed.
     """
     from .prefix_cache_adapters import TurnCacheManager
 
     bundle = _PrefixCacheBundle()
 
-    if config.use_paged_cache:
-        paged_cache_manager = PagedCacheManager(
-            block_size=config.paged_cache_block_size,
-            max_blocks=config.max_cache_blocks,
-        )
-        block_aware_cache = BlockAwarePrefixCache(
-            model=model,
-            paged_cache_manager=paged_cache_manager,
-        )
-        bundle.paged_cache_manager = paged_cache_manager
-        bundle.block_aware_cache = block_aware_cache
-        bundle.adapter = None
-        logger.warning(
-            "Paged cache is no longer supported; disabling prefix caching. "
-            f"(block_size={config.paged_cache_block_size}, max_blocks={config.max_cache_blocks})"
-        )
-
-    elif config.use_memory_aware_cache and not config.use_turn_cache:
-        cache_config = MemoryCacheConfig(
-            max_memory_mb=config.cache_memory_mb,
-            max_memory_percent=config.cache_memory_percent,
-            kv_quantize=config.kv_cache_quantization,
-            kv_bits=config.kv_cache_quantization_bits,
-            kv_group_size=config.kv_cache_quantization_group_size,
-            kv_min_quantize_tokens=config.kv_cache_min_quantize_tokens,
-        )
-        memory_aware_cache = MemoryAwarePrefixCache(model=model, config=cache_config)
-        bundle.memory_aware_cache = memory_aware_cache
-        bundle.adapter = None
-        logger.warning(
-            "Memory-aware cache is no longer supported; disabling prefix caching. "
-            f"(limit would have been {memory_aware_cache.memory_limit_mb:.1f}MB)"
-        )
-
-    elif config.use_turn_cache:
+    if config.use_turn_cache:
         from .turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
 
         turn_cache = TurnPrefixCache(
@@ -636,17 +595,8 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             f"TurnPrefixCache enabled: stride={config.turn_cache_stride} "
             f"memory={config.turn_cache_memory_gb}GB"
         )
-
     else:
-        prefix_cache = PrefixCacheManager(
-            model=model,
-            max_entries=config.prefix_cache_size,
-        )
-        bundle.prefix_cache = prefix_cache
-        bundle.adapter = None
-        logger.info(
-            f"Legacy prefix cache disabled; no caching (max_entries={config.prefix_cache_size})"
-        )
+        logger.info("Prefix cache disabled (use_turn_cache=False)")
 
     return bundle
 

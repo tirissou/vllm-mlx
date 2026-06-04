@@ -380,8 +380,9 @@ class TestBuildPrefixCache:
 
         assert isinstance(bundle.adapter, TurnCacheManager)
         assert bundle.turn_cache is mock_tc
-        assert bundle.memory_aware_cache is None
-        assert bundle.prefix_cache is None
+        # Deprecated fields removed
+        assert not hasattr(bundle, 'memory_aware_cache')
+        assert not hasattr(bundle, 'prefix_cache')
 
 
 def test_request_cache_state_is_single_attribute():
