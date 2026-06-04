@@ -1,4 +1,4 @@
-# Deepen CacheManager Protocol — Scheduler Cache Decoupling
+# Deepen CacheManager Protocol — Scheduler Cache Decoupling (Corrected)
 
 > **REQUIRED SUB-SKILL:** Use superpowers:executing-plans or superpowers:subagent-driven-development to implement this plan task-by-task.
 
@@ -6,9 +6,10 @@
 
 **Architecture:**
 - Add `validate()`, `extract_cache()`, `save()`, `load()`, `close()` methods to the `CacheManager` protocol with no-op defaults.
-- Implement these on `TurnCacheManager` (the only functional adapter).
+- Implement these on `TurnCacheManager` (the only functional adapter). `save()` and `load()` are updated (already exist, add error handling); `validate()`, `extract_cache()`, `close()` are genuinely new.
 - Remove deprecated backends (`PrefixCacheManager`, `PagedCacheManager`, `MemoryAwarePrefixCache`) and their test files.
 - Refactor the Scheduler to use only `self._prefix_cache` (a `CacheManager` reference) for all cache operations.
+- Remove orphaned free functions `extract_cache_states()` and `validate_cache()` from `kv_cache.py` (zero callers after refactor).
 
 **Tech Stack:** Python, pytest, MLX.
 
@@ -95,6 +96,8 @@ git commit -m "feat: add validate, extract_cache, save, load, close to CacheMana
 **Files:**
 - Modify: `vllm_mlx/prefix_cache_adapters.py`
 
+> **Note:** `save()` and `load()` already exist on `TurnCacheManager`. This task updates them (adds error handling) and adds only `validate()`, `extract_cache()`, `close()` (genuinely new).
+
 **Step 1: Add tests for new methods**
 
 In `tests/test_prefix_cache_adapters.py`, add these tests after the existing TurnCacheManager tests:
@@ -151,7 +154,7 @@ def test_turn_cache_manager_extract_cache_empty():
     assert adapter.extract_cache([]) is None
 
 
-# ── save() / load() ──────────────────────────────────────────────────────────
+# ── save() / load() (updated with error handling) ────────────────────────────
 
 def test_turn_cache_manager_save_forwards_to_inner():
     """save() forwards to inner.save()."""
@@ -211,14 +214,10 @@ Expected: `FAIL` — `TurnCacheManager` doesn't have `validate` method (uses bas
 
 **Step 3: Implement methods on TurnCacheManager**
 
-Add these methods to `TurnCacheManager` (after the existing `clear` method, before `on_prefill_checkpoint`):
+Find the existing `save()` and `load()` methods at the end of `TurnCacheManager` (after `on_prefill_checkpoint`). Replace them with error-handling versions, and add `validate()`, `extract_cache()`, `close()` after them:
 
 ```python
-    def validate(self, cache: list) -> bool:
-        return validate_cache(cache)
-
-    def extract_cache(self, raw_cache: list) -> list | None:
-        return extract_cache_states(raw_cache)
+    # ── Updated: save() / load() with error handling ──────────────────────────
 
     def save(self, cache_dir: str) -> bool:
         try:
@@ -232,6 +231,14 @@ Add these methods to `TurnCacheManager` (after the existing `clear` method, befo
             return 0
         except Exception:
             return 0
+
+    # ── New: validate, extract_cache, close ──────────────────────────────────
+
+    def validate(self, cache: list) -> bool:
+        return validate_cache(cache)
+
+    def extract_cache(self, raw_cache: list) -> list | None:
+        return extract_cache_states(raw_cache)
 
     def close(self) -> None:
         pass
@@ -251,7 +258,7 @@ Expected: All tests pass.
 ```bash
 cd /Users/tibo/Projects/vllm-mlx/test-pi-subagents
 git add vllm_mlx/prefix_cache_adapters.py tests/test_prefix_cache_adapters.py
-git commit -m "feat: implement validate, extract_cache, save, load, close on TurnCacheManager"
+git commit -m "feat: implement validate, extract_cache, close on TurnCacheManager; add error handling to save/load"
 ```
 
 ---
@@ -421,8 +428,8 @@ Remove these imports from the top of `scheduler.py`:
 ```diff
 - from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 - from .paged_cache import PagedCacheManager
-- from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 - from .ssd_cache import SSDCacheConfig, SSDCacheTier
+- from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 ```
 
 **Step 2: Remove deprecated instance attributes**
@@ -770,7 +777,47 @@ git commit -m "chore: remove deprecated backend test files (PrefixCacheManager, 
 
 ---
 
-### Task 10: Final verification
+### Task 10: Remove orphaned free functions from kv_cache.py
+
+> **New task (corrected plan).** `extract_cache_states()` and `validate_cache()` are only called from scheduler.py, which now routes through `self._prefix_cache.validate()` / `self._prefix_cache.extract_cache()`. These free functions are orphaned.
+
+**Files:**
+- Modify: `vllm_mlx/kv_cache.py`
+
+**Step 1: Verify zero callers remain**
+
+Run:
+```bash
+cd /Users/tibo/Projects/vllm-mlx/test-pi-subagents
+rg 'extract_cache_states\(' vllm_mlx/ | grep -v 'def extract_cache_states' | grep -v 'extract_cache_states()' | grep -v 'extract_cache_states(' | head -10
+rg 'validate_cache\(' vllm_mlx/ | grep -v 'def validate_cache' | head -10
+```
+Expected: No results (both are orphaned after scheduler refactor).
+
+**Step 2: Remove the functions**
+
+Remove `extract_cache_states()` and `validate_cache()` from `vllm_mlx/kv_cache.py`. Keep `extract_layer_state()` — it's still used by `prefix_cache_adapters.py`.
+
+**Step 3: Run tests**
+
+Run:
+```bash
+cd /Users/tibo/Projects/vllm-mlx/test-pi-subagents
+python -m pytest tests/test_prefix_cache_adapters.py tests/test_scheduler_cache_fetch.py tests/test_kv_cache.py -v --tb=short
+```
+Expected: All pass (tests that referenced `extract_cache_states` or `validate_cache` directly should have been updated in earlier tasks).
+
+**Step 4: Commit**
+
+```bash
+cd /Users/tibo/Projects/vllm-mlx/test-pi-subagents
+git add vllm_mlx/kv_cache.py
+git commit -m "refactor: remove orphaned extract_cache_states() and validate_cache() from kv_cache.py"
+```
+
+---
+
+### Task 11: Final verification
 
 **Files:**
 - Run: full test suite
@@ -820,7 +867,17 @@ rg 'self\.(memory_aware_cache|prefix_cache|paged_cache_manager|block_aware_cache
 ```
 Expected: No results.
 
-**Step 5: Final commit**
+**Step 5: Verify no direct calls to orphaned functions remain**
+
+Run:
+```bash
+cd /Users/tibo/Projects/vllm-mlx/test-pi-subagents
+rg 'extract_cache_states\(' vllm_mlx/scheduler.py
+rg 'validate_cache\(' vllm_mlx/scheduler.py
+```
+Expected: No results (all calls now go through `self._prefix_cache`).
+
+**Step 6: Final commit**
 
 ```bash
 cd /Users/tibo/Projects/vllm-mlx/test-pi-subagents
@@ -833,8 +890,9 @@ git commit -m "chore: final verification — Scheduler only knows CacheManager p
 ## Summary
 
 **Files modified:**
-- `vllm_mlx/prefix_cache_adapters.py` — Add 5 methods to CacheManager, implement on TurnCacheManager
+- `vllm_mlx/prefix_cache_adapters.py` — Add 5 methods to CacheManager, implement on TurnCacheManager (3 new, 2 updated with error handling)
 - `vllm_mlx/scheduler.py` — Remove deprecated backends, simplify all cache operations through protocol
+- `vllm_mlx/kv_cache.py` — Remove orphaned `extract_cache_states()` and `validate_cache()` (Task 10, new)
 
 **Files deleted:**
 - `tests/test_prefix_cache.py`
@@ -847,8 +905,9 @@ git commit -m "chore: final verification — Scheduler only knows CacheManager p
 **Net effect:**
 - Scheduler goes from knowing about 8 concrete backends to knowing about 1 (`CacheManager`)
 - ~200 lines removed from scheduler.py
-- ~30 lines added to adapters
+- ~30 lines added to adapters (3 new methods, 2 updated)
 - All cache operations flow through the protocol
 - Deprecated backends removed
+- Orphaned free functions removed from kv_cache.py
 
-**Verification:** Full test suite + grep for remaining deprecated references.
+**Verification:** Full test suite + grep for remaining deprecated references + grep for orphaned function calls.
