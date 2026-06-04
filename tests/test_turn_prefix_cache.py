@@ -1788,7 +1788,7 @@ def test_mid_prefill_eagerly_inserts_turn_at_boundary():
     sched.uid_to_request_id[123] = "test-1"
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=50)
-    with patch("vllm_mlx.scheduler.extract_cache_states", return_value=mock_extracted):
+    with patch("vllm_mlx.prefix_cache_adapters.extract_cache_states", return_value=mock_extracted):
         callback(123, 50, MagicMock())
 
     # System turn eagerly inserted into trie
@@ -1818,7 +1818,7 @@ def test_mid_prefill_does_not_insert_away_from_boundary():
     sched.uid_to_request_id[124] = "test-2"
 
     mock_extracted = _make_extracted_state(n_layers=2, n_tokens=30)
-    with patch("vllm_mlx.scheduler.extract_cache_states", return_value=mock_extracted):
+    with patch("vllm_mlx.prefix_cache_adapters.extract_cache_states", return_value=mock_extracted):
         callback(124, 30, MagicMock())  # total=30, not in [50] → no insert
 
     assert len(sched.turn_cache.root.children) == 0
@@ -1849,7 +1849,7 @@ def test_mid_prefill_inserts_multiple_boundaries_in_sequence():
 
     for boundary, n_tok in [(50, 50), (100, 100), (150, 150)]:
         extracted = _make_extracted_state(n_layers=2, n_tokens=n_tok)
-        with patch("vllm_mlx.scheduler.extract_cache_states", return_value=extracted):
+        with patch("vllm_mlx.prefix_cache_adapters.extract_cache_states", return_value=extracted):
             callback(125, boundary, MagicMock())
 
     # Three turns inserted, chained: root → sys → conv1 → conv2
