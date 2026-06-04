@@ -12,7 +12,7 @@ import mlx.core as mx
 from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
-from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES
+from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
 from .cache_types import KVLayerSegment, RecurrentLayerSegment
 
 
@@ -80,6 +80,30 @@ class CacheManager(ABC):
         pass
 
     def update_n_minus_one(self, request, prompt_cache: list, uid_idx: int) -> None:
+        pass
+
+    def validate(self, cache: list) -> bool:
+        """Validate cache state. Returns True if valid and usable."""
+        return True
+
+    def extract_cache(self, raw_cache: list) -> list | None:
+        """Extract cache state from raw cache objects.
+
+        Returns list of layer state dicts, or None on failure.
+        Called during cleanup to prepare cache for storage.
+        """
+        return None
+
+    def save(self, cache_dir: str) -> bool:
+        """Persist cache to disk. Returns True on success."""
+        return False
+
+    def load(self, cache_dir: str) -> int:
+        """Load cache from disk. Returns entries loaded."""
+        return 0
+
+    def close(self) -> None:
+        """Cleanup resources (SSD threads, file handles, etc.)."""
         pass
 
     def _ensure_cache_index_map(self, layers: list) -> "CacheIndexMap":
