@@ -893,18 +893,9 @@ class Scheduler:
             # sampling params (temperature, top_p, min_p).  Since the
             # server runs a single model, the cache is always valid.
             if self.batch_generator is not None:
-                n_entries = 0
-                if self.memory_aware_cache is not None:
-                    n_entries = len(self.memory_aware_cache._entries)
-                elif self.prefix_cache is not None:
-                    n_entries = (
-                        len(self.prefix_cache)
-                        if hasattr(self.prefix_cache, "__len__")
-                        else 0
-                    )
                 logger.info(
-                    f"[batch_generator] recreating (sampler params changed), "
-                    f"keeping {n_entries} cache entries"
+                    "[batch_generator] recreating (sampler params changed), "
+                    "keeping cache entries"
                 )
 
             self._close_batch_generator()
