@@ -7,9 +7,9 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 - The python source code lives in `./vllm_mlx/`. 
 - All tests lives in `./tests/`.
 - All docs live in `./docs/`.
-- Prefer `rg` over `grep`.
+- Prefer `rg` over `grep`. Use `-e` flag for regex, `-n` for line numbers, `-l` for filename only.
 - Prefer `fd` over `find` when available.
-- Always pass a `path` parameter to `rg` and `fd` queries (ie for source code, tests, docs, etc).
+- Always pass a path to `rg` and `fd` (ie for source code, tests, docs, etc).
 - Python virtual environment at `.venv` is managed by `uv`. Use `uv pip` always.
 
 #### Research
