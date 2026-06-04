@@ -690,22 +690,12 @@ class Scheduler:
     def _init_cache_bundle(self) -> None:
         """Initialize cache backend attributes from SchedulerConfig.
 
-        Called from __init__. Kept as a separate method so that
-        __init__ source does not reference self.memory_aware_cache or
-        self._ssd_tier directly (those now live here or in close_ssd_tier).
+        Called from __init__. The Scheduler only knows about CacheManager
+        through self._prefix_cache.
         """
-        self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
-        self._ssd_tier: Optional[SSDCacheTier] = None
-
         if self.config.enable_prefix_cache:
             _bundle = _build_prefix_cache(self.config, self.model)
             self._prefix_cache = _bundle.adapter
-            self.memory_aware_cache = _bundle.memory_aware_cache
-            self.prefix_cache = _bundle.prefix_cache
-            self.paged_cache_manager = _bundle.paged_cache_manager
-            self.block_aware_cache = _bundle.block_aware_cache
-            self._ssd_tier = _bundle.ssd_tier
-            self._ssd_offloaded_cache = _bundle.ssd_offloaded_cache
             self.turn_cache = _bundle.turn_cache
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
