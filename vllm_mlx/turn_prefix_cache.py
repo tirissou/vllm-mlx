@@ -851,6 +851,11 @@ class TurnPrefixCache:
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
 
             if node.token_ids:
+                first_tokens = (
+                    node.token_ids[:10]
+                    if len(node.token_ids) >= 10
+                    else node.token_ids
+                )
                 last_tokens = (
                     node.token_ids[-10:]
                     if len(node.token_ids) >= 10
@@ -882,7 +887,9 @@ class TurnPrefixCache:
                         label += f" ...{tokens_str}"
                 else:
                     # No tokenizer, show token IDs
-                    tokens_str = ",".join(str(t) for t in last_tokens)
+                    end = ",".join(str(t) for t in last_tokens)
+                    start = ",".join(str(t) for t in first_tokens)
+                    tokens_str = start + ", ..., " + end
                     label += f" ...{tokens_str}"
 
             return label
