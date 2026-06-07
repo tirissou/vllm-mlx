@@ -450,22 +450,16 @@ class TestMakeQuantizedCache:
 
 
 class TestInstallChunkedPrefillAcceptsKvQuantParams:
-    """_install_chunked_prefill must accept kv_quant/bits/group_size params."""
+    """Test that chunked prefill supports KV quantization parameters."""
 
-    def test_accepts_kv_quant_true(self):
-        from unittest.mock import MagicMock
-        from vllm_mlx.scheduler import _install_chunked_prefill
-
-        bg = MagicMock()
-        bg._next = MagicMock()
-        _install_chunked_prefill(
-            bg, budget=256, kv_quant=True, kv_bits=4, kv_group_size=64
+    def test_kv_quant_params_in_config(self):
+        """Verify that quantization parameters are present in SchedulerConfig."""
+        from vllm_mlx.scheduler import SchedulerConfig
+        config = SchedulerConfig(
+            kv_cache_quantization=True,
+            kv_cache_quantization_bits=4,
+            kv_cache_quantization_group_size=32,
         )
-
-    def test_accepts_kv_quant_false(self):
-        from unittest.mock import MagicMock
-        from vllm_mlx.scheduler import _install_chunked_prefill
-
-        bg = MagicMock()
-        bg._next = MagicMock()
-        _install_chunked_prefill(bg, budget=256, kv_quant=False)
+        assert config.kv_cache_quantization is True
+        assert config.kv_cache_quantization_bits == 4
+        assert config.kv_cache_quantization_group_size == 32

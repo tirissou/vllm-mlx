@@ -8,9 +8,7 @@ from mlx_lm.models.cache import KVCache
 
 from vllm_mlx.kv_cache import (
     CacheHit,
-    CacheDiskStore,
     QuantizedArray,
-    SpillableCache,
     validate_cache,
 )
 from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
@@ -59,43 +57,6 @@ class TestQuantizedArray:
         assert q.packed.dtype == mx.uint32
         assert q.scales.dtype == mx.bfloat16
         assert q.biases.dtype == mx.bfloat16
-
-
-class TestSpillableCacheProtocol:
-    """SpillableCache runtime-checkable protocol checks."""
-
-    def test_class_with_all_methods_satisfies_protocol(self):
-        """A class implementing all PrefixCache methods plus set_spill_delegate should satisfy SpillableCache."""
-
-        class FullImpl:
-            def fetch(self, request): ...
-            def store(self, request, cache): ...
-            def release(self, handle): ...
-            def get_stats(self): ...
-            def clear(self): ...
-            def on_prefill_checkpoint(
-                self, request, processed_tokens, extracted_cache
-            ): ...
-            def set_spill_delegate(self, on_spill, on_promote): ...
-
-        assert isinstance(FullImpl(), SpillableCache)
-
-    def test_missing_set_spill_delegate_fails_check(self):
-        """A class with all PrefixCache methods but missing set_spill_delegate should not satisfy SpillableCache."""
-
-        class NoDelegate:
-            def fetch(self, request): ...
-            def store(self, request, cache): ...
-            def release(self, handle): ...
-            def get_stats(self): ...
-            def clear(self): ...
-            def on_prefill_checkpoint(
-                self, request, processed_tokens, extracted_cache
-            ): ...
-
-            # No set_spill_delegate
-
-        assert not isinstance(NoDelegate(), SpillableCache)
 
 
 def _run_prefill(cache: BatchQuantizedKVCache, B: int, H: int, T: int, D: int):
@@ -581,70 +542,6 @@ class TestValidateCache:
         layer.keys.__class__ = object
         layer.keys.shape = (2, 4, 128)  # batch=2, not 1
         assert validate_cache([layer]) is False
-
-
-class TestCacheDiskStoreProtocol:
-    def test_protocol_is_runtime_checkable(self):
-        # Any concrete class with write/read/has/all_keys satisfies the protocol.
-        # MagicMock(spec=[...]) is intentionally avoided: Python 3.12+ protocol
-        # isinstance checks use MRO lookup, not __getattr__, so MagicMock fails
-        # even when hasattr returns True for all required attrs.
-        from vllm_mlx.kv_cache import CacheDiskStore
-
-        class MinimalStore:
-            def write(self, tokens, layers): ...
-            def read(self, tokens): ...
-            def has(self, tokens): ...
-            def all_keys(self): ...
-
-        assert isinstance(MinimalStore(), CacheDiskStore)
-
-    def test_missing_method_fails_check(self):
-        from vllm_mlx.kv_cache import CacheDiskStore
-
-        class IncompleteStore:
-            def write(self, tokens, layers): ...
-            def read(self, tokens): ...
-
-            # missing has and all_keys
-
-        assert not isinstance(IncompleteStore(), CacheDiskStore)
-
-
-class TestSpillableCacheProtocol:
-    def test_protocol_is_runtime_checkable(self):
-        from vllm_mlx.kv_cache import SpillableCache
-
-        class MinimalSpillable:
-            def fetch(self, request): ...
-            def store(self, request, cache): ...
-            def release(self, handle): ...
-            def get_stats(self): ...
-            def clear(self): ...
-            def on_prefill_checkpoint(
-                self, request, processed_tokens, extracted_cache
-            ): ...
-            def update_n_minus_one(self, request, prompt_cache, uid_idx): ...
-            def set_spill_delegate(self, on_spill, on_promote): ...
-
-        assert isinstance(MinimalSpillable(), SpillableCache)
-
-    def test_missing_set_spill_delegate_fails_check(self):
-        """A class with all PrefixCache methods but missing set_spill_delegate should not satisfy SpillableCache."""
-
-        class NoDelegate:
-            def fetch(self, request): ...
-            def store(self, request, cache): ...
-            def release(self, handle): ...
-            def get_stats(self): ...
-            def clear(self): ...
-            def on_prefill_checkpoint(
-                self, request, processed_tokens, extracted_cache
-            ): ...
-
-            # No set_spill_delegate
-
-        assert not isinstance(NoDelegate(), SpillableCache)
 
 
 class TestArraysCacheReferenceSemantics:

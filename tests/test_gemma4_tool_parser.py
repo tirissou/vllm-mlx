@@ -275,7 +275,7 @@ class TestGemma4Registration:
     def test_native_format_false(self):
         assert Gemma4ToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is False
 
-    def test_extra_stop_tokens_declares_tool_response(self):
+    def test_extra_stop_tokens_declares_tool_response(self: TestGemma4Registration):
         """Gemma 4 treats <|tool_response> (id 50) as end-of-generation
         after a tool call. The parser exposes it so the server can merge it
         into the request's stop sequences.

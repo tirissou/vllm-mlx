@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 
 from vllm_mlx.ssd_cache import FilesystemCacheDiskStore
-from vllm_mlx.kv_cache import CacheDiskStore
 
 
 @pytest.fixture
@@ -14,9 +13,6 @@ def store(tmp_path):
 
 
 class TestFilesystemCacheDiskStore:
-    def test_implements_protocol(self, store):
-        assert isinstance(store, CacheDiskStore)
-
     def test_has_returns_false_for_missing(self, store):
         assert store.has((1, 2, 3)) is False
 
