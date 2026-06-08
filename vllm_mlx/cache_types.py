@@ -9,20 +9,23 @@ import mlx.core as mx
 
 @dataclass
 class KVLayerSegment:
-    """Immutable quantized KV snapshot for one transformer layer, stored in a TurnNode.
+    """Immutable KV snapshot for one transformer layer, stored in a TurnNode.
 
-    Keys and values are in mlx-lm's native group-quantized format (QuantizedArray).
+    Keys and values can be either:
+    - QuantizedArray(packed, scales, biases) for quantized storage (bits is not None)
+    - mx.array for float precision storage (bits is None, Track B)
     Use KVLayerSegment.concat() to merge incremental segments along the sequence axis.
     """
 
-    keys: Any  # QuantizedArray(packed, scales, biases)
-    values: Any  # QuantizedArray(packed, scales, biases)
+    keys: Any  # QuantizedArray(packed, scales, biases) or mx.array
+    values: Any  # QuantizedArray(packed, scales, biases) or mx.array
     metadata: dict[str, Any]
     # metadata keys:
     #   class_name: str          — 'KVCache' or 'RotatingKVCache'
     #   layer_index: int         — position in the live cache list
     #   merge_strategy: str      — 'concatenate' (KVCache) or 'last' (RotatingKVCache)
     #   n_tokens: int            — token count represented by this segment
+    #   is_quantized: bool       — True if keys/values are QuantizedArray, False if float
     #   max_size: int            — (RotatingKVCache) ring-buffer capacity
     #   keep: int                — (RotatingKVCache) attention sink tokens kept
     #   offset: int              — (RotatingKVCache) linearized write-head position

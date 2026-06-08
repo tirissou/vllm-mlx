@@ -214,6 +214,30 @@ class TurnCacheManager(CacheManager):
                 # Using raw offset here would slice out-of-bounds when offset > max_size.
                 lin_keys = _linearize(state[0], _idx, max_size)
                 lin_values = _linearize(state[1], _idx, max_size)
+
+                if bits is None:
+                    # Track B: store float arrays, no quantization
+                    sliced_keys = mx.stop_gradient(lin_keys)
+                    sliced_values = mx.stop_gradient(lin_values)
+                    mx.eval(sliced_keys, sliced_values)
+                    kv_list[i] = KVLayerSegment(
+                        keys=sliced_keys,
+                        values=sliced_values,
+                        metadata={
+                            "class_name": "RotatingKVCache",
+                            "layer_index": i,
+                            "merge_strategy": "last",
+                            "n_tokens": lin_keys.shape[-2],
+                            "max_size": max_size,
+                            "keep": keep,
+                            "offset": offset,
+                            "_idx": _idx,
+                            "is_quantized": False,
+                        },
+                    )
+                    continue
+
+                # bits is not None: quantize path
                 q_keys = QuantizedArray(
                     *mx.quantize(lin_keys, group_size=group_size, bits=bits)
                 )
