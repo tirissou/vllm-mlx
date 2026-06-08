@@ -157,7 +157,7 @@ class Gemma4ToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser gemma4 are set.
     """
 
-    SUPPORTS_NATIVE_TOOL_FORMAT = False
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
 
     # The chat template renders <|tool_response> (token 50) when the assistant
     # emits a tool call without its own tool_responses block — it's the signal
