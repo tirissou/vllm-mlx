@@ -1043,6 +1043,35 @@ class BatchedEngine(BaseEngine):
                 )
                 return boundaries
 
+            # Try <turn|> + <tool_response|> scan for Gemma 4-like tokenizers.
+            # Tool-calling assistant turns with no text content suppress <turn|>
+            # (template line: `not (ns_tr_out.flag and not message.get('content'))`),
+            # so <tool_response|> is the only structural marker left at each
+            # tool-call boundary. Scanning both gives one boundary per complete
+            # turn or per complete tool-response, whichever applies.
+            turn_end_id = None
+            tool_resp_end_id = None
+            if hasattr(tokenizer, "convert_tokens_to_ids"):
+                _unk = getattr(tokenizer, "unk_token_id", None)
+                _tid = tokenizer.convert_tokens_to_ids("<turn|>")
+                if _tid != _unk:
+                    turn_end_id = _tid
+                _rid = tokenizer.convert_tokens_to_ids("<tool_response|>")
+                if _rid != _unk:
+                    tool_resp_end_id = _rid
+
+            if turn_end_id is not None or tool_resp_end_id is not None:
+                boundaries = []
+                for i, tok in enumerate(full_tokens):
+                    if tok == turn_end_id or tok == tool_resp_end_id:
+                        boundaries.append(i + 1)
+
+                logger.info(
+                    f"[turn_cache] _compute_turn_boundaries (<turn|>+<tool_response|> scan): "
+                    f"{len(full_tokens)} tokens, {len(boundaries)} boundaries"
+                )
+                return boundaries
+
             # Fallback: detect boundaries by finding message boundaries in the template
             # Only add boundaries after system and completed assistant messages
             boundaries = []
