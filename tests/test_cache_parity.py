@@ -210,3 +210,46 @@ class TestCacheParity:
             f"no_cache : {tokens_no_cache}\n"
             f"hit      : {tokens_hit}"
         )
+
+
+@pytest.mark.anyio
+async def test_invalid_cache_falls_back_to_miss(model_and_tokenizer):
+    """A corrupt reconstructed cache must trigger a miss fallback, not a crash."""
+    import unittest.mock
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+
+    model, tokenizer = model_and_tokenizer
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+
+    # In Python 3, accessing a staticmethod via the class returns a plain
+    # function, so we just reference it directly (no __func__ needed).
+    _orig_assemble = TurnCacheManager._assemble
+
+    def _corrupt_assemble(kv_layers, rec_layers, group_size=64, bits=None):
+        result = _orig_assemble(kv_layers, rec_layers, group_size, bits)
+        # Corrupt batch dimension so validate() rejects it
+        from mlx_lm.models.cache import KVCache
+        import mlx.core as mx
+        bad = KVCache()
+        bad.keys = mx.zeros([2, 4, 3, 64])  # batch=2 → invalid
+        bad.values = mx.zeros([2, 4, 3, 64])
+        bad.offset = 3
+        if result:
+            result[0] = bad
+        return result
+
+    async with AsyncEngineCore(model, tokenizer, _turn_cache_config()) as engine:
+        await asyncio.sleep(0.05)
+        # Populate cache on first request
+        await _run_chat(engine, tokenizer, messages)
+        # Patch _assemble so the second request gets a corrupt cache
+        with unittest.mock.patch.object(
+            TurnCacheManager, "_assemble", staticmethod(_corrupt_assemble)
+        ):
+            # Should not crash; falls back to miss and produces valid output
+            tokens = await _run_chat(engine, tokenizer, messages)
+
+    assert len(tokens) > 0, "Engine must produce tokens even after corrupt cache fallback"

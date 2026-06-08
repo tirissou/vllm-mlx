@@ -521,6 +521,11 @@ class TurnCacheManager(CacheManager):
                             arrays_to_eval.append(comp)
         if arrays_to_eval:
             mx.eval(*arrays_to_eval)
+        if not self.validate(reconstructed):
+            if path:
+                self._inner.release(path)
+            self._set_miss_state(request)
+            return False
         cached_tokens = ancestor.n_tokens
         if cs is not None:
             cs.hit_type = "hit"
