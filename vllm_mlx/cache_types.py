@@ -32,16 +32,20 @@ class KVLayerSegment:
         """Concatenate incremental KV segments along the sequence axis (axis=-2)."""
         from vllm_mlx.kv_cache import QuantizedArray
 
-        merged_keys = QuantizedArray(
-            packed=mx.concatenate([l.keys.packed for l in layers], axis=-2),
-            scales=mx.concatenate([l.keys.scales for l in layers], axis=-2),
-            biases=mx.concatenate([l.keys.biases for l in layers], axis=-2),
-        )
-        merged_values = QuantizedArray(
-            packed=mx.concatenate([l.values.packed for l in layers], axis=-2),
-            scales=mx.concatenate([l.values.scales for l in layers], axis=-2),
-            biases=mx.concatenate([l.values.biases for l in layers], axis=-2),
-        )
+        if isinstance(layers[0].keys, QuantizedArray):
+            merged_keys = QuantizedArray(
+                packed=mx.concatenate([l.keys.packed for l in layers], axis=-2),
+                scales=mx.concatenate([l.keys.scales for l in layers], axis=-2),
+                biases=mx.concatenate([l.keys.biases for l in layers], axis=-2),
+            )
+            merged_values = QuantizedArray(
+                packed=mx.concatenate([l.values.packed for l in layers], axis=-2),
+                scales=mx.concatenate([l.values.scales for l in layers], axis=-2),
+                biases=mx.concatenate([l.values.biases for l in layers], axis=-2),
+            )
+        else:
+            merged_keys = mx.concatenate([l.keys for l in layers], axis=-2)
+            merged_values = mx.concatenate([l.values for l in layers], axis=-2)
         meta = dict(layers[-1].metadata)
         meta["n_tokens"] = sum(l.metadata.get("n_tokens", 0) for l in layers)
         return cls(keys=merged_keys, values=merged_values, metadata=meta)

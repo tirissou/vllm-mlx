@@ -145,7 +145,7 @@ class TurnCacheManager(CacheManager):
     """Adapts TurnPrefixCache to the CacheManager protocol."""
 
     def __init__(
-        self, inner: TurnPrefixCache, kv_bits: int = 8, kv_group_size: int = 64
+        self, inner: TurnPrefixCache, kv_bits: int | None = 8, kv_group_size: int = 64
     ):
         self._inner = inner
         self._kv_bits = kv_bits
@@ -187,7 +187,7 @@ class TurnCacheManager(CacheManager):
     def _segment(
         live_states: list[dict],
         group_size: int = 64,
-        bits: int = 8,
+        bits: int | None = 8,
     ) -> tuple[list, list]:
         """Transform live cache states into KVLayerSegment / RecurrentLayerSegment."""
         from .kv_cache import QuantizedArray
@@ -259,39 +259,80 @@ class TurnCacheManager(CacheManager):
 
             elif "KVCache" in class_name:
                 try:
-                    actual_end = int(meta[0]) if meta else state[0].shape[2]
+                    actual_end = int(meta[0]) if meta else (
+                        state[0].packed.shape[-2] if isinstance(state[0], QuantizedArray)
+                        else state[0].shape[2]
+                    )
                 except (TypeError, ValueError, IndexError):
-                    actual_end = state[0].shape[2]
+                    actual_end = (
+                        state[0].packed.shape[-2] if isinstance(state[0], QuantizedArray)
+                        else state[0].shape[2]
+                    )
 
-                sliced_keys = state[0][:, :, :actual_end, :]
-                sliced_values = state[1][:, :, :actual_end, :]
-                q_keys = QuantizedArray(
-                    *mx.quantize(sliced_keys, group_size=group_size, bits=bits)
-                )
-                q_values = QuantizedArray(
-                    *mx.quantize(sliced_values, group_size=group_size, bits=bits)
-                )
-                mx.eval(
-                    q_keys.packed,
-                    q_keys.scales,
-                    q_keys.biases,
-                    q_values.packed,
-                    q_values.scales,
-                    q_values.biases,
-                )
-                # mx.stop_gradient severs the MLX computation graph so the
-                # trie node does not retain a reference to the source float16
-                # Metal buffers via the lazy quantize dependency chain.
-                q_keys = QuantizedArray(
-                    packed=mx.stop_gradient(q_keys.packed),
-                    scales=mx.stop_gradient(q_keys.scales),
-                    biases=mx.stop_gradient(q_keys.biases),
-                )
-                q_values = QuantizedArray(
-                    packed=mx.stop_gradient(q_values.packed),
-                    scales=mx.stop_gradient(q_values.scales),
-                    biases=mx.stop_gradient(q_values.biases),
-                )
+                if isinstance(state[0], QuantizedArray):
+                    # Track A: state already quantized — stop_gradient and store as-is
+                    q_keys = QuantizedArray(
+                        packed=mx.stop_gradient(state[0].packed[..., :actual_end, :]),
+                        scales=mx.stop_gradient(state[0].scales[..., :actual_end, :]),
+                        biases=mx.stop_gradient(state[0].biases[..., :actual_end, :]),
+                    )
+                    q_values = QuantizedArray(
+                        packed=mx.stop_gradient(state[1].packed[..., :actual_end, :]),
+                        scales=mx.stop_gradient(state[1].scales[..., :actual_end, :]),
+                        biases=mx.stop_gradient(state[1].biases[..., :actual_end, :]),
+                    )
+                    mx.eval(
+                        q_keys.packed, q_keys.scales, q_keys.biases,
+                        q_values.packed, q_values.scales, q_values.biases,
+                    )
+                elif bits is None:
+                    # Track B: float precision — stop_gradient and store as float arrays
+                    sliced_keys = mx.stop_gradient(mx.array(state[0][:, :, :actual_end, :]))
+                    sliced_values = mx.stop_gradient(mx.array(state[1][:, :, :actual_end, :]))
+                    mx.eval(sliced_keys, sliced_values)
+                    kv_list[i] = KVLayerSegment(
+                        keys=sliced_keys,
+                        values=sliced_values,
+                        metadata={
+                            "class_name": class_name,
+                            "layer_index": i,
+                            "merge_strategy": "concatenate",
+                            "n_tokens": actual_end,
+                            "is_quantized": False,
+                        },
+                    )
+                    continue
+                else:
+                    # Track C: quantize float arrays
+                    sliced_keys = state[0][:, :, :actual_end, :]
+                    sliced_values = state[1][:, :, :actual_end, :]
+                    q_keys = QuantizedArray(
+                        *mx.quantize(sliced_keys, group_size=group_size, bits=bits)
+                    )
+                    q_values = QuantizedArray(
+                        *mx.quantize(sliced_values, group_size=group_size, bits=bits)
+                    )
+                    mx.eval(
+                        q_keys.packed,
+                        q_keys.scales,
+                        q_keys.biases,
+                        q_values.packed,
+                        q_values.scales,
+                        q_values.biases,
+                    )
+                    # mx.stop_gradient severs the MLX computation graph so the
+                    # trie node does not retain a reference to the source float16
+                    # Metal buffers via the lazy quantize dependency chain.
+                    q_keys = QuantizedArray(
+                        packed=mx.stop_gradient(q_keys.packed),
+                        scales=mx.stop_gradient(q_keys.scales),
+                        biases=mx.stop_gradient(q_keys.biases),
+                    )
+                    q_values = QuantizedArray(
+                        packed=mx.stop_gradient(q_values.packed),
+                        scales=mx.stop_gradient(q_values.scales),
+                        biases=mx.stop_gradient(q_values.biases),
+                    )
 
                 kv_list[i] = KVLayerSegment(
                     keys=q_keys,
@@ -301,6 +342,7 @@ class TurnCacheManager(CacheManager):
                         "layer_index": i,
                         "merge_strategy": "concatenate",
                         "n_tokens": actual_end,
+                        "is_quantized": isinstance(state[0], QuantizedArray) or bits is not None,
                     },
                 )
 
@@ -321,30 +363,36 @@ class TurnCacheManager(CacheManager):
         kv_layers: list,
         recurrent_layers: list,
         group_size: int = 64,
-        bits: int = 8,
+        bits: int | None = 8,
     ) -> list:
         """Reconstruct live cache objects from KVLayerSegment and RecurrentLayerSegment lists."""
         from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
+        from .kv_cache import QuantizedArray
 
         result: dict[int, Any] = {}
 
         for layer in kv_layers:
             li = layer.metadata["layer_index"]
+            is_quantized_payload = isinstance(layer.keys, QuantizedArray)
             if layer.metadata["class_name"] == "RotatingKVCache":
-                dq_keys = mx.dequantize(
-                    layer.keys.packed,
-                    layer.keys.scales,
-                    layer.keys.biases,
-                    group_size=group_size,
-                    bits=bits,
-                )
-                dq_values = mx.dequantize(
-                    layer.values.packed,
-                    layer.values.scales,
-                    layer.values.biases,
-                    group_size=group_size,
-                    bits=bits,
-                )
+                if is_quantized_payload:
+                    dq_keys = mx.dequantize(
+                        layer.keys.packed,
+                        layer.keys.scales,
+                        layer.keys.biases,
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                    dq_values = mx.dequantize(
+                        layer.values.packed,
+                        layer.values.scales,
+                        layer.values.biases,
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                else:
+                    dq_keys = layer.keys
+                    dq_values = layer.values
                 max_size = layer.metadata["max_size"]
                 if dq_keys.shape[-2] > max_size:
                     dq_keys = dq_keys[..., -max_size:, :]
@@ -367,13 +415,22 @@ class TurnCacheManager(CacheManager):
                 cache.offset = layer.metadata.get("offset", dq_keys.shape[-2])
                 cache._idx = _idx
             else:
-                from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
+                if is_quantized_payload:
+                    from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
 
-                n_tokens = layer.metadata.get("n_tokens", layer.keys.packed.shape[-2])
-                cache = _QuantizedKVCache(group_size=group_size, bits=bits)
-                cache.keys = [k[..., :n_tokens, :] for k in layer.keys]
-                cache.values = [v[..., :n_tokens, :] for v in layer.values]
-                cache.offset = n_tokens
+                    n_tokens = layer.metadata.get("n_tokens", layer.keys.packed.shape[-2])
+                    cache = _QuantizedKVCache(group_size=group_size, bits=bits)
+                    cache.keys = [k[..., :n_tokens, :] for k in layer.keys]
+                    cache.values = [v[..., :n_tokens, :] for v in layer.values]
+                    cache.offset = n_tokens
+                else:
+                    from mlx_lm.models.cache import KVCache as _KVCache
+
+                    n_tokens = layer.metadata.get("n_tokens", layer.keys.shape[-2])
+                    cache = _KVCache()
+                    cache.keys = layer.keys[..., :n_tokens, :]
+                    cache.values = layer.values[..., :n_tokens, :]
+                    cache.offset = n_tokens
             result[li] = cache
 
         for layer in recurrent_layers:
@@ -510,16 +567,33 @@ class TurnCacheManager(CacheManager):
         """
         if prev_end == 0:
             return states
+        from .kv_cache import QuantizedArray
+
         result = []
         for s in states:
             cname = s.get("class_name", "")
             if "KVCache" in cname and "Rotating" not in cname:
                 state = s["state"]
                 meta = s.get("meta_state") or ()
-                actual_end = int(meta[0]) if meta else state[0].shape[2]
-                sliced_state = tuple(
-                    mx.array(arr[:, :, prev_end:actual_end, :]) for arr in state[:2]
-                )
+                if isinstance(state[0], QuantizedArray):
+                    actual_end = int(meta[0]) if meta else state[0].packed.shape[-2]
+
+                    def _slice_qa(qa, start, end):
+                        return QuantizedArray(
+                            packed=qa.packed[..., start:end, :],
+                            scales=qa.scales[..., start:end, :],
+                            biases=qa.biases[..., start:end, :],
+                        )
+
+                    sliced_state = (
+                        _slice_qa(state[0], prev_end, actual_end),
+                        _slice_qa(state[1], prev_end, actual_end),
+                    )
+                else:
+                    actual_end = int(meta[0]) if meta else state[0].shape[2]
+                    sliced_state = tuple(
+                        mx.array(arr[:, :, prev_end:actual_end, :]) for arr in state[:2]
+                    )
                 new_meta = (actual_end - prev_end,) + tuple(meta[1:])
                 s = {**s, "state": sliced_state, "meta_state": new_meta}
             result.append(s)
