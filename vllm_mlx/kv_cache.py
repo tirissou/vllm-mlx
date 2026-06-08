@@ -149,8 +149,8 @@ def extract_layer_state(layer) -> dict | None:
     state, meta_state, class_name, and class_ref. Returns None if layer lacks
     the required .state and .meta_state attributes.
 
-    For QuantizedKVCache, state is dequantized to plain (keys, values) mx.arrays
-    so that _slice_kv_to_delta and _segment can treat all KV states uniformly.
+    For QuantizedKVCache, state is wrapped in QuantizedArray to preserve
+    quantized format and allow downstream code to bypass dequantize → requantize.
     """
     if not (hasattr(layer, "state") and hasattr(layer, "meta_state")):
         return None
@@ -158,19 +158,13 @@ def extract_layer_state(layer) -> dict | None:
     raw_state = layer.state
 
     # QuantizedKVCache.state returns (tuple-of-3, tuple-of-3) rather than
-    # (mx.array, mx.array). Normalize to plain arrays so all downstream code
-    # (slicing, _segment) can assume a uniform (keys, values) structure.
+    # (mx.array, mx.array). Track A: preserve quantized format so _segment can
+    # bypass dequantize → requantize round-trip and detect via isinstance check.
     if isinstance(raw_state[0], (list, tuple)):
         from mlx_lm.models.cache import QuantizedKVCache
 
         if isinstance(layer, QuantizedKVCache):
-            dq_keys = mx.dequantize(
-                *raw_state[0], group_size=layer.group_size, bits=layer.bits
-            )
-            dq_values = mx.dequantize(
-                *raw_state[1], group_size=layer.group_size, bits=layer.bits
-            )
-            raw_state = (dq_keys, dq_values)
+            raw_state = (QuantizedArray(*raw_state[0]), QuantizedArray(*raw_state[1]))
 
     return {
         "state": raw_state,
