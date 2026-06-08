@@ -280,6 +280,44 @@ class TestCacheParity:
             f"hit  : {tokens_hit}"
         )
 
+    async def test_config_integrity_bits_do_not_leak(self, model_and_tokenizer):
+        """kv_cache_quantization_bits must be ignored when kv_cache_quantization=False."""
+        model, tokenizer = model_and_tokenizer
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+
+        async with AsyncEngineCore(model, tokenizer, _no_cache_config()) as engine:
+            await asyncio.sleep(0.05)
+            tokens_baseline = await _run_chat(engine, tokenizer, messages)
+
+        # Explicitly set kv_cache_quantization_bits=4 (non-default), but quantization=False.
+        # If gating is broken, the 4-bit path activates and output diverges.
+        leaky_config = EngineConfig(
+            scheduler_config=SchedulerConfig(
+                use_turn_cache=True,
+                kv_cache_quantization=False,
+                kv_cache_quantization_bits=4,   # non-default — must be ignored
+                chunked_prefill_tokens=2048,
+            )
+        )
+        async with AsyncEngineCore(model, tokenizer, leaky_config) as engine:
+            await asyncio.sleep(0.05)
+            tokens_miss = await _run_chat(engine, tokenizer, messages)
+            tokens_hit = await _run_chat(engine, tokenizer, messages)
+
+        assert tokens_miss == tokens_baseline, (
+            "kv_cache_quantization_bits=4 leaked into miss run despite kv_cache_quantization=False.\n"
+            f"baseline : {tokens_baseline}\n"
+            f"miss     : {tokens_miss}"
+        )
+        assert tokens_hit == tokens_baseline, (
+            "kv_cache_quantization_bits=4 leaked into hit run despite kv_cache_quantization=False.\n"
+            f"baseline : {tokens_baseline}\n"
+            f"hit      : {tokens_hit}"
+        )
+
 
 @pytest.mark.anyio
 async def test_invalid_cache_falls_back_to_miss(model_and_tokenizer):
