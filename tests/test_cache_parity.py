@@ -35,6 +35,17 @@ def _turn_cache_config():
     )
 
 
+def _turn_cache_quantized_config():
+    return EngineConfig(
+        scheduler_config=SchedulerConfig(
+            use_turn_cache=True,
+            kv_cache_quantization=True,
+            kv_cache_quantization_bits=8,
+            chunked_prefill_tokens=2048,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -209,6 +220,64 @@ class TestCacheParity:
             f"Cache-hit run differs from no-cache baseline (consecutive assistant turns).\n"
             f"no_cache : {tokens_no_cache}\n"
             f"hit      : {tokens_hit}"
+        )
+
+    async def test_quantized_simple_conversation(self, model_and_tokenizer):
+        """Quantized: cache-hit must equal cache-miss (internal consistency)."""
+        model, tokenizer = model_and_tokenizer
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+
+        async with AsyncEngineCore(model, tokenizer, _turn_cache_quantized_config()) as engine:
+            await asyncio.sleep(0.05)
+            tokens_miss = await _run_chat(engine, tokenizer, messages)
+            tokens_hit = await _run_chat(engine, tokenizer, messages)
+
+        assert tokens_miss == tokens_hit, (
+            f"Quantized cache-hit differs from cache-miss.\n"
+            f"miss : {tokens_miss}\n"
+            f"hit  : {tokens_hit}"
+        )
+
+    async def test_quantized_multi_turn(self, model_and_tokenizer):
+        """Quantized multi-turn: cache-hit must equal cache-miss."""
+        model, tokenizer = model_and_tokenizer
+        system = {"role": "system", "content": "You are a helpful assistant. Keep responses short."}
+        user_1 = {"role": "user", "content": "Name exactly one planet. One word only."}
+
+        async with AsyncEngineCore(model, tokenizer, _no_cache_config()) as engine:
+            await asyncio.sleep(0.05)
+            toks_a1 = await _run_chat(engine, tokenizer, [system, user_1], max_tokens=10)
+        text_a1 = tokenizer.decode(toks_a1)
+
+        async with AsyncEngineCore(model, tokenizer, _no_cache_config()) as engine:
+            await asyncio.sleep(0.05)
+            toks_a2 = await _run_chat(
+                engine, tokenizer,
+                [system, {"role": "user", "content": "Is that planet larger than Earth? One word."}],
+                max_tokens=10,
+            )
+        text_a2 = tokenizer.decode(toks_a2)
+
+        messages = [
+            system,
+            user_1,
+            {"role": "assistant", "content": text_a1},
+            {"role": "assistant", "content": text_a2},
+            {"role": "user", "content": "Does it have rings? Yes or no only."},
+        ]
+
+        async with AsyncEngineCore(model, tokenizer, _turn_cache_quantized_config()) as engine:
+            await asyncio.sleep(0.05)
+            tokens_miss = await _run_chat(engine, tokenizer, messages)
+            tokens_hit = await _run_chat(engine, tokenizer, messages)
+
+        assert tokens_miss == tokens_hit, (
+            f"Quantized multi-turn cache-hit differs from miss.\n"
+            f"miss : {tokens_miss}\n"
+            f"hit  : {tokens_hit}"
         )
 
 
