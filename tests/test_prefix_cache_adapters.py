@@ -539,8 +539,10 @@ def test_fetch_hit_populates_turn_path_on_cache_state():
     inner.find_checkpoint_ancestor.return_value = ancestor
     # Mock collect_path_data to return empty lists (no real MLX arrays needed)
     inner.collect_path_data.return_value = ([], [])
-    # Patch _assemble to return empty cache without needing real MLX eval
-    with patch.object(TurnCacheManager, "_assemble", return_value=[]):
+    # Patch _assemble and validate_cache so fetch() doesn't need real MLX arrays
+    with patch.object(TurnCacheManager, "_assemble", return_value=[]), patch(
+        "vllm_mlx.prefix_cache_adapters.validate_cache", return_value=True
+    ):
         adapter = TurnCacheManager(inner)
         req = _make_request(
             prompt_token_ids=list(range(10)),
@@ -564,7 +566,9 @@ def test_fetch_sets_prefill_boundaries_via_boundaries():
     ancestor.n_tokens = 5
     inner.find_checkpoint_ancestor.return_value = ancestor
     inner.collect_path_data.return_value = ([], [])
-    with patch.object(TurnCacheManager, "_assemble", return_value=[]):
+    with patch.object(TurnCacheManager, "_assemble", return_value=[]), patch(
+        "vllm_mlx.prefix_cache_adapters.validate_cache", return_value=True
+    ):
         adapter = TurnCacheManager(inner)
         # Use boundaries [5, 8] so cached=5 excludes 5 but keeps 8 → [8-5]=[3]
         req = _make_request(

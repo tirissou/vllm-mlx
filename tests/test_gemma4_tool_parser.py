@@ -272,8 +272,8 @@ class TestGemma4Registration:
         parser_cls = ToolParserManager.get_tool_parser("gemma4")
         assert parser_cls is Gemma4ToolParser
 
-    def test_native_format_false(self):
-        assert Gemma4ToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is False
+    def test_native_format_true(self):
+        assert Gemma4ToolParser.SUPPORTS_NATIVE_TOOL_FORMAT is True
 
     def test_extra_stop_tokens_declares_tool_response(self: TestGemma4Registration):
         """Gemma 4 treats <|tool_response> (id 50) as end-of-generation
@@ -317,4 +317,4 @@ class TestGemma4Registration:
 
         assert get_parser_stop_tokens(None, ["A"]) == ["A"]
         assert get_parser_stop_tokens(None, None) == []
-        assert Gemma4ToolParser.supports_native_format() is False
+        assert Gemma4ToolParser.supports_native_format() is True
