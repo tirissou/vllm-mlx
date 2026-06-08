@@ -232,7 +232,6 @@ class TurnCacheManager(CacheManager):
                             "keep": keep,
                             "offset": offset,
                             "_idx": _idx,
-                            "is_quantized": False,
                         },
                     )
                     continue
@@ -311,8 +310,8 @@ class TurnCacheManager(CacheManager):
                     )
                 elif bits is None:
                     # Track B: float precision — stop_gradient and store as float arrays
-                    sliced_keys = mx.stop_gradient(mx.array(state[0][:, :, :actual_end, :]))
-                    sliced_values = mx.stop_gradient(mx.array(state[1][:, :, :actual_end, :]))
+                    sliced_keys = mx.stop_gradient(state[0][:, :, :actual_end, :])
+                    sliced_values = mx.stop_gradient(state[1][:, :, :actual_end, :])
                     mx.eval(sliced_keys, sliced_values)
                     kv_list[i] = KVLayerSegment(
                         keys=sliced_keys,
@@ -322,7 +321,6 @@ class TurnCacheManager(CacheManager):
                             "layer_index": i,
                             "merge_strategy": "concatenate",
                             "n_tokens": actual_end,
-                            "is_quantized": False,
                         },
                     )
                     continue
@@ -366,7 +364,6 @@ class TurnCacheManager(CacheManager):
                         "layer_index": i,
                         "merge_strategy": "concatenate",
                         "n_tokens": actual_end,
-                        "is_quantized": isinstance(state[0], QuantizedArray) or bits is not None,
                     },
                 )
 

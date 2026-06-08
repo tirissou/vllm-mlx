@@ -25,7 +25,6 @@ class KVLayerSegment:
     #   layer_index: int         — position in the live cache list
     #   merge_strategy: str      — 'concatenate' (KVCache) or 'last' (RotatingKVCache)
     #   n_tokens: int            — token count represented by this segment
-    #   is_quantized: bool       — True if keys/values are QuantizedArray, False if float
     #   max_size: int            — (RotatingKVCache) ring-buffer capacity
     #   keep: int                — (RotatingKVCache) attention sink tokens kept
     #   offset: int              — (RotatingKVCache) linearized write-head position
