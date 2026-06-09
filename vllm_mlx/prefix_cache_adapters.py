@@ -671,9 +671,9 @@ class TurnCacheManager(CacheManager):
 
                     def _slice_qa(qa, start, end):
                         return QuantizedArray(
-                            packed=qa.packed[..., start:end, :],
-                            scales=qa.scales[..., start:end, :],
-                            biases=qa.biases[..., start:end, :],
+                            packed=mx.contiguous(qa.packed[..., start:end, :]),
+                            scales=mx.contiguous(qa.scales[..., start:end, :]),
+                            biases=mx.contiguous(qa.biases[..., start:end, :]),
                         )
 
                     sliced_state = (
@@ -683,7 +683,7 @@ class TurnCacheManager(CacheManager):
                 else:
                     actual_end = int(meta[0]) if meta else state[0].shape[2]
                     sliced_state = tuple(
-                        mx.array(arr[:, :, prev_end:actual_end, :]) for arr in state[:2]
+                        mx.contiguous(arr[:, :, prev_end:actual_end, :]) for arr in state[:2]
                     )
                 new_meta = (actual_end - prev_end,) + tuple(meta[1:])
                 s = {**s, "state": sliced_state, "meta_state": new_meta}
