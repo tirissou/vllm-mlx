@@ -43,10 +43,6 @@ _apply_prefill_flash_sdpa()
 _patch_gemma4_llm()
 
 
-from .batch_quantized_kv_cache import (
-    make_quantized_cache as _make_quantized_cache,
-)  # re-export for tests
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 

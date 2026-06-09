@@ -362,7 +362,9 @@ class TestMakeQuantizedCache:
 
     def test_produces_batch_quantized_kv_cache(self):
         from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
-        from vllm_mlx.scheduler import _make_quantized_cache
+        from vllm_mlx.batch_quantized_kv_cache import (
+            make_quantized_cache as _make_quantized_cache,
+        )
 
         model = self._fake_model_layers(n=4)
         left_padding = [0, 0]
@@ -377,7 +379,9 @@ class TestMakeQuantizedCache:
 
     def test_group_size_and_bits_propagated(self):
         from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
-        from vllm_mlx.scheduler import _make_quantized_cache
+        from vllm_mlx.batch_quantized_kv_cache import (
+            make_quantized_cache as _make_quantized_cache,
+        )
 
         model = self._fake_model_layers(n=2)
         cache = _make_quantized_cache(
@@ -390,8 +394,12 @@ class TestMakeQuantizedCache:
     def test_no_make_cache_fallback(self):
         """Model without make_cache() should produce BatchQuantizedKVCache per layer."""
         from mlx_lm.models.cache import KVCache
-        from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
-        from vllm_mlx.scheduler import _make_quantized_cache
+        from vllm_mlx.batch_quantized_kv_cache import (
+            BatchQuantizedKVCache,
+        )
+        from vllm_mlx.batch_quantized_kv_cache import (
+            make_quantized_cache as _make_quantized_cache,
+        )
 
         class FakeLayer:
             pass
@@ -410,8 +418,12 @@ class TestMakeQuantizedCache:
     def test_arrays_cache_layers_preserved(self):
         """Recurrent (ArraysCache) layers must not be replaced by quantized cache."""
         from mlx_lm.models.cache import ArraysCache, KVCache
-        from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
-        from vllm_mlx.scheduler import _make_quantized_cache
+        from vllm_mlx.batch_quantized_kv_cache import (
+            BatchQuantizedKVCache,
+        )
+        from vllm_mlx.batch_quantized_kv_cache import (
+            make_quantized_cache as _make_quantized_cache,
+        )
 
         class FakeModel:
             layers = [None, None]  # not used by make_cache path
