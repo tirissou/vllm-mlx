@@ -169,28 +169,26 @@ def test_segment_layer_index_matches_position():
 # ── _assemble pipeline ────────────────────────────────────────────────────────
 
 
-def test_assemble_kvcache_returns_quantized_kv_cache():
-    """_assemble on a KVLayerSegment returns a QuantizedKVCache."""
-    from mlx_lm.models.cache import QuantizedKVCache
+def test_assemble_kvcache_returns_batch_quantized_kv_cache():
+    """_assemble on a KVLayerSegment returns a BatchQuantizedKVCache (ADR-0005)."""
+    from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
 
     states = [_make_kvcache_state(n_tokens=4)]
     kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
     kv_layers = [k for k in kv_list if k is not None]
     result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
     assert len(result) == 1
-    assert isinstance(result[0], QuantizedKVCache)
+    assert isinstance(result[0], BatchQuantizedKVCache)
 
 
 def test_assemble_kvcache_offset_matches_n_tokens():
-    """Reconstructed QuantizedKVCache.offset equals original n_tokens."""
-    from mlx_lm.models.cache import QuantizedKVCache
-
+    """Reconstructed cache _idx (logical length) equals original n_tokens."""
     n_tokens = 6
     states = [_make_kvcache_state(n_tokens=n_tokens)]
     kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
     kv_layers = [k for k in kv_list if k is not None]
     result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
-    assert result[0].offset == n_tokens
+    assert result[0]._idx == n_tokens
 
 
 def test_assemble_rotating_returns_rotating_kv_cache():
@@ -207,8 +205,6 @@ def test_assemble_rotating_returns_rotating_kv_cache():
 
 def test_assemble_mixed_layer_ordering():
     """_assemble returns layers sorted by layer_index regardless of input order."""
-    from mlx_lm.models.cache import QuantizedKVCache
-
     states = [_make_kvcache_state(n_tokens=4), _make_kvcache_state(n_tokens=4)]
     kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
     kv_layers = [k for k in kv_list if k is not None]
@@ -233,5 +229,5 @@ def test_kvcache_round_trip_shape():
     merged = KVLayerSegment.concat([kv1[0], kv2[0]])
     result = TurnCacheManager._assemble([merged], [], group_size=64, bits=8)
     assert len(result) == 1
-    # offset should be 3 + 5 = 8
-    assert result[0].offset == 8
+    # logical length should be 3 + 5 = 8
+    assert result[0]._idx == 8

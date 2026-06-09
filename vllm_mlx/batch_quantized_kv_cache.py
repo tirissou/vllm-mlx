@@ -305,6 +305,10 @@ class BatchQuantizedKVCache(_BaseCache):
         # Fast-path for single cache: wrap existing arrays directly, no copy.
         if len(caches) == 1:
             c = caches[0]
+            # Already batched (e.g. produced by from_quantized_arrays on a cache
+            # hit). offset/_idx are mx.array; nesting them would corrupt state.
+            if isinstance(c, cls):
+                return c
             gs = getattr(c, "group_size", 64)
             b = getattr(c, "bits", 4)
             result = cls([0], group_size=gs, bits=b)

@@ -437,13 +437,36 @@ class TurnCacheManager(CacheManager):
                 cache._idx = _idx
             else:
                 if is_quantized_payload:
-                    from mlx_lm.models.cache import QuantizedKVCache as _QuantizedKVCache
+                    from .batch_quantized_kv_cache import BatchQuantizedKVCache
 
                     n_tokens = layer.metadata.get("n_tokens", layer.keys.packed.shape[-2])
-                    cache = _QuantizedKVCache(group_size=group_size, bits=bits)
-                    cache.keys = [k[..., :n_tokens, :] for k in layer.keys]
-                    cache.values = [v[..., :n_tokens, :] for v in layer.values]
-                    cache.offset = n_tokens
+                    # Pad to the next `step` boundary so the first decode-step
+                    # update_and_fetch lands on the in-place assignment branch
+                    # rather than re-allocating + concatenating the whole buffer
+                    # (which transiently doubles cache memory at GB scale on
+                    # 60k-token hits and OOMs).
+                    step = BatchQuantizedKVCache.step
+                    padded_len = ((n_tokens + step - 1) // step) * step
+                    pad = padded_len - n_tokens
+
+                    def _pad_qa(qa):
+                        if pad == 0:
+                            return qa
+                        return QuantizedArray(*[
+                            mx.concatenate(
+                                [c, mx.zeros((*c.shape[:-2], pad, c.shape[-1]), dtype=c.dtype)],
+                                axis=-2,
+                            )
+                            for c in qa
+                        ])
+
+                    cache = BatchQuantizedKVCache.from_quantized_arrays(
+                        keys=_pad_qa(layer.keys),
+                        values=_pad_qa(layer.values),
+                        n_tokens=n_tokens,
+                        group_size=group_size,
+                        bits=bits,
+                    )
                 else:
                     from mlx_lm.models.cache import KVCache as _KVCache
 

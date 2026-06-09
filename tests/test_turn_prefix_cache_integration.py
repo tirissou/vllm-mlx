@@ -53,7 +53,7 @@ def _make_rotating_states(n_tokens: int, max_size: int = 4, keep: int = 0):
 
 def test_kvcache_round_trip(trie):
     """KVCache: _segment → insert → match → collect_path_data → _assemble restores shape."""
-    from mlx_lm.models.cache import QuantizedKVCache
+    from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
 
     live_states = _make_kvcache_states(n_tokens=4, n_layers=2)
 
@@ -74,9 +74,9 @@ def test_kvcache_round_trip(trie):
 
     assert len(assembled) == 2  # 2 KV layers
     for cache in assembled:
-        # Each assembled layer should be a QuantizedKVCache
-        assert isinstance(cache, QuantizedKVCache)
-        assert cache.offset == 4
+        # Per ADR-0005: full-attn quantized KV reconstructs to BatchQuantizedKVCache.
+        assert isinstance(cache, BatchQuantizedKVCache)
+        assert cache._idx == 4
     trie.release(path)
 
 
@@ -155,7 +155,8 @@ def test_recurrent_comes_from_leaf(trie):
 
 def test_collect_path_data_layer_ordering(trie):
     """Mixed KV + recurrent layers: _assemble output is ordered by layer_index."""
-    from mlx_lm.models.cache import QuantizedKVCache, ArraysCache
+    from mlx_lm.models.cache import ArraysCache
+    from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
 
     # layer 0 = KVCache, layer 1 = Recurrent
     kv_state = mx.ones((1, 1, 2, 64), dtype=mx.bfloat16)
@@ -176,6 +177,6 @@ def test_collect_path_data_layer_ordering(trie):
     assembled = TurnCacheManager._assemble(kv_out, rec_out)
 
     assert len(assembled) == 2
-    # layer 0 = KVCache (QuantizedKVCache), layer 1 = recurrent (ArraysCache)
-    assert isinstance(assembled[0], QuantizedKVCache)
+    # layer 0 = KVCache → BatchQuantizedKVCache (ADR-0005), layer 1 = recurrent (ArraysCache)
+    assert isinstance(assembled[0], BatchQuantizedKVCache)
     assert isinstance(assembled[1], ArraysCache)

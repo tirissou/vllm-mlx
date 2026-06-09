@@ -68,7 +68,7 @@ class CacheIndexMap:
 
 @dataclass
 class CacheHit:
-    """Returned by PrefixCache.fetch on a successful prefix match."""
+    """Returned by CacheManager.fetch on a successful prefix match."""
 
     cache: list  # per-layer KV state
     cached_tokens: int
