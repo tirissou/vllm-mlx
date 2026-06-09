@@ -13,13 +13,13 @@ The obvious fix is to extract a `CacheOrchestrator` class that coordinates betwe
 
 We rejected `CacheOrchestrator` in favour of deepening the existing adapter hierarchy.
 
-The `PrefixCache` Protocol seam already exists. The problem is that `Scheduler` bypasses it — calling `memory_aware_cache.check_ssd()` directly instead of going through `_prefix_cache.fetch()`. The right fix is to make the adapter's `fetch` genuinely deep, not to add a fourth coordinator on top of three existing objects.
+The `CacheManager` interface already exists. The problem is that `Scheduler` bypasses it — calling `memory_aware_cache.check_ssd()` directly instead of going through `_prefix_cache.fetch()`. The right fix is to make the adapter's `fetch` genuinely deep, not to add a fourth coordinator on top of three existing objects.
 
-Concrete changes:
+Due to implementation difficulties with a unified decorator, the proposed `SSDOffloadedCache` and the sub-protocol `SpillableCache` were removed. Instead, the two existing cache patterns handle SSD tiering differently:
 
-- **`SSDOffloadedCache`** — a decorator wrapping any `SpillableCache`. Registers the spill delegate, owns the background promotion loop, exposes `save()`/`load()` via the same `CacheDiskStore`. `_build_prefix_cache` conditionally wraps: `cache = SSDOffloadedCache(inner, store) if ssd_configured else inner`. The Scheduler holds one `PrefixCache` regardless of SSD configuration.
-- **`SpillableCache`** — sub-protocol of `PrefixCache` with `set_spill_delegate(on_spill, on_promote)`. Implemented by `MemoryAwarePrefixCache` and `TurnPrefixCache`. The two-part delegate replaces `SSDRef` and `_spill_to_ssd`/`_promote_from_ssd` in `TurnPrefixCache`.
 - **`CacheDiskStore`** — shared durable store (`write`, `read`, `all_keys`). Used by both runtime SSD tiering (spill/promote) and startup/shutdown persistence (save/load). Eliminates the duplicated file I/O currently split between `SSDCacheTier` and the persistence path.
+- **`MemoryAwarePrefixCache`** (Full Eviction) — uses `set_spill_delegate(on_spill, on_promote)` to offload evicted entries to `CacheDiskStore`.
+- **`TurnPrefixCache`** (Intra-cache Spilling) — uses inlined `_spill_to_ssd` and `_promote_from_ssd` methods to manage disk interaction directly.
 - **`validate_cache`** — free function in `kv_cache.py`, called inside the adapter's `fetch`. Scheduler stops seeing invalid caches.
 
 ## Consequences
