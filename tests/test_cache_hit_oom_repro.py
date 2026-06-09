@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression test for OOM at decode-from-cache-hit on large prefixes.
 
-TurnCacheManager._assemble used to construct an mlx_lm QuantizedKVCache sized
-exactly to n_tokens. The next update_and_fetch then entered the
-`(prev + num_steps) > self.keys[0].shape[-2]` branch, which trims and concatenates
-a fresh buffer — doubling Metal-memory transiently. At 60k cached tokens on a
-Gemma 4 26B-A4B-class model that doubling is GB-scale and OOMs the server.
+TurnCacheManager._assemble used to construct an mlx_lm KVCache (or
+QuantizedKVCache) sized exactly to n_tokens. The next update_and_fetch
+then entered the `(prev + 1) > self.keys.shape[-2]` branch, which trims
+and concatenates a fresh buffer — doubling Metal-memory transiently. At
+60k cached tokens on a Gemma 4 26B-A4B-class model that doubling is
+GB-scale and OOMs the server.
 
-The fix (see ADR-0005): emit BatchQuantizedKVCache.from_quantized_arrays(...)
-with buffers pre-padded to the next `step` boundary so the first update_and_fetch
-lands on the in-place assignment branch.
+The fix (see ADR-0005): emit a cache pre-padded to the next `step` boundary
+so the first update_and_fetch lands on the in-place assignment branch.
 
 Signal: peak Metal allocation during the first decode step, above the
 pre-decode active level. Must stay near zero.
@@ -28,14 +28,18 @@ from vllm_mlx.prefix_cache_adapters import TurnCacheManager
 
 
 # Realistic shape for the full-attention slice of a Gemma 4 26B-A4B-class model.
-# 60000 % 256 = 96 — deliberately not step-aligned, like the reported failure.
-N_TOKENS = 60_000
 N_KV_HEADS = 4
 HEAD_DIM = 512
 GROUP_SIZE = 64
 BITS = 8
 EL_PER_INT = 32 // BITS
 N_FULL_LAYERS = 7  # ~1 in 5 of 35 layers in Gemma 4 26B-A4B.
+
+# Two token counts: one deliberately off the 256-step grid (the original
+# failure shape), one exactly on it (the step-aligned edge case that the
+# original quantized fix missed).
+N_TOKENS_UNALIGNED = 60_000   # 60000 % 256 = 96
+N_TOKENS_ALIGNED = 60_160     # 235 * 256
 
 
 def _make_quantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
@@ -51,8 +55,27 @@ def _make_quantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
         scales=mx.zeros(scale_shape, dtype=mx.bfloat16),
         biases=mx.zeros(scale_shape, dtype=mx.bfloat16),
     )
-    mx.eval(keys.packed, keys.scales, keys.biases,
-            values.packed, values.scales, values.biases)
+    mx.eval(
+        keys.packed, keys.scales, keys.biases,
+        values.packed, values.scales, values.biases,
+    )
+    return KVLayerSegment(
+        keys=keys,
+        values=values,
+        metadata={
+            "class_name": "KVCache",
+            "layer_index": layer_index,
+            "merge_strategy": "concatenate",
+            "n_tokens": n_tokens,
+        },
+    )
+
+
+def _make_unquantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
+    shape = (1, N_KV_HEADS, n_tokens, HEAD_DIM)
+    keys = mx.zeros(shape, dtype=mx.bfloat16)
+    values = mx.zeros(shape, dtype=mx.bfloat16)
+    mx.eval(keys, values)
     return KVLayerSegment(
         keys=keys,
         values=values,
@@ -75,19 +98,46 @@ def _flatten_arrays(x):
             yield from _flatten_arrays(v)
 
 
+def _per_layer_bytes_quantized(n_tokens: int) -> int:
+    # packed: uint32 (4 bytes) ; scales/biases: bfloat16 (2 bytes each).
+    return (
+        (N_KV_HEADS * n_tokens * (HEAD_DIM // EL_PER_INT) * 4)
+        + 2 * (N_KV_HEADS * n_tokens * (HEAD_DIM // GROUP_SIZE) * 2)
+    )
+
+
+def _per_layer_bytes_unquantized(n_tokens: int) -> int:
+    # bfloat16: 2 bytes per element.
+    return N_KV_HEADS * n_tokens * HEAD_DIM * 2
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
-def test_assemble_does_not_spike_on_first_decode_step():
+@pytest.mark.parametrize(
+    "kind, n_tokens, make_segment, per_layer_bytes",
+    [
+        ("quantized_unaligned",   N_TOKENS_UNALIGNED, _make_quantized_segment,   _per_layer_bytes_quantized),
+        ("quantized_aligned",     N_TOKENS_ALIGNED,   _make_quantized_segment,   _per_layer_bytes_quantized),
+        ("unquantized_unaligned", N_TOKENS_UNALIGNED, _make_unquantized_segment, _per_layer_bytes_unquantized),
+        ("unquantized_aligned",   N_TOKENS_ALIGNED,   _make_unquantized_segment, _per_layer_bytes_unquantized),
+    ],
+)
+def test_assemble_does_not_spike_on_first_decode_step(
+    kind, n_tokens, make_segment, per_layer_bytes
+):
     """Reconstruction + first decode step must not allocate a transient buffer
-    on the order of the cache size."""
+    on the order of the cache size, regardless of payload kind or whether
+    n_tokens is aligned to the cache's `step` boundary."""
     gc.collect()
 
-    kv_layers = [_make_quantized_segment(i, N_TOKENS) for i in range(N_FULL_LAYERS)]
+    kv_layers = [make_segment(i, n_tokens) for i in range(N_FULL_LAYERS)]
 
     caches = TurnCacheManager._assemble(
         kv_layers=kv_layers,
         recurrent_layers=[],
         group_size=GROUP_SIZE,
-        bits=BITS,
+        # bits=None on the unquantized branch tells _assemble to expect
+        # plain mx.array payloads; bits=BITS routes to BatchQuantizedKVCache.
+        bits=BITS if kind.startswith("quantized") else None,
     )
 
     eval_args = []
@@ -111,23 +161,18 @@ def test_assemble_does_not_spike_on_first_decode_step():
 
     peak_decode = mx.get_peak_memory() - pre_decode
 
+    cache_bytes = 2 * N_FULL_LAYERS * per_layer_bytes(n_tokens)  # K + V
+    threshold = int(0.10 * cache_bytes)
+
     print(
-        f"\n[regress] N_TOKENS={N_TOKENS} N_FULL_LAYERS={N_FULL_LAYERS} "
-        f"resident={resident/1e6:.1f} MB  first-decode peak={peak_decode/1e6:.1f} MB"
+        f"\n[regress:{kind}] n_tokens={n_tokens} layers={N_FULL_LAYERS} "
+        f"resident={resident/1e6:.1f} MB  "
+        f"first-decode peak={peak_decode/1e6:.1f} MB  "
+        f"threshold={threshold/1e6:.1f} MB"
     )
 
-    # Threshold: 10% of the per-layer cache size, summed over layers. A reallocation
-    # by `step` slots is bounded by step/N_TOKENS * cache_bytes — for step=256 and
-    # N=60000 that's <0.5%. 10% leaves comfortable headroom for MLX bookkeeping
-    # while still catching a full-buffer-doubling regression by orders of magnitude.
-    per_layer_bytes_keys = (
-        (N_KV_HEADS * N_TOKENS * (HEAD_DIM // EL_PER_INT) * 4)
-        + 2 * (N_KV_HEADS * N_TOKENS * (HEAD_DIM // GROUP_SIZE) * 2)
-    )
-    cache_bytes = 2 * N_FULL_LAYERS * per_layer_bytes_keys  # K + V
-    threshold = int(0.10 * cache_bytes)
     assert peak_decode < threshold, (
-        f"first-decode peak {peak_decode/1e6:.1f} MB exceeds threshold "
+        f"[{kind}] first-decode peak {peak_decode/1e6:.1f} MB exceeds threshold "
         f"{threshold/1e6:.1f} MB (10% of {cache_bytes/1e6:.1f} MB cache). "
         f"Reconstruction is forcing an allocation+concat on the first decode step."
     )
