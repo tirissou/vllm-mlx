@@ -442,11 +442,13 @@ class TurnCacheManager(CacheManager):
                     n_tokens = layer.metadata.get("n_tokens", layer.keys.packed.shape[-2])
                     # Pad to the next `step` boundary so the first decode-step
                     # update_and_fetch lands on the in-place assignment branch
-                    # rather than re-allocating + concatenating the whole buffer
-                    # (which transiently doubles cache memory at GB scale on
-                    # 60k-token hits and OOMs).
+                    # rather than re-allocating + concatenating the whole buffer.
+                    # `((n // step) + 1) * step` (rather than the usual round-up)
+                    # guarantees pad >= 1 even when n_tokens is already aligned —
+                    # an exactly-aligned buffer would otherwise still hit the
+                    # expand branch on the very first step.
                     step = BatchQuantizedKVCache.step
-                    padded_len = ((n_tokens + step - 1) // step) * step
+                    padded_len = ((n_tokens // step) + 1) * step
                     pad = padded_len - n_tokens
 
                     def _pad_qa(qa):
@@ -471,9 +473,35 @@ class TurnCacheManager(CacheManager):
                     from mlx_lm.models.cache import KVCache as _KVCache
 
                     n_tokens = layer.metadata.get("n_tokens", layer.keys.shape[-2])
+                    # Pre-pad to the next `step` boundary so the first decode-step
+                    # update_and_fetch lands on the in-place assignment branch
+                    # rather than `mx.concatenate([n_tokens_buffer, step_zeros])` —
+                    # the same buffer-doubling pattern fixed in the quantized
+                    # branch above. `((n // step) + 1) * step` guarantees pad >= 1
+                    # even when n_tokens is already aligned.
+                    step = _KVCache.step
+                    padded_len = ((n_tokens // step) + 1) * step
+                    pad = padded_len - n_tokens
+
+                    k = layer.keys[..., :n_tokens, :]
+                    v = layer.values[..., :n_tokens, :]
+                    if pad:
+                        k = mx.concatenate(
+                            [k, mx.zeros((*k.shape[:-2], pad, k.shape[-1]), dtype=k.dtype)],
+                            axis=-2,
+                        )
+                        v = mx.concatenate(
+                            [v, mx.zeros((*v.shape[:-2], pad, v.shape[-1]), dtype=v.dtype)],
+                            axis=-2,
+                        )
+
                     cache = _KVCache()
-                    cache.keys = layer.keys[..., :n_tokens, :]
-                    cache.values = layer.values[..., :n_tokens, :]
+                    cache.keys = k
+                    cache.values = v
+                    # offset is the logical token count; cache.keys.shape[-2] is
+                    # padded_len. Attention masking is offset-based, so this is
+                    # what the model expects (see mlx_lm KVCache.update_and_fetch
+                    # which reads `prev = self.offset`).
                     cache.offset = n_tokens
             result[li] = cache
 
