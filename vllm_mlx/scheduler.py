@@ -208,7 +208,25 @@ class _InstrumentedBatchGenerator(BatchGenerator):
         ]
 
     def _next(self):
+        _probe_pre_active = mx.get_active_memory()
+        mx.reset_peak_memory()
+        _probe_n_prompt = len(getattr(self._prompt_batch, "uids", []) or [])
+
         prompt_responses, gen_responses = super()._next()
+
+        _probe_post_active = mx.get_active_memory()
+        _probe_peak = mx.get_peak_memory()
+        if _probe_n_prompt > 0 or _probe_post_active != _probe_pre_active:
+            logger.warning(
+                "[memprobe:step] phase=%s n_prompt=%d pre=%.2fGB post=%.2fGB "
+                "delta=%.2fGB step_peak=%.2fGB",
+                "prefill" if _probe_n_prompt > 0 else "decode",
+                _probe_n_prompt,
+                _probe_pre_active / 1e9,
+                _probe_post_active / 1e9,
+                (_probe_post_active - _probe_pre_active) / 1e9,
+                _probe_peak / 1e9,
+            )
 
         if self._mid_prefill_callback and prompt_responses:
             uid_to_idx = {uid: i for i, uid in enumerate(self._prompt_batch.uids)}
@@ -220,8 +238,36 @@ class _InstrumentedBatchGenerator(BatchGenerator):
                 if self._save_interval > 0 and (processed - last) < self._save_interval:
                     continue
                 idx = uid_to_idx[resp.uid]
+
+                _cb_pre = mx.get_active_memory()
                 per_uid_cache = self._prompt_batch.extract_cache(idx)
+                mx.eval(*[c.keys for c in per_uid_cache if hasattr(c, "keys") and c.keys is not None],
+                        *[c.values for c in per_uid_cache if hasattr(c, "values") and c.values is not None])
+                _cb_post_extract = mx.get_active_memory()
+
                 self._mid_prefill_callback(resp.uid, processed, per_uid_cache)
+                _cb_post_callback = mx.get_active_memory()
+
+                del per_uid_cache
+                import gc as _gc
+                _gc.collect()
+                mx.clear_cache()
+                _cb_post_gc = mx.get_active_memory()
+
+                logger.warning(
+                    "[memprobe:callback] processed=%d pre=%.2fGB "
+                    "post_extract=%.2fGB(+%.2f) post_callback=%.2fGB(+%.2f) "
+                    "post_gc=%.2fGB(net+%.2f)",
+                    processed,
+                    _cb_pre / 1e9,
+                    _cb_post_extract / 1e9,
+                    (_cb_post_extract - _cb_pre) / 1e9,
+                    _cb_post_callback / 1e9,
+                    (_cb_post_callback - _cb_post_extract) / 1e9,
+                    _cb_post_gc / 1e9,
+                    (_cb_post_gc - _cb_pre) / 1e9,
+                )
+
                 self._uid_last_saved[resp.uid] = processed
 
         # Remove tracking for sequences that have left the prompt batch
@@ -1908,8 +1954,39 @@ class Scheduler:
             if pb is None or uid not in pb.uids:
                 continue
             idx = pb.uids.index(uid)
+
+            _cb_pre = mx.get_active_memory()
             per_uid_cache = pb.extract_cache(idx)
+            mx.eval(*[c.keys for c in per_uid_cache if hasattr(c, "keys") and c.keys is not None],
+                    *[c.values for c in per_uid_cache if hasattr(c, "values") and c.values is not None])
+            _cb_post_extract = mx.get_active_memory()
+
             extracted = self._prefix_cache.extract_cache(per_uid_cache)
+            _cb_post_extract_states = mx.get_active_memory()
+
             if extracted:
                 total = (request._cache_state.cached_tokens or 0) + processed
                 self._prefix_cache.on_prefill_checkpoint(request, total, extracted)
+            _cb_post_checkpoint = mx.get_active_memory()
+
+            del per_uid_cache, extracted
+            import gc as _gc
+            _gc.collect()
+            mx.clear_cache()
+            _cb_post_gc = mx.get_active_memory()
+
+            logger.warning(
+                "[memprobe:segend] processed=%d pre=%.2fGB "
+                "post_extract=%.2fGB(+%.2f) post_states=%.2fGB(+%.2f) "
+                "post_checkpoint=%.2fGB(+%.2f) post_gc=%.2fGB(net+%.2f)",
+                processed,
+                _cb_pre / 1e9,
+                _cb_post_extract / 1e9,
+                (_cb_post_extract - _cb_pre) / 1e9,
+                _cb_post_extract_states / 1e9,
+                (_cb_post_extract_states - _cb_post_extract) / 1e9,
+                _cb_post_checkpoint / 1e9,
+                (_cb_post_checkpoint - _cb_post_extract_states) / 1e9,
+                _cb_post_gc / 1e9,
+                (_cb_post_gc - _cb_pre) / 1e9,
+            )

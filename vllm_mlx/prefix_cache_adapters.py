@@ -550,8 +550,11 @@ class TurnCacheManager(CacheManager):
             self._set_miss_state(request)
             return False
 
+        _probe_req_id = getattr(request, "request_id", None) or getattr(request, "uid", "?")
+        _probe_pre_active = mx.get_active_memory()
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
         reconstructed = self._assemble(kv_data, rec_data, self._kv_group_size, self._kv_bits)
+        _probe_n_tokens = sum(l.metadata.get("n_tokens", 0) for l in (kv_data or []) if l is not None)
         del kv_data, rec_data
         # Materialize the KVCache arrays now so the lazy computation graph
         # is freed before decode starts.
@@ -569,6 +572,17 @@ class TurnCacheManager(CacheManager):
                             arrays_to_eval.append(comp)
         if arrays_to_eval:
             mx.eval(*arrays_to_eval)
+        _probe_post_active = mx.get_active_memory()
+        logging.warning(
+            "[memprobe:fetch] req=%s n_tokens=%d pre_assemble=%.2fGB "
+            "post_assemble=%.2fGB delta=%.2fGB peak=%.2fGB",
+            _probe_req_id,
+            _probe_n_tokens,
+            _probe_pre_active / 1e9,
+            _probe_post_active / 1e9,
+            (_probe_post_active - _probe_pre_active) / 1e9,
+            mx.get_peak_memory() / 1e9,
+        )
         if not self.validate(reconstructed):
             if path:
                 self._inner.release(path)
