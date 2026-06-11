@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import mlx.core as mx
 
 from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
+
+if TYPE_CHECKING:
+    from vllm_mlx.turn_prefix_cache import TurnNode
 
 from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
 from .cache_types import KVLayerSegment, RecurrentLayerSegment
@@ -150,6 +153,9 @@ class TurnCacheManager(CacheManager):
         self._inner = inner
         self._kv_bits = kv_bits
         self._kv_group_size = kv_group_size
+        # request_id -> currently pinned leaf node (Active Leaf invariant).
+        # Populated by fetch() on hit, advanced by store(), cleared by release().
+        self._pinned_leaves: dict[str, "TurnNode"] = {}
 
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state

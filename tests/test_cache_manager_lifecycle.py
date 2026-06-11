@@ -1,0 +1,296 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Lifecycle tests for the deepened CacheManager seam ("Active Leaf" model).
+
+These tests drive Tasks 2 and 3 of the deepen-cache-manager-seam plan:
+they assert the externally-visible contract that
+
+  - ``fetch`` pins only the leaf of the matched path,
+  - ``release`` unpins that leaf and clears request cache state,
+  - ``store`` performs "unpin old leaf -> insert -> pin new leaf",
+  - errors during ``store`` roll back to the pre-store leaf pin.
+
+They are expected to FAIL against the current ``TurnCacheManager``
+implementation (which pins every node on the matched path via
+``TurnPrefixCache.match`` and does not yet maintain ``_pinned_leaves``).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from vllm_mlx.kv_cache import RequestCacheState
+from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+from vllm_mlx.request import Request, SamplingParams
+from vllm_mlx.turn_prefix_cache import (
+    Segment,
+    TurnPrefixCache,
+    TurnPrefixCacheConfig,
+)
+
+
+# ── Fixtures / helpers ────────────────────────────────────────────────────
+
+
+def _make_trie() -> TurnPrefixCache:
+    """Trie where every node is a permanent checkpoint (stride=0) and stored
+    in bf16. Keeps configuration deterministic and removes eviction races."""
+    return TurnPrefixCache(
+        TurnPrefixCacheConfig(checkpoint_stride=0, kv_dtype="bf16")
+    )
+
+
+def _make_manager(trie: TurnPrefixCache) -> TurnCacheManager:
+    return TurnCacheManager(trie, kv_bits=None, kv_group_size=64)
+
+
+def _make_request(
+    request_id: str,
+    prompt_token_ids: list[int],
+    turn_boundaries: list[int],
+) -> Request:
+    """Build a Request with the fields the cache layer reads from."""
+    req = Request(
+        request_id=request_id,
+        prompt=" ".join(str(t) for t in prompt_token_ids),
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    req.prompt_token_ids = list(prompt_token_ids)
+    req.num_prompt_tokens = len(prompt_token_ids)
+    req._turn_boundaries = list(turn_boundaries)
+    req._cache_state = RequestCacheState()
+    return req
+
+
+def _stub_assemble_and_validate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bypass _assemble / validate so hit-path tests do not depend on real
+    KV reconstruction. We are testing lifecycle/pinning, not cache contents.
+    """
+    monkeypatch.setattr(
+        TurnCacheManager,
+        "_assemble",
+        staticmethod(lambda kv, rec, *a, **k: [object()]),
+    )
+    monkeypatch.setattr(TurnCacheManager, "validate", lambda self, cache: True)
+
+
+def _insert_two_segment_path(
+    trie: TurnPrefixCache, sys_tokens: list[int], user_tokens: list[int]
+):
+    """Insert a [system, user] path with non-empty kv_data so that
+    find_checkpoint_ancestor will return the leaf rather than None.
+
+    Returns (sys_node, user_leaf).
+    """
+    # A list with no items is truthy-ish? No — an empty list is falsy. We need
+    # non-empty kv_data so find_checkpoint_ancestor accepts the node.
+    # The kv_data items only have to look like KVLayerSegments for the
+    # collect_path_data walk; since we stub _assemble, the actual contents
+    # do not matter.
+    from vllm_mlx.cache_types import KVLayerSegment
+    import mlx.core as mx
+
+    def _dummy_layer(idx: int) -> KVLayerSegment:
+        return KVLayerSegment(
+            keys=mx.zeros((1, 1, 1, 1)),
+            values=mx.zeros((1, 1, 1, 1)),
+            metadata={
+                "class_name": "KVCache",
+                "layer_index": idx,
+                "merge_strategy": "concatenate",
+                "n_tokens": 1,
+            },
+        )
+
+    sys_node = trie.insert(
+        trie.root,
+        Segment(role="system", token_ids=sys_tokens),
+        kv_data=[_dummy_layer(0)],
+        is_system_prompt=True,
+    )
+    user_leaf = trie.insert(
+        sys_node,
+        Segment(role="user", token_ids=user_tokens),
+        kv_data=[_dummy_layer(0)],
+    )
+    return sys_node, user_leaf
+
+
+# ── Tests ─────────────────────────────────────────────────────────────────
+
+
+def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On a hit, only the leaf of the matched path is pinned (Active Leaf).
+
+    This intentionally fails today: ``TurnPrefixCache.match`` pins every node
+    in the path, and ``TurnCacheManager`` does not yet populate
+    ``_pinned_leaves``.
+    """
+    _stub_assemble_and_validate(monkeypatch)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    sys_node, user_leaf = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    req = _make_request(
+        "req-hit",
+        prompt_token_ids=sys_tokens + user_tokens,
+        turn_boundaries=[len(sys_tokens)],  # B_sys = 10 → [system, user]
+    )
+
+    assert manager.fetch(req) is True
+    assert req._cache_state.hit_type == "hit"
+
+    # Active Leaf invariant: only the leaf is pinned.
+    assert user_leaf.ref_count == 1, (
+        f"leaf should have ref_count==1, got {user_leaf.ref_count}"
+    )
+    assert sys_node.ref_count == 0, (
+        "non-leaf ancestors must not be pinned under the Active Leaf model; "
+        f"got sys_node.ref_count == {sys_node.ref_count}"
+    )
+
+    # The manager must remember which leaf belongs to this request.
+    assert req.request_id in manager._pinned_leaves
+    assert manager._pinned_leaves[req.request_id] is user_leaf
+
+
+def test_cache_fetch_miss_initialises_state() -> None:
+    """A miss leaves the trie unpinned and populates miss state on the request."""
+    trie = _make_trie()
+    manager = _make_manager(trie)
+
+    prompt = list(range(20))
+    req = _make_request(
+        "req-miss",
+        prompt_token_ids=prompt,
+        turn_boundaries=[10],  # [system, user] segments, but trie is empty
+    )
+
+    assert manager.fetch(req) is False
+    assert req._cache_state.hit_type == "miss"
+    assert req._cache_state.cached_tokens == 0
+    assert req._cache_state.remaining_tokens == req.prompt_token_ids
+
+    # No leaf was pinned for this request.
+    assert req.request_id not in manager._pinned_leaves
+
+
+def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``release`` undoes the leaf pin from ``fetch`` and clears state."""
+    _stub_assemble_and_validate(monkeypatch)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    _sys_node, user_leaf = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    req = _make_request(
+        "req-release",
+        prompt_token_ids=sys_tokens + user_tokens,
+        turn_boundaries=[len(sys_tokens)],
+    )
+
+    assert manager.fetch(req) is True
+    # Sanity: hit pinned the leaf.
+    assert user_leaf.ref_count == 1
+    assert manager._pinned_leaves.get(req.request_id) is user_leaf
+
+    manager.release(req)
+
+    assert user_leaf.ref_count == 0, "release must unpin the leaf"
+    assert req.request_id not in manager._pinned_leaves, (
+        "release must remove the request from _pinned_leaves"
+    )
+    assert req._cache_state.turn_path == [], (
+        "release must clear request._cache_state.turn_path"
+    )
+
+
+def test_cache_store_advancement_unpins_old_pins_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``store`` advances the active leaf: old leaf is unpinned, new leaf pinned."""
+    _stub_assemble_and_validate(monkeypatch)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    _sys_node, leaf_a = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    req = _make_request(
+        "req-store",
+        prompt_token_ids=sys_tokens + user_tokens,
+        turn_boundaries=[len(sys_tokens)],
+    )
+
+    assert manager.fetch(req) is True
+    assert leaf_a.ref_count == 1
+    assert manager._pinned_leaves[req.request_id] is leaf_a
+
+    # Simulate the model having produced output tokens; ``store`` requires
+    # output_token_ids to be non-empty.
+    req.output_token_ids = [42, 43]
+
+    # store with no cache layers is sufficient for lifecycle testing; the
+    # important effect is that a new node is inserted below leaf_a.
+    manager.store(req, tokens=req.output_token_ids, cache=[])
+
+    # The newly inserted child of leaf_a is the new leaf.
+    new_children = list(leaf_a.children.values())
+    assert len(new_children) == 1, (
+        "store should insert exactly one new child under the previous leaf"
+    )
+    leaf_b = new_children[0]
+
+    assert leaf_a.ref_count == 0, "old leaf must be unpinned by store"
+    assert leaf_b.ref_count == 1, "new leaf must be pinned by store"
+    assert manager._pinned_leaves[req.request_id] is leaf_b
+    assert req._cache_state.turn_path[-1] is leaf_b, (
+        "request.turn_path must end at the new pinned leaf"
+    )
+
+
+def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If insertion raises, ``store`` rolls back so the old leaf stays pinned."""
+    _stub_assemble_and_validate(monkeypatch)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    _sys_node, leaf_a = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    req = _make_request(
+        "req-rollback",
+        prompt_token_ids=sys_tokens + user_tokens,
+        turn_boundaries=[len(sys_tokens)],
+    )
+
+    assert manager.fetch(req) is True
+    assert leaf_a.ref_count == 1
+    assert manager._pinned_leaves[req.request_id] is leaf_a
+
+    req.output_token_ids = [42, 43]
+
+    class _BoomError(RuntimeError):
+        pass
+
+    def _raise(*args, **kwargs):
+        raise _BoomError("simulated insert failure")
+
+    monkeypatch.setattr(TurnPrefixCache, "_insert_node", _raise)
+
+    with pytest.raises(_BoomError):
+        manager.store(req, tokens=req.output_token_ids, cache=[])
+
+    # Rollback invariant: leaf_a is still the pinned leaf for this request.
+    assert leaf_a.ref_count == 1, (
+        "old leaf ref_count must remain 1 after a failed store"
+    )
+    assert manager._pinned_leaves[req.request_id] is leaf_a, (
+        "_pinned_leaves must still map req -> leaf_a after a failed store"
+    )
