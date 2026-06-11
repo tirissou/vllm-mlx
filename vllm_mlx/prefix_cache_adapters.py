@@ -787,6 +787,11 @@ class TurnCacheManager(CacheManager):
         else:
             kv_layers, rec_layers = [], []
 
+        # Snapshot the previous pinned leaf BEFORE any mutation so that an
+        # exception from insert() leaves the existing pin intact (implicit
+        # rollback — same shape as store()).
+        old_leaf = self._pinned_leaves.get(request.request_id)
+
         new_node = self._inner.insert(
             parent,
             segment,
@@ -794,6 +799,14 @@ class TurnCacheManager(CacheManager):
             recurrent_data=rec_layers or None,
             is_system_prompt=is_sys,
         )
+
+        # Insert succeeded — advance the active leaf: release the old leaf
+        # (if any) and pin the new one.
+        if old_leaf is not None:
+            self._inner.release([old_leaf])
+        with self._inner._lock:
+            new_node.ref_count += 1
+        self._pinned_leaves[request.request_id] = new_node
         if cs is not None:
             cs.turn_path.append(new_node)
 
