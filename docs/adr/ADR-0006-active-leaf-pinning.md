@@ -22,7 +22,7 @@ The two invariants below are paired and load-bearing. Changing one without re-ex
 
 `TurnCacheManager._pinned_leaves: dict[request_id, TurnNode]` is the sole owner of `Request -> pinned node` state. At most one node per request is pinned at any time, and that node is always a leaf of the trie at the moment of pinning.
 
-The four mutators are `fetch`, `store`, `on_prefill_checkpoint`, and `release`. Each one advances or clears the pin in the same shape:
+The four mutators are `fetch`, `store`, `on_prefill_checkpoint`, and `release` (`store` and `on_prefill_checkpoint` insert a new node; `fetch` pins a matched node; `release` clears the pin). Each one advances or clears the pin in the same shape:
 
 1. Snapshot the current pinned leaf (if any).
 2. Mutate the trie (insert / match / nothing).
