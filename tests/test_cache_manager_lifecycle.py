@@ -457,8 +457,8 @@ def test_fetch_failure_no_checkpoint_ancestor_releases_pin(
 ) -> None:
     """When find_checkpoint_ancestor returns None after a match, fetch must
     release the leaf pin, drop _pinned_leaves[req], and set miss state."""
-    _stub_assemble_and_validate(monkeypatch)
-
+    # _assemble and validate are never reached on this code path;
+    # find_checkpoint_ancestor returning None short-circuits before them.
     trie = _make_trie()
     sys_tokens = list(range(10))
     user_tokens = list(range(10, 15))
