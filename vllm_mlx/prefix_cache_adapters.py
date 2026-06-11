@@ -634,10 +634,17 @@ class TurnCacheManager(CacheManager):
         matched_depth = len(path)
         parent = path[-1] if path else self._inner.root
         new_segments = segments[matched_depth:]
-        if not new_segments:
-            return False
 
-        response_tokens = list(segments[-1].token_ids) + list(request.output_token_ids)
+        if new_segments:
+            # Combine the last unmatched prompt segment with the generated output
+            # into a single response node.
+            response_tokens = list(segments[-1].token_ids) + list(
+                request.output_token_ids
+            )
+        else:
+            # Full prompt was already in the trie; record only the new output as
+            # a child of the deepest matched node.
+            response_tokens = list(request.output_token_ids)
 
         if cache and not isinstance(cache[0], dict):
             from .kv_cache import extract_layer_state
@@ -657,12 +664,27 @@ class TurnCacheManager(CacheManager):
         else:
             kv_layers, rec_layers = [], []
 
-        self._inner.insert(
+        # Snapshot current pinned leaf BEFORE any mutation so we can roll back
+        # cleanly on insert failure.
+        old_leaf = self._pinned_leaves.get(request.request_id)
+
+        # Insert first; only touch ref_counts / _pinned_leaves after success so
+        # that an exception leaves the previous leaf pin intact.
+        new_leaf = self._inner.insert(
             parent,
             Segment(role="conversation", token_ids=response_tokens),
             kv_data=kv_layers or None,
             recurrent_data=rec_layers or None,
         )
+
+        # Success path: advance the active leaf — unpin the old, pin the new.
+        if old_leaf is not None:
+            self._inner.release([old_leaf])
+        with self._inner._lock:
+            new_leaf.ref_count += 1
+        self._pinned_leaves[request.request_id] = new_leaf
+        if cs is not None:
+            cs.turn_path = self._inner._inorder_path(new_leaf)
         return True
 
     @staticmethod
