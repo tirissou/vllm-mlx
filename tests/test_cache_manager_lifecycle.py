@@ -294,3 +294,156 @@ def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert manager._pinned_leaves[req.request_id] is leaf_a, (
         "_pinned_leaves must still map req -> leaf_a after a failed store"
     )
+
+
+def test_checkpoint_from_miss_pins_new_leaf() -> None:
+    """Miss path: the first on_prefill_checkpoint must pin the inserted node
+    even though _pinned_leaves had no prior entry.
+
+    Today this fails: on_prefill_checkpoint inserts the node but never touches
+    _pinned_leaves, so the new leaf has ref_count == 0 and is evictable.
+    """
+    trie = _make_trie()
+    manager = _make_manager(trie)
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    prompt = sys_tokens + user_tokens
+    req = _make_request(
+        "req-ckpt-miss",
+        prompt_token_ids=prompt,
+        turn_boundaries=[len(sys_tokens), len(prompt)],
+    )
+
+    # Miss populates cache_state.turn_path == [] and leaves _pinned_leaves empty.
+    assert manager.fetch(req) is False
+    assert req.request_id not in manager._pinned_leaves
+
+    # Drive the first checkpoint at the system-boundary (abs_idx=0).
+    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
+                                  extracted_cache=[])
+
+    turn_path = req._cache_state.turn_path
+    assert len(turn_path) == 1, "checkpoint should append exactly one node"
+    new_leaf = turn_path[-1]
+
+    assert new_leaf.ref_count == 1, (
+        f"new checkpoint leaf must be pinned, got ref_count={new_leaf.ref_count}"
+    )
+    assert manager._pinned_leaves[req.request_id] is new_leaf
+
+
+def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hit path: fetch pins leaf A; the next checkpoint inserts B as child of A
+    and must unpin A while pinning B.
+
+    Today this fails: A stays pinned (interior-pin is wasted) and B has
+    ref_count == 0 (evictable while prefill is still running).
+    """
+    _stub_assemble_and_validate(monkeypatch)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    _sys_node, leaf_a = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    # Prompt includes a NEW third segment past the matched [system, user] path.
+    # Boundaries are [10, 15, 20] for prompt of length 20, so messages_to_segments
+    # produces 3 segments (system, conversation, user). The matched path after
+    # fetch has depth 2. The early-return guard inside on_prefill_checkpoint is
+    # `if len(turn_path) > abs_idx: return`, so we must call it at the boundary
+    # whose abs_idx == 2 — i.e. total_tokens_prefilled == len(prompt).
+    extra_tokens = list(range(15, 20))
+    prompt = sys_tokens + user_tokens + extra_tokens
+    req = _make_request(
+        "req-ckpt-hit",
+        prompt_token_ids=prompt,
+        turn_boundaries=[
+            len(sys_tokens),
+            len(sys_tokens) + len(user_tokens),
+            len(prompt),
+        ],
+    )
+
+    assert manager.fetch(req) is True
+    assert leaf_a.ref_count == 1
+    assert manager._pinned_leaves[req.request_id] is leaf_a
+
+    # Drive a checkpoint at abs_idx=2 (past the matched depth of 2).
+    manager.on_prefill_checkpoint(
+        req,
+        total_tokens_prefilled=len(prompt),
+        extracted_cache=[],
+    )
+
+    new_children = list(leaf_a.children.values())
+    assert len(new_children) == 1
+    leaf_b = new_children[0]
+
+    assert leaf_a.ref_count == 0, "checkpoint must unpin the previous active leaf"
+    assert leaf_b.ref_count == 1, "checkpoint must pin the newly inserted leaf"
+    assert manager._pinned_leaves[req.request_id] is leaf_b
+    assert req._cache_state.turn_path[-1] is leaf_b
+
+
+def test_consecutive_checkpoints_advance_leaf() -> None:
+    """Two checkpoints in a row from a miss: each advances the pin to the
+    newest leaf; the intermediate node ends at ref_count == 0."""
+    trie = _make_trie()
+    manager = _make_manager(trie)
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    prompt = sys_tokens + user_tokens
+    req = _make_request(
+        "req-ckpt-chain",
+        prompt_token_ids=prompt,
+        turn_boundaries=[len(sys_tokens), len(prompt)],
+    )
+
+    assert manager.fetch(req) is False
+
+    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
+                                  extracted_cache=[])
+    node_sys = req._cache_state.turn_path[-1]
+    assert node_sys.ref_count == 1
+    assert manager._pinned_leaves[req.request_id] is node_sys
+
+    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(prompt),
+                                  extracted_cache=[])
+    node_user = req._cache_state.turn_path[-1]
+
+    assert node_user is not node_sys, "second checkpoint must insert a new node"
+    assert node_sys.ref_count == 0, "previous checkpoint leaf must be unpinned"
+    assert node_user.ref_count == 1, "newest checkpoint leaf must be pinned"
+    assert manager._pinned_leaves[req.request_id] is node_user
+
+
+def test_release_after_checkpoint_unpins_latest_leaf() -> None:
+    """Abort during prefill: fetch (miss) -> checkpoint -> release should
+    unpin the checkpoint leaf, not the (non-existent) original leaf, and
+    leave no dangling _pinned_leaves entry."""
+    trie = _make_trie()
+    manager = _make_manager(trie)
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    prompt = sys_tokens + user_tokens
+    req = _make_request(
+        "req-ckpt-abort",
+        prompt_token_ids=prompt,
+        turn_boundaries=[len(sys_tokens), len(prompt)],
+    )
+
+    assert manager.fetch(req) is False
+    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
+                                  extracted_cache=[])
+    leaf = req._cache_state.turn_path[-1]
+    assert leaf.ref_count == 1
+
+    manager.release(req)
+
+    assert leaf.ref_count == 0, "release must unpin the checkpoint leaf"
+    assert req.request_id not in manager._pinned_leaves
+    assert req._cache_state.turn_path == []
