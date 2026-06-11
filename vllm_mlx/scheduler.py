@@ -1060,13 +1060,13 @@ class Scheduler:
 
         if request is not None:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
-            # Release cache references so Metal buffers can be freed
+            # Release cache references so Metal buffers can be freed.
+            # release() is a no-op if no leaf is pinned and also clears
+            # the manager-owned turn_path.
             request._cache_state.cache = None
             request._cache_state.decoded_cache = None
-            turn_path = request._cache_state.turn_path
-            if turn_path and self._prefix_cache is not None:
+            if self._prefix_cache is not None:
                 self._prefix_cache.release(request)
-                request._cache_state.turn_path = []
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
 
@@ -1130,11 +1130,11 @@ class Scheduler:
                             f"prompt_tokens={len(request.prompt_token_ids)}"
                         )
                 else:
-                    request._cache_state.hit_type = "miss"
-                    request._cache_state.cached_tokens = 0
-                    request._cache_state.turn_path = []
+                    # No prefix cache configured: RequestCacheState defaults
+                    # already encode a miss (hit_type="miss", cached_tokens=0,
+                    # turn_path=[], prefill_boundaries=[]). We only set
+                    # remaining_tokens so downstream code that reads it works.
                     request._cache_state.remaining_tokens = request.prompt_token_ids
-                    request._cache_state.prefill_boundaries = []
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -1238,36 +1238,29 @@ class Scheduler:
                     )
             except Exception as e:
                 if cache_to_use is not None:
-                    # Release the nodes to avoid refcount leaks if the insert fails
-                    if request._cache_state.turn_path:
+                    # Release the pinned leaf (release() is a no-op when
+                    # nothing is pinned and also clears turn_path).
+                    if self._prefix_cache is not None:
                         self._prefix_cache.release(request)
 
                     logger.warning(
                         f"[cache_insert_error] request={request.request_id[:12]} "
                         f"cache insert failed ({e}), retrying without cache"
                     )
+                    # Reset scheduler-owned cache fields. turn_path is
+                    # cache-manager-owned and was already cleared by release().
                     cache_to_use = None
                     request._cache_state.cache = None
                     request._cache_state.hit_type = "miss"
                     request._cache_state.cached_tokens = 0
-                    request._cache_state.turn_path = []
                     request._cache_state.remaining_tokens = request.prompt_token_ids
                     # Recovery: full prefill without cache → no segments needed
                     request._cache_state.prefill_boundaries = []
                     tokens_to_process = request.prompt_token_ids
-                    segments = _split_at_boundaries(
-                        tokens_to_process, request._cache_state.prefill_boundaries
-                    )
-                    use_segments = len(segments) > 1
                     insert_kwargs["caches"] = None
-                    if use_segments:
-                        uids = self.batch_generator.insert_segments(
-                            [segments], **insert_kwargs
-                        )
-                    else:
-                        uids = self.batch_generator.insert(
-                            [tokens_to_process], **insert_kwargs
-                        )
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process], **insert_kwargs
+                    )
                 else:
                     raise
 
@@ -1448,7 +1441,6 @@ class Scheduler:
                     self._prefix_cache.release(request)
                 except Exception as e:
                     logger.debug(f"[cache_store] release failed for {request_id}: {e}")
-                request._cache_state.turn_path = []
 
             # Evaluate stored cache tensors incrementally (per-layer) to prevent
             # a deferred batch evaluation spike when all lazy ops resolve at once.
@@ -1586,6 +1578,10 @@ class Scheduler:
             # Reset request state
             request.status = RequestStatus.WAITING
             request.batch_uid = None
+            # Release any pinned leaf so refcounts don't leak when the
+            # request is bounced back to waiting and re-fetches on retry.
+            if self._prefix_cache is not None:
+                self._prefix_cache.release(request)
             request._cache_state.cache = None
             request._cache_state.cached_tokens = 0
             request._cache_state.remaining_tokens = request.prompt_token_ids

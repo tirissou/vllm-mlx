@@ -188,9 +188,16 @@ def test_cache_insert_error_resets_state_with_turn_path_clear():
     req._cache_state.remaining_tokens = [4, 5]
     req._cache_state.prefill_boundaries = []
 
-    # Mock _prefix_cache with boundaries for the recovery branch
+    # Mock _prefix_cache with boundaries for the recovery branch.
+    # release() now owns clearing the manager-owned turn_path, so make the
+    # mock simulate that side-effect (the real TurnCacheManager does this).
     mock_cache = MagicMock()
     mock_cache.boundaries.return_value = []
+
+    def _release_clears_turn_path(request):
+        request._cache_state.turn_path = []
+
+    mock_cache.release.side_effect = _release_clears_turn_path
     scheduler._prefix_cache = mock_cache
 
     # Mock batch_generator.insert to raise an error, then succeed on retry
