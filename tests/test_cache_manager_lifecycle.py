@@ -450,3 +450,64 @@ def test_release_after_checkpoint_unpins_latest_leaf() -> None:
     assert leaf.ref_count == 0, "release must unpin the checkpoint leaf"
     assert req.request_id not in manager._pinned_leaves
     assert req._cache_state.turn_path == []
+
+
+def test_fetch_failure_no_checkpoint_ancestor_releases_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When find_checkpoint_ancestor returns None after a match, fetch must
+    release the leaf pin, drop _pinned_leaves[req], and set miss state."""
+    _stub_assemble_and_validate(monkeypatch)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    _sys_node, user_leaf = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    req = _make_request(
+        "req-no-ancestor",
+        prompt_token_ids=sys_tokens + user_tokens,
+        turn_boundaries=[len(sys_tokens)],
+    )
+
+    # Force the post-match failure mode: no usable checkpoint ancestor.
+    monkeypatch.setattr(TurnPrefixCache, "find_checkpoint_ancestor",
+                        lambda self, path: None)
+
+    assert manager.fetch(req) is False
+    assert req._cache_state.hit_type == "miss"
+    assert user_leaf.ref_count == 0, "leaf pin must be released on this failure"
+    assert req.request_id not in manager._pinned_leaves
+
+
+def test_fetch_failure_validate_returns_false_releases_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When validate(reconstructed) returns False, fetch must release the
+    leaf pin, drop _pinned_leaves[req], and set miss state."""
+    # Stub _assemble (so we don't depend on real reconstruction) but force
+    # validate False instead of True.
+    monkeypatch.setattr(
+        TurnCacheManager,
+        "_assemble",
+        staticmethod(lambda kv, rec, *a, **k: [object()]),
+    )
+    monkeypatch.setattr(TurnCacheManager, "validate", lambda self, cache: False)
+
+    trie = _make_trie()
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    _sys_node, user_leaf = _insert_two_segment_path(trie, sys_tokens, user_tokens)
+
+    manager = _make_manager(trie)
+    req = _make_request(
+        "req-bad-validate",
+        prompt_token_ids=sys_tokens + user_tokens,
+        turn_boundaries=[len(sys_tokens)],
+    )
+
+    assert manager.fetch(req) is False
+    assert req._cache_state.hit_type == "miss"
+    assert user_leaf.ref_count == 0, "leaf pin must be released on validate failure"
+    assert req.request_id not in manager._pinned_leaves
