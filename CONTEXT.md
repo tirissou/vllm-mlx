@@ -20,6 +20,10 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 
 **EvictableCache** — Superseded by `SpillableCache`. Do not use.
 
+**Active Leaf pinning** — invariant enforced by `TurnCacheManager`. For each in-flight request, exactly one trie node (the deepest currently-relevant leaf) is pinned via `ref_count`. Mutators: `fetch` pins the matched leaf, `store` and `on_prefill_checkpoint` insert-then-advance (release old leaf, pin new leaf), `release` unpins the current leaf. The mapping `request_id -> pinned leaf` lives in `TurnCacheManager._pinned_leaves`; the Scheduler never touches it.
+
+**Leaf-only eviction** — invariant enforced by `TurnPrefixCache`. A node is evictable iff `len(children) == 0` AND `ref_count == 0`. Interior nodes are never evicted. This is what makes Active Leaf safe with O(1) per-request bookkeeping: pinning just the leaf is sufficient because everything above it is protected structurally.
+
 ---
 
 ## Spill delegate contract
