@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
 from .cache_types import KVLayerSegment, RecurrentLayerSegment
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
 
 def _linearize(tensor: "mx.array", offset: int, max_size: int) -> "mx.array":
     """Unwrap a RotatingKVCache ring buffer into a contiguous linear sequence."""
