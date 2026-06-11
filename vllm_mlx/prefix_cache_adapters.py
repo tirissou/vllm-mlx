@@ -807,6 +807,8 @@ class TurnCacheManager(CacheManager):
         with self._inner._lock:
             new_node.ref_count += 1
         self._pinned_leaves[request.request_id] = new_node
+        # Append rather than rebuild the full path: checkpoint always inserts
+        # depth abs_idx in order, so the path is already correct up to abs_idx-1.
         if cs is not None:
             cs.turn_path.append(new_node)
 
