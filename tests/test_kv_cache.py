@@ -387,9 +387,11 @@ class TestTurnCacheAdapterFetch:
         req = _make_turn_request(list(range(50)), [])  # no boundaries → no segments
         assert adapter.fetch(req) is False
 
-    def test_release_noop_on_none_handle(self):
+    def test_release_noop_when_no_pinned_leaf(self):
         adapter, _ = self._make_adapter()
-        adapter.release(None)  # must not raise
+        # Request that was never fetched: no pinned leaf, release must be a no-op.
+        req = _make_turn_request(list(range(10)), [])
+        adapter.release(req)  # must not raise
 
     def test_release_decrements_refcount(self):
         """release(path) decrements ref counts on matched nodes."""

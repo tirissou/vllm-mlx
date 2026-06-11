@@ -1065,7 +1065,7 @@ class Scheduler:
             request._cache_state.decoded_cache = None
             turn_path = request._cache_state.turn_path
             if turn_path and self._prefix_cache is not None:
-                self._prefix_cache.release(turn_path)
+                self._prefix_cache.release(request)
                 request._cache_state.turn_path = []
         self.finished_req_ids.add(request_id)
         self._cleanup_detokenizer(request_id)
@@ -1240,7 +1240,7 @@ class Scheduler:
                 if cache_to_use is not None:
                     # Release the nodes to avoid refcount leaks if the insert fails
                     if request._cache_state.turn_path:
-                        self._prefix_cache.release(request._cache_state.turn_path)
+                        self._prefix_cache.release(request)
 
                     logger.warning(
                         f"[cache_insert_error] request={request.request_id[:12]} "
@@ -1444,9 +1444,8 @@ class Scheduler:
                         logger.debug(
                             f"[cache_store] store failed for {request_id}: {e}"
                         )
-                _handle = request._cache_state.turn_path
                 try:
-                    self._prefix_cache.release(_handle)
+                    self._prefix_cache.release(request)
                 except Exception as e:
                     logger.debug(f"[cache_store] release failed for {request_id}: {e}")
                 request._cache_state.turn_path = []

@@ -62,7 +62,7 @@ class CacheManager(ABC):
 
     # ── Default no-ops (override as needed) ──────────────────────────────────
 
-    def release(self, handle: Any) -> None:
+    def release(self, request) -> None:
         pass
 
     def get_stats(self) -> dict:
@@ -545,14 +545,20 @@ class TurnCacheManager(CacheManager):
             self._set_miss_state(request)
             return False
 
+        # Active Leaf invariant: match() incremented ref_count on every node
+        # in `path`. Release the ancestors so only the leaf retains its +1.
+        if len(path) > 1:
+            self._inner.release(path[:-1])
+
         cs = getattr(request, "_cache_state", None)
         if cs is not None:
             cs.turn_path = path
 
         ancestor = self._inner.find_checkpoint_ancestor(path)
         if ancestor is None:
-            if path:
-                self._inner.release(path)
+            # Release the remaining leaf pin; this is a miss after all.
+            self._inner.release([path[-1]])
+            self._pinned_leaves.pop(request.request_id, None)
             self._set_miss_state(request)
             return False
 
@@ -590,8 +596,9 @@ class TurnCacheManager(CacheManager):
             mx.get_peak_memory() / 1e9,
         )
         if not self.validate(reconstructed):
-            if path:
-                self._inner.release(path)
+            # Release the remaining leaf pin; this is a miss after all.
+            self._inner.release([path[-1]])
+            self._pinned_leaves.pop(request.request_id, None)
             self._set_miss_state(request)
             return False
         cached_tokens = ancestor.n_tokens
@@ -601,6 +608,8 @@ class TurnCacheManager(CacheManager):
             cs.cached_tokens = cached_tokens
             cs.remaining_tokens = list(request.prompt_token_ids[cached_tokens:])
             cs.prefill_boundaries = self.boundaries(request)
+        # Record the pinned leaf so release() can find it.
+        self._pinned_leaves[request.request_id] = path[-1]
         return True
 
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:
@@ -696,9 +705,15 @@ class TurnCacheManager(CacheManager):
             result.append(s)
         return result
 
-    def release(self, handle) -> None:
-        if handle is not None:
-            self._inner.release(handle)
+    def release(self, request) -> None:
+        leaf = self._pinned_leaves.pop(request.request_id, None)
+        if leaf is not None:
+            # Go through the inner trie's release() so the node is re-added to
+            # the eviction heap if it just became evictable.
+            self._inner.release([leaf])
+        cs = getattr(request, "_cache_state", None)
+        if cs is not None:
+            cs.turn_path = []
 
     def get_stats(self) -> dict:
         return {}

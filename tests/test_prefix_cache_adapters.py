@@ -118,19 +118,29 @@ def test_turn_cache_adapter_store_returns_false_when_no_output():
     assert adapter.store(req, []) is False
 
 
-def test_turn_cache_adapter_release_calls_inner_release():
-    """TurnCacheManager.release() must forward to inner.release()."""
+def test_turn_cache_adapter_release_unpins_recorded_leaf():
+    """TurnCacheManager.release(request) unpins the pinned leaf via inner.release()."""
     inner = MagicMock()
     adapter = TurnCacheManager(inner)
-    path = [MagicMock(), MagicMock()]
-    adapter.release(path)
-    inner.release.assert_called_once_with(path)
+    leaf = MagicMock()
+    req = MagicMock()
+    req.request_id = "r-1"
+    req._cache_state = MagicMock(turn_path=[MagicMock(), leaf])
+    adapter._pinned_leaves[req.request_id] = leaf
+    adapter.release(req)
+    inner.release.assert_called_once_with([leaf])
+    assert req.request_id not in adapter._pinned_leaves
+    assert req._cache_state.turn_path == []
 
 
-def test_turn_cache_adapter_release_noop_on_none():
+def test_turn_cache_adapter_release_noop_when_no_pinned_leaf():
+    """If no leaf is recorded for the request, release is a no-op on the trie."""
     inner = MagicMock()
     adapter = TurnCacheManager(inner)
-    adapter.release(None)  # must not raise
+    req = MagicMock()
+    req.request_id = "r-missing"
+    req._cache_state = MagicMock(turn_path=[])
+    adapter.release(req)  # must not raise
     inner.release.assert_not_called()
 
 
