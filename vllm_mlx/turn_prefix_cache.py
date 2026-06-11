@@ -828,12 +828,10 @@ class TurnPrefixCache:
 
         return True
 
-    def visualize(self, max_depth: int = 10, tokenizer=None) -> str:
-        """Return a tree representation of the trie structure.
+    def visualize(self, max_depth: int = 20) -> str:
+        """Return a compact tree representation of the trie structure.
 
-        Args:
-            max_depth: Maximum depth to traverse
-            tokenizer: Optional tokenizer to decode tokens (must have decode() method)
+        Pinned nodes (ref_count > 0) are highlighted in red via ANSI codes.
         """
         lines = []
 
@@ -849,63 +847,27 @@ class TurnPrefixCache:
                 else " "
             )
             label = f"[{ntok}t {ckpt}{has_kv}{has_state}]"
-
-            if node.token_ids:
-                first_tokens = (
-                    node.token_ids[:10]
-                    if len(node.token_ids) >= 10
-                    else node.token_ids
-                )
-                last_tokens = (
-                    node.token_ids[-10:]
-                    if len(node.token_ids) >= 10
-                    else node.token_ids
-                )
-
-                # Try to decode tokens to text
-                if tokenizer:
-                    try:
-                        # Handle both direct tokenizer with decode() and wrapped tokenizer
-                        tok = tokenizer
-                        if hasattr(tokenizer, "tokenizer"):
-                            tok = tokenizer.tokenizer
-
-                        if hasattr(tok, "decode"):
-                            text = tok.decode(last_tokens)
-                            # Escape newlines and limit length for display
-                            text = text.replace("\n", "\\n").replace("\r", "\\r")
-                            if len(text) > 80:
-                                text = text[:47] + "..."
-                            label += f" | {text}"
-                        else:
-                            # Fallback to token IDs if decode not available
-                            tokens_str = ",".join(str(t) for t in last_tokens)
-                            label += f" ...{tokens_str}"
-                    except Exception:
-                        # If decode fails, show token IDs
-                        tokens_str = ",".join(str(t) for t in last_tokens)
-                        label += f" ...{tokens_str}"
-                else:
-                    # No tokenizer, show token IDs
-                    end = ",".join(str(t) for t in last_tokens)
-                    start = ",".join(str(t) for t in first_tokens)
-                    tokens_str = start + ", ..., " + end
-                    label += f" ...{tokens_str}"
-
+            if node.ref_count > 0:
+                label = f"\033[31m{label}\033[0m"
             return label
 
         def visit(
-            node: TurnNode, prefix: str = "", is_root: bool = False, depth: int = 0
+            node: TurnNode,
+            self_prefix: str = "",
+            child_prefix: str = "",
+            is_root: bool = False,
+            depth: int = 0,
         ):
             if depth > max_depth:
                 return
-            lines.append(prefix + node_label(node, is_root))
+            lines.append(self_prefix + node_label(node, is_root))
             children = list(node.children.values())
             for i, child in enumerate(children):
                 is_last = i == len(children) - 1
-                ext = "└── " if is_last else "├── "
-                new_prefix = prefix + ("    " if is_last else "│   ")
-                visit(child, new_prefix, depth=depth + 1)
+                if is_last:
+                    visit(child, child_prefix + "└ ", child_prefix + "  ", depth=depth + 1)
+                else:
+                    visit(child, child_prefix + "├ ", child_prefix + "│ ", depth=depth + 1)
 
         visit(self.root, is_root=True)
         summary = (
