@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lifecycle tests for the deepened CacheManager seam ("Active Leaf" model).
 
-These tests drive Tasks 2 and 3 of the deepen-cache-manager-seam plan:
-they assert the externally-visible contract that
+These tests assert the externally-visible contract that
 
   - ``fetch`` pins only the leaf of the matched path,
   - ``release`` unpins that leaf and clears request cache state,
   - ``store`` performs "unpin old leaf -> insert -> pin new leaf",
-  - errors during ``store`` roll back to the pre-store leaf pin.
+  - errors during ``store`` roll back to the pre-store leaf pin,
+  - ``on_prefill_checkpoint`` advances the active leaf the same way ``store`` does.
 
-They are expected to FAIL against the current ``TurnCacheManager``
-implementation (which pins every node on the matched path via
-``TurnPrefixCache.match`` and does not yet maintain ``_pinned_leaves``).
+The first five tests (fetch/release/store lifecycle) pass on the current
+implementation.  The four ``test_checkpoint_*`` tests are intentionally red
+until Task 2 (on_prefill_checkpoint active-leaf advancement) is implemented.
 """
 
 from __future__ import annotations
@@ -378,7 +378,7 @@ def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     new_children = list(leaf_a.children.values())
-    assert len(new_children) == 1
+    assert len(new_children) == 1, "checkpoint must insert exactly one child under leaf_a"
     leaf_b = new_children[0]
 
     assert leaf_a.ref_count == 0, "checkpoint must unpin the previous active leaf"
@@ -407,7 +407,9 @@ def test_consecutive_checkpoints_advance_leaf() -> None:
     manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
                                   extracted_cache=[])
     node_sys = req._cache_state.turn_path[-1]
-    assert node_sys.ref_count == 1
+    # These two assertions are also part of the expected red state today
+    # (first checkpoint does not pin): both will pass once Task 2 is done.
+    assert node_sys.ref_count == 1, "first checkpoint must pin the inserted node"
     assert manager._pinned_leaves[req.request_id] is node_sys
 
     manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(prompt),
@@ -440,7 +442,8 @@ def test_release_after_checkpoint_unpins_latest_leaf() -> None:
     manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
                                   extracted_cache=[])
     leaf = req._cache_state.turn_path[-1]
-    assert leaf.ref_count == 1
+    # This assertion is also red today (checkpoint never pins): it passes once Task 2 is done.
+    assert leaf.ref_count == 1, "checkpoint must have pinned the leaf before release"
 
     manager.release(req)
 
