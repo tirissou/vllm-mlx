@@ -39,9 +39,11 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 
 ## Trie storage types
 
-**KVLayerSegment** — immutable snapshot of one transformer layer's KV state stored in a `TurnNode`. Holds `keys: QuantizedArray` and `values: QuantizedArray` in mlx-lm's native group-quantized format (`packed: uint32`, `scales: bfloat16`, `biases: bfloat16`), plus a metadata dict (`layer_index`, `merge_strategy`, and rotating-cache fields `max_size`/`keep`/`offset`). Not a decode buffer — callers must not treat it as one. Compare with `BatchQuantizedKVCache` (live, mutable) and `QuantizedKVCache` (live, single-sequence).
+**KVLayerSegment** — immutable snapshot of one transformer layer's KV state stored in a `TurnNode`. Holds `keys: QuantizedArray` and `values: QuantizedArray` in mlx-lm's native group-quantized format (`packed: uint32`, `scales: bfloat16`, `biases: bfloat16`), plus a metadata dict (`layer_index`, `merge_strategy`, `bits` (int or None — the precision used to store this layer), and rotating-cache fields `max_size`/`keep`/`offset`). Not a decode buffer — callers must not treat it as one. Compare with `BatchQuantizedKVCache` (live, mutable) and `QuantizedKVCache` (live, single-sequence).
 
 `KVLayerSegment.concat(layers)` — classmethod. Concatenates a list of same-layer segments along the sequence axis (`axis=-2`) by concatenating `packed`, `scales`, and `biases` arrays independently. Called by `collect_path_data()` for `merge_strategy='concatenate'` (standard KV) layers; rotating layers use `layers[-1]` directly.
+
+**KVQuantPolicy** — immutable dataclass in `cache_types.py`. Maps cache-class name → bits-or-None via `bits_for(class_name)`: `'RotatingKVCache'` → `sliding_bits`, any `'*KVCache'` → `full_bits`, everything else → `None`. Owned by `TurnCacheManager` (one per process, set at construction); consulted by `_segment` at write time. Smart defaults: `sliding_bits=None` (bf16), `full_bits=8` (q8). See ADR-0007.
 
 **RecurrentLayerSegment** — immutable snapshot of one recurrent layer's state stored in a `TurnNode`. Holds raw arrays plus `class_ref` (the concrete mlx-lm class) so `_assemble()` can call `class_ref.from_state(arrays, meta_state)` at reconstruction time without a class-name dispatch table.
 
