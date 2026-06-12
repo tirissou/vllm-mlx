@@ -127,3 +127,248 @@ class CacheDiskStore(Protocol):
     def get_total_bytes(self) -> int: ...
 
     def close(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Concrete implementation
+# ---------------------------------------------------------------------------
+
+import hashlib
+import json
+import logging
+import os
+import struct
+from pathlib import Path
+
+import mlx.core as mx
+
+from vllm_mlx.cache_types import KVLayerSegment, RecurrentLayerSegment
+
+_DISK_FORMAT_VERSION = 1
+_INDEX_NAME = "_index.json"
+
+logger = logging.getLogger(__name__)
+
+
+def _node_hash(key: NodeKey) -> str:
+    parent_hash, token_ids = key
+    h = hashlib.blake2b(digest_size=16)
+    h.update(struct.pack("<q", parent_hash))
+    h.update(struct.pack(f"<{len(token_ids)}i", *token_ids))
+    return h.hexdigest()
+
+
+class FilesystemCacheDiskStore:
+    """Concrete CacheDiskStore on a local filesystem.
+
+    Layout::
+        cache_dir/
+            _index.json            — {_DISK_FORMAT_VERSION, entries, total_bytes}
+            <node_hash>.safetensors
+            <node_hash>.meta.json
+    """
+
+    def __init__(
+        self,
+        cache_dir: str,
+        kv_group_size: int,
+        max_bytes: int | None = None,
+    ) -> None:
+        self._cache_dir = Path(cache_dir)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._kv_group_size = kv_group_size
+        self._max_bytes = max_bytes
+        self._index_path = self._cache_dir / _INDEX_NAME
+        self._index: dict[str, Any] = self._load_or_init_index()
+
+    def _load_or_init_index(self) -> dict[str, Any]:
+        if not self._index_path.exists():
+            return {
+                "_DISK_FORMAT_VERSION": _DISK_FORMAT_VERSION,
+                "entries": {},
+                "total_bytes": 0,
+            }
+        with open(self._index_path) as f:
+            return json.load(f)
+
+    def _flush_index(self) -> None:
+        tmp = self._index_path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(self._index, f)
+        os.replace(tmp, self._index_path)
+
+    def has(self, key: NodeKey) -> bool:
+        return _node_hash(key) in self._index["entries"]
+
+    def write(self, key: NodeKey, payload: NodePayload) -> list[NodeKey]:
+        node_hash = _node_hash(key)
+        tensor_path = self._cache_dir / f"{node_hash}.safetensors"
+        meta_path = self._cache_dir / f"{node_hash}.meta.json"
+
+        tensors: dict[str, mx.array] = {}
+        layer_meta: list[dict] = []
+        for kv in payload.kv_layers:
+            li = kv.metadata["layer_index"]
+            if hasattr(kv.keys, "packed"):
+                tensors[f"l{li}_k_packed"] = kv.keys.packed
+                tensors[f"l{li}_k_scales"] = kv.keys.scales
+                tensors[f"l{li}_k_biases"] = kv.keys.biases
+                tensors[f"l{li}_v_packed"] = kv.values.packed
+                tensors[f"l{li}_v_scales"] = kv.values.scales
+                tensors[f"l{li}_v_biases"] = kv.values.biases
+            else:
+                tensors[f"l{li}_k"] = kv.keys
+                tensors[f"l{li}_v"] = kv.values
+            layer_meta.append({"kind": "kv", **kv.metadata})
+
+        # mx.save_safetensors appends ".safetensors" automatically;
+        # pass a .tmp stem so the written file becomes <stem>.tmp.safetensors,
+        # then rename to the final <hash>.safetensors.
+        tmp_stem = self._cache_dir / f"{node_hash}.tmp"
+        mx.save_safetensors(str(tmp_stem), tensors)
+        os.replace(str(tmp_stem) + ".safetensors", tensor_path)
+
+        meta_blob = {
+            "parent_key": list(payload.parent_key) if payload.parent_key else None,
+            "token_ids": list(payload.token_ids),
+            "n_tokens_cumulative": payload.n_tokens_cumulative,
+            "last_access_ts": payload.last_access_ts,
+            "kv_group_size": self._kv_group_size,
+            "layers": layer_meta,
+        }
+        tmp_meta = str(meta_path) + ".tmp"
+        with open(tmp_meta, "w") as f:
+            json.dump(meta_blob, f)
+        os.replace(tmp_meta, meta_path)
+
+        size = tensor_path.stat().st_size + meta_path.stat().st_size
+        self._index["entries"][node_hash] = {
+            "key": [key[0], list(key[1])],
+            "parent_key": meta_blob["parent_key"],
+            "token_ids": meta_blob["token_ids"],
+            "n_tokens_cumulative": payload.n_tokens_cumulative,
+            "last_access_ts": payload.last_access_ts,
+            "size_bytes": size,
+            "child_count": 0,
+            "layer_bits": [m.get("bits") for m in layer_meta],
+            "layer_class_names": [m.get("class_name") for m in layer_meta],
+            "recurrent_class_paths": [],
+            "kv_group_size": self._kv_group_size,
+        }
+        self._index["total_bytes"] += size
+        self._flush_index()
+        return []
+
+    def read(self, key: NodeKey) -> NodePayload | None:
+        node_hash = _node_hash(key)
+        if node_hash not in self._index["entries"]:
+            return None
+        tensor_path = self._cache_dir / f"{node_hash}.safetensors"
+        meta_path = self._cache_dir / f"{node_hash}.meta.json"
+        try:
+            tensors = mx.load(str(tensor_path))
+            with open(meta_path) as f:
+                meta_blob = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Corrupt cache entry %s: %s", tensor_path, e)
+            self.delete(key)
+            return None
+
+        from vllm_mlx.kv_cache import QuantizedArray
+
+        kv_layers: list[KVLayerSegment] = []
+        recurrent_layers: list[RecurrentLayerSegment] = []
+        for layer_meta in meta_blob["layers"]:
+            if layer_meta["kind"] != "kv":
+                continue  # recurrent handled in Task 9.
+            li = layer_meta["layer_index"]
+            md = {k: v for k, v in layer_meta.items() if k != "kind"}
+            if md.get("bits") is None:
+                kv_layers.append(KVLayerSegment(
+                    keys=tensors[f"l{li}_k"],
+                    values=tensors[f"l{li}_v"],
+                    metadata=md,
+                ))
+            else:
+                kv_layers.append(KVLayerSegment(
+                    keys=QuantizedArray(
+                        packed=tensors[f"l{li}_k_packed"],
+                        scales=tensors[f"l{li}_k_scales"],
+                        biases=tensors[f"l{li}_k_biases"],
+                    ),
+                    values=QuantizedArray(
+                        packed=tensors[f"l{li}_v_packed"],
+                        scales=tensors[f"l{li}_v_scales"],
+                        biases=tensors[f"l{li}_v_biases"],
+                    ),
+                    metadata=md,
+                ))
+
+        parent_key = (
+            (meta_blob["parent_key"][0], tuple(meta_blob["parent_key"][1]))
+            if meta_blob["parent_key"] is not None
+            else None
+        )
+        return NodePayload(
+            parent_key=parent_key,
+            token_ids=tuple(meta_blob["token_ids"]),
+            n_tokens_cumulative=meta_blob["n_tokens_cumulative"],
+            last_access_ts=meta_blob["last_access_ts"],
+            kv_layers=kv_layers,
+            recurrent_layers=recurrent_layers,
+        )
+
+    def read_header(self, key: NodeKey) -> NodeHeader | None:
+        node_hash = _node_hash(key)
+        entry = self._index["entries"].get(node_hash)
+        if entry is None:
+            return None
+        parent_key = (
+            (entry["parent_key"][0], tuple(entry["parent_key"][1]))
+            if entry["parent_key"] is not None
+            else None
+        )
+        return NodeHeader(
+            parent_key=parent_key,
+            token_ids=tuple(entry["token_ids"]),
+            n_tokens_cumulative=entry["n_tokens_cumulative"],
+            last_access_ts=entry["last_access_ts"],
+            size_bytes=entry["size_bytes"],
+            child_count=entry.get("child_count", 0),
+            layer_bits=tuple(entry["layer_bits"]),
+            layer_class_names=tuple(entry["layer_class_names"]),
+            recurrent_class_paths=tuple(entry["recurrent_class_paths"]),
+            kv_group_size=entry["kv_group_size"],
+        )
+
+    def delete(self, key: NodeKey) -> None:
+        node_hash = _node_hash(key)
+        entry = self._index["entries"].pop(node_hash, None)
+        if entry is None:
+            return
+        self._index["total_bytes"] -= entry["size_bytes"]
+        for ext in (".safetensors", ".meta.json"):
+            p = self._cache_dir / f"{node_hash}{ext}"
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        self._flush_index()
+
+    def touch(self, key: NodeKey) -> None:
+        import time
+        node_hash = _node_hash(key)
+        entry = self._index["entries"].get(node_hash)
+        if entry is not None:
+            entry["last_access_ts"] = time.time()
+            self._flush_index()
+
+    def all_keys(self) -> Iterable[NodeKey]:
+        for entry in self._index["entries"].values():
+            yield (entry["key"][0], tuple(entry["key"][1]))
+
+    def get_total_bytes(self) -> int:
+        return self._index["total_bytes"]
+
+    def close(self) -> None:
+        self._flush_index()
