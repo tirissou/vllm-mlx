@@ -900,20 +900,125 @@ class TurnCacheManager(CacheManager):
         if cs is not None:
             cs.turn_path.append(new_node)
 
-    # ── Updated: save() / load() with error handling ──────────────────────────
+    # ── save() / load() lifecycle ─────────────────────────────────────────────
 
-    def save(self, cache_dir: str) -> bool:
-        try:
-            return self._inner.save(cache_dir)
-        except Exception:
-            return False
+    def save(self) -> int:
+        """Persist every in-memory trie node not already on disk. Returns nodes written."""
+        if self._disk_store is None:
+            return 0
+        from vllm_mlx.cache_disk_store import NodePayload, SSDRef
+        written = 0
+        for node in self._inner.walk_all_nodes_preorder():
+            parent = node.parent
+            parent_hash = parent.context_hash if parent is not None else 0
+            key = (parent_hash, tuple(node.token_ids))
 
-    def load(self, cache_dir: str) -> int:
-        try:
-            self._inner.load(cache_dir)
+            both_on_disk = (
+                isinstance(node.kv_data, SSDRef)
+                and (
+                    isinstance(node.recurrent_data, SSDRef)
+                    or node.recurrent_data is None
+                )
+            )
+            if both_on_disk and self._disk_store.has(key):
+                self._disk_store.touch(key)
+                continue
+
+            kv_layers = node.kv_data if isinstance(node.kv_data, list) else []
+            rec_layers = node.recurrent_data if isinstance(node.recurrent_data, list) else []
+            if not kv_layers and not rec_layers:
+                continue
+            parent_key = (
+                (parent.parent.context_hash if parent.parent is not None else 0,
+                 tuple(parent.token_ids))
+                if parent is not None and parent is not self._inner.root else None
+            )
+            payload = NodePayload(
+                parent_key=parent_key,
+                token_ids=tuple(node.token_ids),
+                n_tokens_cumulative=node.n_tokens,
+                last_access_ts=node.last_used,
+                kv_layers=kv_layers,
+                recurrent_layers=rec_layers,
+            )
+            self._disk_store.write(key, payload)
+            written += 1
+        return written
+
+    def load(self) -> int:
+        """Rebuild the in-memory trie from disk_store, leaving SSDRef placeholders."""
+        if self._disk_store is None:
             return 0
-        except Exception:
-            return 0
+        from vllm_mlx.cache_disk_store import (
+            CachePolicyMismatchError, SSDRef,
+        )
+        keys = list(self._disk_store.all_keys())
+        headers = [(k, self._disk_store.read_header(k)) for k in keys]
+        headers = [(k, h) for k, h in headers if h is not None]
+
+        # Compatibility checks
+        for key, header in headers:
+            for bits, class_name in zip(header.layer_bits, header.layer_class_names):
+                expected = self._policy.bits_for(class_name) if self._policy else None
+                if bits != expected:
+                    raise CachePolicyMismatchError(
+                        kind=f"bits[{class_name}]",
+                        expected=str(expected),
+                        found=str(bits),
+                    )
+            if header.kv_group_size != self._kv_group_size:
+                raise CachePolicyMismatchError(
+                    kind="kv_group_size",
+                    expected=str(self._kv_group_size),
+                    found=str(header.kv_group_size),
+                )
+
+        ordered = self._topo_sort(headers)
+
+        restored = 0
+        for key, header in ordered:
+            self._inner.insert_prebuilt(
+                parent_key=header.parent_key,
+                token_ids=header.token_ids,
+                last_access_ts=header.last_access_ts,
+                n_tokens_cumulative=header.n_tokens_cumulative,
+                kv_data=SSDRef(key=key),
+                recurrent_data=SSDRef(key=key) if header.recurrent_class_paths else None,
+            )
+            restored += 1
+        return restored
+
+    @staticmethod
+    def _topo_sort(headers):
+        """Order headers so each parent_key appears before its children."""
+        from vllm_mlx.turn_prefix_cache import _context_hash
+        by_hash = {}
+        for key, h in headers:
+            node_hash = _context_hash(key[0], list(key[1]))
+            by_hash[node_hash] = (key, h)
+
+        parents = {}
+        for node_hash, (key, h) in by_hash.items():
+            if h.parent_key is None:
+                parents[node_hash] = None
+            else:
+                parents[node_hash] = _context_hash(h.parent_key[0], list(h.parent_key[1]))
+
+        order = []
+        visited = set()
+
+        def visit(node_hash):
+            if node_hash in visited:
+                return
+            p = parents.get(node_hash)
+            if p is not None and p in by_hash:
+                visit(p)
+            visited.add(node_hash)
+            order.append(by_hash[node_hash])
+
+        for nh in by_hash:
+            visit(nh)
+        return order
 
     # ── New: validate, extract_cache, close ──────────────────────────────────
 

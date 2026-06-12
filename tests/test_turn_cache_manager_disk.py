@@ -77,3 +77,66 @@ def test_on_promote_restores_segments(tmp_path):
     kv, rec = result
     assert len(kv) == 1
     assert mx.array_equal(kv[0].keys.packed, original[0].keys.packed)
+
+
+def test_save_then_load_round_trip(tmp_path):
+    from vllm_mlx.cache_disk_store import FilesystemCacheDiskStore, SSDRef
+    from vllm_mlx.cache_types import KVQuantPolicy
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.turn_prefix_cache import (
+        Segment, TurnPrefixCache, TurnPrefixCacheConfig,
+    )
+    policy = KVQuantPolicy(full_bits=8, sliding_bits=None)
+    trie_a = TurnPrefixCache(TurnPrefixCacheConfig())
+    store_a = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr_a = TurnCacheManager(
+        trie_a, policy=policy, kv_group_size=64, disk_store=store_a,
+    )
+
+    a = trie_a.insert(trie_a.root, Segment(role="user", token_ids=[1]),
+                      kv_data=[_make_kv_seg(0, 8, bits=8)])
+    b = trie_a.insert(a, Segment(role="user", token_ids=[2]),
+                      kv_data=[_make_kv_seg(0, 8, bits=8)])
+
+    written = mgr_a.save()
+    assert written == 2
+
+    # Fresh manager pointing at the same disk dir.
+    trie_b = TurnPrefixCache(TurnPrefixCacheConfig())
+    store_b = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr_b = TurnCacheManager(
+        trie_b, policy=policy, kv_group_size=64, disk_store=store_b,
+    )
+    restored = mgr_b.load()
+    assert restored == 2
+
+    nodes = trie_b.walk_all_nodes_preorder()
+    assert all(isinstance(n.kv_data, SSDRef) for n in nodes)
+
+
+def test_load_rejects_policy_mismatch(tmp_path):
+    from vllm_mlx.cache_disk_store import (
+        CachePolicyMismatchError, FilesystemCacheDiskStore,
+    )
+    from vllm_mlx.cache_types import KVQuantPolicy
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.turn_prefix_cache import (
+        Segment, TurnPrefixCache, TurnPrefixCacheConfig,
+    )
+    # Save with q8.
+    trie = TurnPrefixCache(TurnPrefixCacheConfig())
+    store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr = TurnCacheManager(trie, policy=KVQuantPolicy(full_bits=8),
+                           kv_group_size=64, disk_store=store)
+    trie.insert(trie.root, Segment(role="user", token_ids=[1]),
+                kv_data=[_make_kv_seg(0, 8, bits=8)])
+    mgr.save()
+
+    # Load with q4 — must raise.
+    import pytest
+    trie2 = TurnPrefixCache(TurnPrefixCacheConfig())
+    store2 = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr2 = TurnCacheManager(trie2, policy=KVQuantPolicy(full_bits=4),
+                            kv_group_size=64, disk_store=store2)
+    with pytest.raises(CachePolicyMismatchError):
+        mgr2.load()
