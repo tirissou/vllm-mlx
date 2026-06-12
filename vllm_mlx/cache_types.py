@@ -34,6 +34,15 @@ class KVLayerSegment:
         """Concatenate incremental KV segments along the sequence axis (axis=-2)."""
         from vllm_mlx.kv_cache import QuantizedArray
 
+        # All segments in a concat must agree on quantization bits: a single
+        # policy writes the whole path in one process, so a mismatch is a bug.
+        first_bits = layers[0].metadata.get("bits")
+        for l in layers[1:]:
+            assert l.metadata.get("bits") == first_bits, (
+                f"KVLayerSegment.concat: mismatched bits "
+                f"{first_bits!r} vs {l.metadata.get('bits')!r}"
+            )
+
         if isinstance(layers[0].keys, QuantizedArray):
             merged_keys = QuantizedArray(
                 packed=mx.concatenate([l.keys.packed for l in layers], axis=-2),
@@ -50,6 +59,7 @@ class KVLayerSegment:
             merged_values = mx.concatenate([l.values for l in layers], axis=-2)
         meta = dict(layers[-1].metadata)
         meta["n_tokens"] = sum(l.metadata.get("n_tokens", 0) for l in layers)
+        meta["bits"] = first_bits
         return cls(keys=merged_keys, values=merged_values, metadata=meta)
 
 

@@ -231,3 +231,48 @@ def test_kvcache_round_trip_shape():
     assert len(result) == 1
     # logical length should be 3 + 5 = 8
     assert result[0]._idx == 8
+
+
+# ── KVLayerSegment.concat bits-agree invariant ───────────────────────────────
+
+
+def _make_kv_segment_with_bits(n_tokens: int, bits: int | None) -> KVLayerSegment:
+    if bits is None:
+        keys = mx.ones((1, 1, n_tokens, 64), dtype=mx.bfloat16)
+        values = mx.ones((1, 1, n_tokens, 64), dtype=mx.bfloat16)
+        return KVLayerSegment(
+            keys=keys,
+            values=values,
+            metadata={
+                "class_name": "KVCache",
+                "layer_index": 0,
+                "merge_strategy": "concatenate",
+                "n_tokens": n_tokens,
+                "bits": None,
+            },
+        )
+    seg = _make_kv_segment(n_tokens=n_tokens)
+    seg.metadata["bits"] = bits
+    return seg
+
+
+def test_concat_mismatched_bits_raises():
+    a = _make_kv_segment_with_bits(n_tokens=3, bits=8)
+    b = _make_kv_segment_with_bits(n_tokens=5, bits=4)
+    with pytest.raises(AssertionError):
+        KVLayerSegment.concat([a, b])
+
+
+def test_concat_matching_bits_succeeds():
+    a = _make_kv_segment_with_bits(n_tokens=3, bits=8)
+    b = _make_kv_segment_with_bits(n_tokens=5, bits=8)
+    merged = KVLayerSegment.concat([a, b])
+    assert merged.metadata["bits"] == 8
+    assert merged.metadata["n_tokens"] == 8
+
+
+def test_concat_matching_float_bits_succeeds():
+    a = _make_kv_segment_with_bits(n_tokens=3, bits=None)
+    b = _make_kv_segment_with_bits(n_tokens=5, bits=None)
+    merged = KVLayerSegment.concat([a, b])
+    assert merged.metadata["bits"] is None
