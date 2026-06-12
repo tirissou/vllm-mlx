@@ -6,7 +6,7 @@ Replaces the old CacheTranslator tests now that linearize/quantize_kv are gone.
 import mlx.core as mx
 import pytest
 
-from vllm_mlx.cache_types import KVLayerSegment
+from vllm_mlx.cache_types import KVLayerSegment, KVQuantPolicy
 from vllm_mlx.kv_cache import QuantizedArray
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager, _linearize
 
@@ -423,3 +423,27 @@ def test_assemble_reads_bits_from_metadata_mixed():
 
     assert isinstance(caches[0], BatchQuantizedKVCache)
     assert isinstance(caches[1], _RotatingKVCache)
+
+
+# ── TurnCacheManager constructor ───────────────────────────────────────────────
+
+
+def test_turncachemanager_holds_policy():
+    """TurnCacheManager stores a KVQuantPolicy instance (not a raw kv_bits int)."""
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    inner = TurnPrefixCache(TurnPrefixCacheConfig())
+    policy = KVQuantPolicy(sliding_bits=None, full_bits=8)
+    mgr = TurnCacheManager(inner, policy=policy, kv_group_size=64)
+
+    assert mgr._policy is policy
+    assert mgr._kv_group_size == 64
+
+
+def test_turncachemanager_accepts_none_policy():
+    """policy=None means quantization disabled."""
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+    inner = TurnPrefixCache(TurnPrefixCacheConfig())
+    mgr = TurnCacheManager(inner, policy=None)
+    assert mgr._policy is None

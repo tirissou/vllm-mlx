@@ -151,10 +151,13 @@ class TurnCacheManager(CacheManager):
     """Adapts TurnPrefixCache to the CacheManager protocol."""
 
     def __init__(
-        self, inner: TurnPrefixCache, kv_bits: int | None = 8, kv_group_size: int = 64
+        self,
+        inner: TurnPrefixCache,
+        policy: KVQuantPolicy | None = None,
+        kv_group_size: int = 64,
     ):
         self._inner = inner
-        self._kv_bits = kv_bits
+        self._policy = policy
         self._kv_group_size = kv_group_size
         # request_id -> currently pinned leaf node (Active Leaf invariant).
         # Populated by fetch() on hit, advanced by store(), cleared by release().
@@ -672,7 +675,7 @@ class TurnCacheManager(CacheManager):
             prev_end = path[-1].n_tokens if path else 0
             cache = self._slice_kv_to_delta(cache, prev_end)
             kv_sparse, rec_sparse = self._segment(
-                cache, self._kv_group_size, self._kv_bits
+                cache, policy=self._policy, group_size=self._kv_group_size
             )
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
@@ -795,7 +798,7 @@ class TurnCacheManager(CacheManager):
             prev_end = _turn_boundaries[abs_idx - 1] if abs_idx > 0 else 0
             extracted_cache = self._slice_kv_to_delta(extracted_cache, prev_end)
             kv_sparse, rec_sparse = self._segment(
-                extracted_cache, self._kv_group_size, self._kv_bits
+                extracted_cache, policy=self._policy, group_size=self._kv_group_size
             )
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]

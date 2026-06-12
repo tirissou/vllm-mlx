@@ -622,12 +622,16 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             )
         )
         bundle.turn_cache = turn_cache
-        _tcm_kv_bits = (
-            config.kv_cache_quantization_bits if config.kv_cache_quantization else None
+        from .cache_types import KVQuantPolicy
+
+        _tcm_policy = (
+            KVQuantPolicy(full_bits=config.kv_cache_quantization_bits)
+            if config.kv_cache_quantization
+            else None
         )
         bundle.adapter = TurnCacheManager(
             turn_cache,
-            kv_bits=_tcm_kv_bits,
+            policy=_tcm_policy,
             kv_group_size=config.kv_cache_quantization_group_size,
         )
         logger.info(

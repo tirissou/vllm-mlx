@@ -40,7 +40,7 @@ def _make_trie() -> TurnPrefixCache:
 
 
 def _make_manager(trie: TurnPrefixCache) -> TurnCacheManager:
-    return TurnCacheManager(trie, kv_bits=None, kv_group_size=64)
+    return TurnCacheManager(trie, policy=None, kv_group_size=64)
 
 
 def _make_request(

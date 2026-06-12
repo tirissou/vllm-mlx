@@ -5,6 +5,7 @@ from abc import ABC
 
 import pytest
 
+from vllm_mlx.cache_types import KVQuantPolicy
 from vllm_mlx.kv_cache import RequestCacheState
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
 
@@ -719,9 +720,9 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
         adapter.on_prefill_checkpoint(
             req, total_tokens_prefilled=10, extracted_cache=extracted
         )
-    # _segment should have been called with extracted_cache plus group_size and bits
+    # _segment should have been called with extracted_cache plus policy and group_size
     mock_seg.assert_called_once_with(
-        extracted, adapter._kv_group_size, adapter._kv_bits
+        extracted, policy=adapter._policy, group_size=adapter._kv_group_size
     )
     # inner.split_cache_arrays must NOT be called (it was the old API)
     inner.split_cache_arrays.assert_not_called()
@@ -766,7 +767,7 @@ def test_segment_rotating_kvcache_quantized_arrays_are_evaluated():
     import mlx.core as mx
 
     state = _rotating_state()
-    kv_list, _ = TurnCacheManager._segment([state], group_size=32, bits=8)
+    kv_list, _ = TurnCacheManager._segment([state], policy=KVQuantPolicy(sliding_bits=8, full_bits=8), group_size=32)
     seg = kv_list[0]
     assert seg is not None
 
@@ -790,7 +791,7 @@ def test_segment_kvcache_quantized_arrays_are_evaluated():
     import mlx.core as mx
 
     state = _kvcache_state()
-    kv_list, _ = TurnCacheManager._segment([state], group_size=32, bits=8)
+    kv_list, _ = TurnCacheManager._segment([state], policy=KVQuantPolicy(full_bits=8), group_size=32)
     seg = kv_list[0]
     assert seg is not None
 
@@ -830,7 +831,7 @@ def test_segment_does_not_retain_source_float16_in_active_memory():
         "meta_state": ("0", str(T), str(T), str(T)),
     }
 
-    kv_list, _ = TurnCacheManager._segment([state], group_size=32, bits=8)
+    kv_list, _ = TurnCacheManager._segment([state], policy=KVQuantPolicy(sliding_bits=8, full_bits=8), group_size=32)
     seg = kv_list[0]
 
     # Release all source references.
