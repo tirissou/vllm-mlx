@@ -63,6 +63,7 @@ def _make_quantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
         keys=keys,
         values=values,
         metadata={
+            "bits": BITS,
             "class_name": "KVCache",
             "layer_index": layer_index,
             "merge_strategy": "concatenate",
@@ -80,6 +81,7 @@ def _make_unquantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment
         keys=keys,
         values=values,
         metadata={
+            "bits": None,
             "class_name": "KVCache",
             "layer_index": layer_index,
             "merge_strategy": "concatenate",
@@ -135,9 +137,6 @@ def test_assemble_does_not_spike_on_first_decode_step(
         kv_layers=kv_layers,
         recurrent_layers=[],
         group_size=GROUP_SIZE,
-        # bits=None on the unquantized branch tells _assemble to expect
-        # plain mx.array payloads; bits=BITS routes to BatchQuantizedKVCache.
-        bits=BITS if kind.startswith("quantized") else None,
     )
 
     eval_args = []
