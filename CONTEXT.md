@@ -8,32 +8,27 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 
 **PrefixCache** — Protocol: `fetch(request) -> CacheHit | None`, `store`, `release`, `clear`. The seam the Scheduler uses for all cache interaction. Never bypass it to access underlying cache objects directly.
 
-**SpillableCache** — Sub-protocol of `PrefixCache`. Caches that can move KV arrays out of RAM to disk under memory pressure, leaving a handle in their place. Exposes `set_spill_delegate(on_spill, on_promote)`. Implemented by `MemoryAwarePrefixCache` (full eviction) and `TurnPrefixCache` (intra-cache spilling).
+**TurnCacheManager** — `CacheManager` for the conversation-turn trie. Owns the in-memory `TurnPrefixCache`, the optional `CacheDiskStore` for persistence, the `KVQuantPolicy`, and the `request_id → pinned leaf` map (`_pinned_leaves`). Installs spill/promote handlers on the trie at construction. Save/load lifecycle methods (no args) are invoked by `BatchedEngine` on graceful shutdown / startup.
 
-**CacheDiskStore** — Protocol: `write(tokens, layers)`, `read(tokens)`, `all_keys()`. Shared durable store used by both runtime SSD tiering (spill/promote) and startup/shutdown persistence (save/load). Concrete implementation wraps `SSDCacheTier` file I/O.
+**CacheDiskStore** — Protocol defined in `vllm_mlx/cache_disk_store.py`. Methods: `write(key, payload) -> evicted_keys`, `read(key)`, `read_header(key)` (cheap structural), `delete`, `has`, `touch`, `all_keys`, `get_total_bytes`, `close`. One shipping implementation: `FilesystemCacheDiskStore` (safetensors-mlx + JSON sidecar + JSON index with parent-aware LRU).
 
-**SSDOffloadedCache** — Decorator wrapping any `SpillableCache`. Registers the spill delegate, owns the background promotion loop (for full-eviction caches), and exposes `save()`/`load()` for persistence — all via the same `CacheDiskStore`. The Scheduler holds one `PrefixCache` reference regardless of whether SSD is configured.
+**SSDRef** — Sentinel that replaces a node's KV/recurrent payload after spill. Holds only the `NodeKey = (parent_hash, token_ids)` needed to fetch on promote. Defined in `cache_disk_store.py`.
 
-**Full eviction** — the cache entry leaves the in-memory structure entirely (`MemoryAwarePrefixCache` pattern). Promotion happens via `SSDOffloadedCache`'s background loop on the next `fetch` miss; the Scheduler re-queues the request and it is scheduled one cycle later.
+**Spill / promote** — `TurnCacheManager._on_spill(node)` is called by the trie during memory-pressure eviction; it writes the full node payload, sets `node.kv_data = node.recurrent_data = SSDRef(key)`, and decrements `_memory_bytes`. `_on_promote(ssd_ref)` is invoked synchronously by `collect_path_data` when it encounters an SSDRef in the path; on `None` (disk miss) it raises `CacheMissDuringWalk`, which `fetch` catches and converts into a partial hit.
 
-**Intra-cache spilling** — the cache node stays in the in-memory structure with a disk handle in place of its arrays (`TurnPrefixCache` pattern). Promotion happens synchronously via `on_promote` when the node is accessed.
+**Active Leaf pinning** — invariant enforced by `TurnCacheManager`. For each in-flight request, exactly one trie node (the deepest currently-relevant leaf) is pinned via `ref_count`. The mapping `request_id → pinned leaf` lives in `TurnCacheManager._pinned_leaves`; the Scheduler never touches it.
 
-**EvictableCache** — Superseded by `SpillableCache`. Do not use.
+**Leaf-only eviction** — invariant enforced by `TurnPrefixCache`. A node is evictable iff `len(children) == 0` AND `ref_count == 0`. Spill respects this too — pinned leaves are never spilled.
 
-**Active Leaf pinning** — invariant enforced by `TurnCacheManager`. For each in-flight request, exactly one trie node (the deepest currently-relevant leaf) is pinned via `ref_count`. Mutators: `fetch` pins the matched leaf, `store` and `on_prefill_checkpoint` insert-then-advance (release old leaf, pin new leaf), `release` unpins the current leaf. The mapping `request_id -> pinned leaf` lives in `TurnCacheManager._pinned_leaves`; the Scheduler never touches it.
-
-**Leaf-only eviction** — invariant enforced by `TurnPrefixCache`. A node is evictable iff `len(children) == 0` AND `ref_count == 0`. Interior nodes are never evicted. This is what makes Active Leaf safe with O(1) per-request bookkeeping: pinning just the leaf is sufficient because everything above it is protected structurally.
+**Disk LRU ordering** — `FilesystemCacheDiskStore` enforces two invariants. (1) Parent-aware: an entry whose `parent_key` is itself on disk is not evicted before its children. (2) Leaf-first: among leaf candidates (`child_count == 0`), oldest `last_access_ts` wins. `DiskStoreFullError` is raised when no leaf candidate exists.
 
 ---
 
-## Spill delegate contract
+**Spill / promote contract**
 
-**Spill** — move KV arrays out of RAM to disk under memory pressure, leaving an opaque handle in their place.  
-**Promote** — restore spilled arrays from disk back into RAM.
+`_on_spill(node) -> bool` — manager-side handler installed on the trie. Writes the node's payload to disk, replaces `node.kv_data` / `node.recurrent_data` with a shared `SSDRef`, and returns `True` on success (node stays in the trie) or `False` on disk-full (trie falls back to drop eviction).
 
-`on_spill(tokens, arrays) -> handle` — called by the cache when spilling. Writes to `CacheDiskStore`, returns an opaque handle the cache stores in place of the arrays.
-
-`on_promote(handle) -> list | None` — called by the cache when it needs spilled arrays back. Reads from `CacheDiskStore` using the handle. For `TurnPrefixCache` (intra-cache spilling) this is synchronous, called on access. For `MemoryAwarePrefixCache` (full eviction) it is never called directly — `SSDOffloadedCache` promotes via its background loop on the next `fetch` miss instead.
+`_on_promote(ssd_ref) -> tuple[list, list] | None` — manager-side handler installed on the trie. Reads the payload from disk and returns `(kv_layers, recurrent_layers)` for the trie to slot back into the node. `None` means a disk miss; the trie drops the node and raises `CacheMissDuringWalk` upward.
 
 ---
 
