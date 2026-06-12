@@ -688,14 +688,27 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
         )
         bundle.turn_cache = turn_cache
         policy = _build_kv_quant_policy(config)
+
+        disk_store = None
+        if config.kv_cache_disk_dir is not None:
+            from .cache_disk_store import FilesystemCacheDiskStore
+            disk_store = FilesystemCacheDiskStore(
+                cache_dir=config.kv_cache_disk_dir,
+                kv_group_size=config.kv_cache_quantization_group_size,
+                max_bytes=config.kv_cache_disk_max_bytes,
+            )
+
         bundle.adapter = TurnCacheManager(
             turn_cache,
             policy=policy,
             kv_group_size=config.kv_cache_quantization_group_size,
+            disk_store=disk_store,
         )
         logger.info(
-            f"TurnPrefixCache enabled: stride={config.turn_cache_stride} "
-            f"memory={config.turn_cache_memory_gb}GB"
+            "TurnPrefixCache enabled: stride=%d memory=%sGB disk_dir=%s",
+            config.turn_cache_stride,
+            config.turn_cache_memory_gb,
+            config.kv_cache_disk_dir,
         )
     else:
         logger.info("Prefix cache disabled (use_turn_cache=False)")
