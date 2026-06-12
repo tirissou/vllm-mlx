@@ -103,3 +103,56 @@ def test_unset_vs_explicit_none_distinct():
     assert p_unset.full_bits == 8
     assert p_explicit.full_bits is None
     assert p_explicit.full_override is True
+
+
+# ── CLI / argparse ────────────────────────────────────────────────────────────
+
+import subprocess
+import sys
+
+
+def _run_cli(*args) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "vllm_mlx.cli", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_cli_rejects_removed_flag():
+    """--kv-cache-quantization-bits is removed; argparse rejects it with a migration message."""
+    result = _run_cli("serve", "--help")  # smoke parser builds
+    assert result.returncode == 0
+
+    bad = _run_cli(
+        "serve",
+        "dummy-model",
+        "--continuous-batching",
+        "--kv-cache-quantization",
+        "--kv-cache-quantization-bits", "4",
+    )
+    assert bad.returncode != 0
+    err = bad.stderr + bad.stdout
+    assert "--kv-cache-quantization-bits" in err
+    assert "was removed" in err
+    assert "--kv-cache-bits-sliding" in err
+    assert "--kv-cache-bits-full" in err
+
+
+def test_cli_parser_accepts_new_flags():
+    """CLI parses --kv-cache-bits-sliding none and --kv-cache-bits-full 4."""
+    from vllm_mlx.cli import build_parser  # exposed parser builder
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "serve", "dummy-model",
+        "--continuous-batching",
+        "--kv-cache-quantization",
+        "--kv-cache-bits-sliding", "none",
+        "--kv-cache-bits-full", "4",
+    ])
+    # The CLI maps these to (value, override) pairs at SchedulerConfig
+    # construction time; just verify the args namespace holds the raw values.
+    assert hasattr(args, "kv_cache_bits_sliding")
+    assert hasattr(args, "kv_cache_bits_full")

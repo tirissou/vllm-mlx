@@ -18,6 +18,66 @@ import sys
 
 from .cli_arg_types import make_json_object_arg_parser
 
+# Private sentinel object: distinct from None, used as the default for the
+# per-layer-type KV bits flags so _resolve_kv_bits can tell "flag omitted"
+# (sentinel) from "flag explicitly set to none" (None). Never escapes this module.
+_KV_BITS_UNSET = object()
+
+
+def _parse_kv_bits_arg(raw: str) -> "int | None":
+    """argparse type for --kv-cache-bits-{sliding,full}.
+
+    Accepts 'none' (→ None, store float), or an int (must be 4 or 8).
+    """
+    if raw.lower() == "none":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a valid bit width (expected int or 'none')"
+        )
+    if value not in (4, 8):
+        raise argparse.ArgumentTypeError(
+            f"bit width must be 4 or 8 (got {value})"
+        )
+    return value
+
+
+def _resolve_kv_bits(raw) -> "tuple[int | None, bool]":
+    """Resolve the argparse output into a (value, override_flag) pair.
+
+    Sentinel → (None, False)  : user didn't pass the flag; smart default applies.
+    None     → (None, True)   : user explicitly passed --kv-cache-bits-* none.
+    int      → (int, True)    : user explicitly passed an int.
+    """
+    if raw is _KV_BITS_UNSET:
+        return (None, False)
+    return (raw, True)
+
+
+class _DeprecatedKvBitsAction(argparse.Action):
+    """Reject the removed --kv-cache-quantization-bits flag with a migration hint."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            f"`{option_string}` was removed. "
+            f"Use `--kv-cache-bits-sliding` (default: bf16) and/or "
+            f"`--kv-cache-bits-full` (default: q8). See ADR-0007."
+        )
+
+
+def _build_kv_quant_kwargs(args) -> dict:
+    """Resolve the sentinel'd CLI args into SchedulerConfig kwargs."""
+    sliding_bits, sliding_override = _resolve_kv_bits(args.kv_cache_bits_sliding)
+    full_bits, full_override = _resolve_kv_bits(args.kv_cache_bits_full)
+    return {
+        "kv_cache_bits_sliding": sliding_bits,
+        "kv_cache_bits_sliding_override": sliding_override,
+        "kv_cache_bits_full": full_bits,
+        "kv_cache_bits_full_override": full_override,
+    }
+
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
@@ -251,7 +311,7 @@ def serve_command(args):
             mtp_optimistic=args.mtp_optimistic,
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
-            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
+            **_build_kv_quant_kwargs(args),
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
             mllm_prefill_step_size=(
@@ -284,8 +344,11 @@ def serve_command(args):
             )
             print(f"Memory-aware cache: {cache_info}")
             if args.kv_cache_quantization:
+                from .scheduler import _build_kv_quant_policy
+                policy = _build_kv_quant_policy(scheduler_config)
+                # policy is non-None here because kv_cache_quantization=True.
                 print(
-                    f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
+                    f"KV cache quantization: {policy.describe()}, "
                     f"group_size={args.kv_cache_quantization_group_size}"
                 )
         elif enable_prefix_cache:
@@ -513,7 +576,7 @@ def bench_command(args):
             turn_cache_ssd_gb=getattr(args, "turn_cache_ssd_gb", 50.0),
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
-            kv_cache_quantization_bits=args.kv_cache_quantization_bits,
+            **_build_kv_quant_kwargs(args),
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
@@ -1055,14 +1118,31 @@ Examples:
     serve_parser.add_argument(
         "--kv-cache-quantization",
         action="store_true",
-        help="Quantize stored KV caches to reduce memory (8-bit by default)",
+        help="Enable KV cache quantization (per-layer-type defaults: "
+             "sliding=bf16, full=q8). See --kv-cache-bits-sliding/-full to override.",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-bits-sliding",
+        type=_parse_kv_bits_arg,
+        default=_KV_BITS_UNSET,
+        metavar="{4,8,none}",
+        help="Bit width for sliding-window (RotatingKVCache) layers, or 'none' "
+             "for bf16. Default: bf16 (sliding-window layers use full RoPE and "
+             "quantize poorly; see ADR-0007).",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-bits-full",
+        type=_parse_kv_bits_arg,
+        default=_KV_BITS_UNSET,
+        metavar="{4,8,none}",
+        help="Bit width for full-attention (KVCache) layers, or 'none' for bf16. "
+             "Default: q8. See ADR-0007.",
     )
     serve_parser.add_argument(
         "--kv-cache-quantization-bits",
-        type=int,
-        default=8,
-        choices=[4, 8],
-        help="Bit width for KV cache quantization (default: 8)",
+        action=_DeprecatedKvBitsAction,
+        nargs="?",  # accept-with-or-without value so the error message wins
+        help=argparse.SUPPRESS,
     )
     serve_parser.add_argument(
         "--kv-cache-quantization-group-size",
@@ -1503,14 +1583,31 @@ Examples:
     bench_parser.add_argument(
         "--kv-cache-quantization",
         action="store_true",
-        help="Quantize stored KV caches to reduce memory (8-bit by default)",
+        help="Enable KV cache quantization (per-layer-type defaults: "
+             "sliding=bf16, full=q8). See --kv-cache-bits-sliding/-full to override.",
+    )
+    bench_parser.add_argument(
+        "--kv-cache-bits-sliding",
+        type=_parse_kv_bits_arg,
+        default=_KV_BITS_UNSET,
+        metavar="{4,8,none}",
+        help="Bit width for sliding-window (RotatingKVCache) layers, or 'none' "
+             "for bf16. Default: bf16 (sliding-window layers use full RoPE and "
+             "quantize poorly; see ADR-0007).",
+    )
+    bench_parser.add_argument(
+        "--kv-cache-bits-full",
+        type=_parse_kv_bits_arg,
+        default=_KV_BITS_UNSET,
+        metavar="{4,8,none}",
+        help="Bit width for full-attention (KVCache) layers, or 'none' for bf16. "
+             "Default: q8. See ADR-0007.",
     )
     bench_parser.add_argument(
         "--kv-cache-quantization-bits",
-        type=int,
-        default=8,
-        choices=[4, 8],
-        help="Bit width for KV cache quantization (default: 8)",
+        action=_DeprecatedKvBitsAction,
+        nargs="?",  # accept-with-or-without value so the error message wins
+        help=argparse.SUPPRESS,
     )
     bench_parser.add_argument(
         "--kv-cache-quantization-group-size",
