@@ -11,6 +11,7 @@ import math
 import mlx.core as mx
 import pytest
 
+from vllm_mlx.cache_types import KVQuantPolicy
 from vllm_mlx.kv_cache import RequestCacheState
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
 from vllm_mlx.request import Request, SamplingParams
@@ -29,7 +30,7 @@ def _attention(q, k, v):
 
 def _make_manager():
     cfg = TurnPrefixCacheConfig(checkpoint_stride=0, max_memory_gb=4.0)
-    return TurnCacheManager(TurnPrefixCache(cfg))
+    return TurnCacheManager(TurnPrefixCache(cfg), policy=KVQuantPolicy(full_bits=8))
 
 
 def _make_request(request_id, token_ids, boundaries):

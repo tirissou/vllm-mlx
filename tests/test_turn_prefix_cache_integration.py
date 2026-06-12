@@ -11,7 +11,7 @@ import pytest
 
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
-from vllm_mlx.cache_types import KVLayerSegment, RecurrentLayerSegment
+from vllm_mlx.cache_types import KVLayerSegment, KVQuantPolicy, RecurrentLayerSegment
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_kvcache_round_trip(trie):
 
     live_states = _make_kvcache_states(n_tokens=4, n_layers=2)
 
-    kv_sparse, rec_sparse = TurnCacheManager._segment(live_states)
+    kv_sparse, rec_sparse = TurnCacheManager._segment(live_states, policy=KVQuantPolicy(full_bits=8))
     kv_layers = [kv for kv in kv_sparse if kv is not None]
     rec_layers = [rec for rec in rec_sparse if rec is not None]
 
@@ -166,7 +166,7 @@ def test_collect_path_data_layer_ordering(trie):
         {"class_name": "Mamba", "state": rec_raw, "meta_state": ()},
     ]
 
-    kv_sparse, rec_sparse = TurnCacheManager._segment(live_states)
+    kv_sparse, rec_sparse = TurnCacheManager._segment(live_states, policy=KVQuantPolicy(full_bits=8))
     kv_layers = [kv for kv in kv_sparse if kv is not None]
     rec_layers = [rec for rec in rec_sparse if rec is not None]
 
