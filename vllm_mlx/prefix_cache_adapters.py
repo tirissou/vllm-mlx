@@ -11,6 +11,7 @@ import mlx.core as mx
 
 from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
+from vllm_mlx.cache_disk_store import CacheDiskStore, NodePayload, SSDRef
 
 if TYPE_CHECKING:
     from vllm_mlx.turn_prefix_cache import TurnNode
@@ -155,6 +156,7 @@ class TurnCacheManager(CacheManager):
         inner: TurnPrefixCache,
         policy: KVQuantPolicy | None = None,
         kv_group_size: int = 64,
+        disk_store: CacheDiskStore | None = None,
     ):
         self._inner = inner
         self._policy = policy
@@ -162,6 +164,18 @@ class TurnCacheManager(CacheManager):
         # request_id -> currently pinned leaf node (Active Leaf invariant).
         # Populated by fetch() on hit, advanced by store(), cleared by release().
         self._pinned_leaves: dict[str, "TurnNode"] = {}
+        self._disk_store = disk_store
+        if disk_store is not None:
+            inner.set_spill_handler(self._on_spill)
+            inner.set_promote_handler(self._on_promote)
+
+    def _on_spill(self, node) -> bool:
+        """Stub spill handler — real implementation comes in Task 16."""
+        return False
+
+    def _on_promote(self, ssd_ref):
+        """Stub promote handler — real implementation comes in Task 16."""
+        return None
 
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state
