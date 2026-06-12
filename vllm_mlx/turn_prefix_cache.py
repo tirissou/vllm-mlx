@@ -133,6 +133,24 @@ class TurnPrefixCache:
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
         self.has_recurrent_state: bool = False
+        self._spill_handler = None
+        self._promote_handler = None
+
+    def set_spill_handler(self, handler) -> None:
+        """Install the manager's spill callback.
+
+        Called during _evict_if_needed_unlocked. Handler signature:
+            (TurnNode) -> bool — True if node kept (spilled), False to drop.
+        """
+        self._spill_handler = handler
+
+    def set_promote_handler(self, handler) -> None:
+        """Install the manager's promote callback.
+
+        Called by collect_path_data. Handler signature:
+            (SSDRef) -> tuple[list, list] | None — (kv_layers, recurrent_layers) or None on miss.
+        """
+        self._promote_handler = handler
 
     # ── SpillableCache / PrefixCache protocol stubs ─────────────────────────
     # TurnPrefixCache is a low-level trie; the PrefixCache protocol is
@@ -360,6 +378,12 @@ class TurnPrefixCache:
             # or is no longer a leaf/unpinned.
             if node.last_used > last_used or not node.is_evictable:
                 continue
+            if self._spill_handler is not None:
+                kept = self._spill_handler(node)
+                if kept:
+                    # Manager's _on_spill set kv_data/recurrent_data to SSDRef
+                    # and adjusted _memory_bytes. Continue evicting.
+                    continue
             self._evict_node(node)
 
         # Rebuild heap periodically if bloated
