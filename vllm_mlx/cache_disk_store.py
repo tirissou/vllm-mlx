@@ -158,6 +158,24 @@ def _node_hash(key: NodeKey) -> str:
     return h.hexdigest()
 
 
+def _estimate_payload_bytes(payload: NodePayload) -> int:
+    total = 0
+    for kv in payload.kv_layers:
+        for attr in ("keys", "values"):
+            t = getattr(kv, attr)
+            if hasattr(t, "packed"):
+                total += t.packed.nbytes + t.scales.nbytes + t.biases.nbytes
+            else:
+                total += t.nbytes
+    for rec in payload.recurrent_layers:
+        arrays = rec.arrays
+        seq = arrays if isinstance(arrays, (list, tuple)) else [arrays]
+        for arr in seq:
+            if hasattr(arr, "nbytes"):
+                total += arr.nbytes
+    return total
+
+
 class FilesystemCacheDiskStore:
     """Concrete CacheDiskStore on a local filesystem.
 
@@ -200,7 +218,37 @@ class FilesystemCacheDiskStore:
     def has(self, key: NodeKey) -> bool:
         return _node_hash(key) in self._index["entries"]
 
+    def _evict_until_fits(self, needed_bytes: int) -> list[NodeKey]:
+        if self._max_bytes is None:
+            return []
+        evicted: list[NodeKey] = []
+        while self._index["total_bytes"] + needed_bytes > self._max_bytes:
+            candidate = self._pick_eviction_candidate()
+            if candidate is None:
+                raise DiskStoreFullError(
+                    needed=needed_bytes,
+                    available=self._max_bytes - self._index["total_bytes"],
+                )
+            self.delete(candidate)
+            evicted.append(candidate)
+        return evicted
+
+    def _pick_eviction_candidate(self) -> "NodeKey | None":
+        # Leaf-first: only entries with child_count == 0; oldest last_access_ts wins.
+        best: "tuple[float, NodeKey] | None" = None
+        for entry in self._index["entries"].values():
+            if entry["child_count"] != 0:
+                continue
+            ts = entry["last_access_ts"]
+            k: NodeKey = (entry["key"][0], tuple(entry["key"][1]))
+            if best is None or ts < best[0]:
+                best = (ts, k)
+        return best[1] if best is not None else None
+
     def write(self, key: NodeKey, payload: NodePayload) -> list[NodeKey]:
+        needed = _estimate_payload_bytes(payload) + 4096  # JSON overhead.
+        evicted = self._evict_until_fits(needed)
+
         node_hash = _node_hash(key)
         tensor_path = self._cache_dir / f"{node_hash}.safetensors"
         meta_path = self._cache_dir / f"{node_hash}.meta.json"
@@ -256,8 +304,15 @@ class FilesystemCacheDiskStore:
             "kv_group_size": self._kv_group_size,
         }
         self._index["total_bytes"] += size
+
+        if payload.parent_key is not None:
+            parent_hash = _node_hash(payload.parent_key)
+            parent_entry = self._index["entries"].get(parent_hash)
+            if parent_entry is not None:
+                parent_entry["child_count"] += 1
+
         self._flush_index()
-        return []
+        return evicted
 
     def read(self, key: NodeKey) -> NodePayload | None:
         node_hash = _node_hash(key)
@@ -346,6 +401,13 @@ class FilesystemCacheDiskStore:
         entry = self._index["entries"].pop(node_hash, None)
         if entry is None:
             return
+        if entry["parent_key"] is not None:
+            parent_hash = _node_hash(
+                (entry["parent_key"][0], tuple(entry["parent_key"][1]))
+            )
+            parent_entry = self._index["entries"].get(parent_hash)
+            if parent_entry is not None and parent_entry["child_count"] > 0:
+                parent_entry["child_count"] -= 1
         self._index["total_bytes"] -= entry["size_bytes"]
         for ext in (".safetensors", ".meta.json"):
             p = self._cache_dir / f"{node_hash}{ext}"

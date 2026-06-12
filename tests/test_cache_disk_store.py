@@ -134,3 +134,70 @@ class TestFilesystemRoundTripFullAttention:
         store = FilesystemCacheDiskStore(cache_dir=str(tmp_path), kv_group_size=64)
         assert store.read((9, (99,))) is None
         assert store.has((9, (99,))) is False
+
+
+class TestDiskLRU:
+    def test_leaf_first_eviction(self, tmp_path):
+        from vllm_mlx.cache_disk_store import (
+            FilesystemCacheDiskStore,
+            NodePayload,
+        )
+
+        # Cap small enough that a third write forces eviction.
+        # Each entry is ~9 KB on disk; estimated overhead ~13 KB per write.
+        # 28_000 comfortably holds two entries but triggers eviction on the third.
+        store = FilesystemCacheDiskStore(
+            cache_dir=str(tmp_path), kv_group_size=64, max_bytes=28_000,
+        )
+
+        def write_node(parent_key, tokens, ts):
+            key = (hash(parent_key), tokens)
+            payload = NodePayload(
+                parent_key=parent_key, token_ids=tokens,
+                n_tokens_cumulative=len(tokens), last_access_ts=ts,
+                kv_layers=[_make_kv_segment(0, 16, bits=8)],
+                recurrent_layers=[],
+            )
+            return key, store.write(key, payload)
+
+        ka, _ = write_node(None, (1,), ts=1.0)
+        kb, _ = write_node(None, (2,), ts=2.0)
+        kc, evicted = write_node(None, (3,), ts=3.0)
+        # ka is the oldest leaf — it should be evicted.
+        assert ka in evicted
+
+    def test_parent_not_evicted_before_children(self, tmp_path):
+        from vllm_mlx.cache_disk_store import (
+            FilesystemCacheDiskStore,
+            NodePayload,
+        )
+        # Each entry is ~9 KB on disk; estimated overhead ~13 KB per write.
+        # 28_000 comfortably holds two entries but triggers eviction on the third.
+        store = FilesystemCacheDiskStore(
+            cache_dir=str(tmp_path), kv_group_size=64, max_bytes=28_000,
+        )
+
+        # Parent first, then a child of that parent, then a new leaf to force eviction.
+        parent_key = (0, (10,))
+        store.write(parent_key, NodePayload(
+            parent_key=None, token_ids=(10,), n_tokens_cumulative=1,
+            last_access_ts=1.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+        child_key = (hash(parent_key), (11,))
+        store.write(child_key, NodePayload(
+            parent_key=parent_key, token_ids=(11,), n_tokens_cumulative=2,
+            last_access_ts=2.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+
+        unrelated_key = (0, (99,))
+        evicted = store.write(unrelated_key, NodePayload(
+            parent_key=None, token_ids=(99,), n_tokens_cumulative=1,
+            last_access_ts=3.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+        # Parent has a child on disk → not eligible; child is the only leaf →
+        # child must be evicted before parent.
+        assert child_key in evicted
+        assert parent_key not in evicted
