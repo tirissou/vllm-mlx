@@ -170,12 +170,68 @@ class TurnCacheManager(CacheManager):
             inner.set_promote_handler(self._on_promote)
 
     def _on_spill(self, node) -> bool:
-        """Stub spill handler — real implementation comes in Task 16."""
-        return False
+        """Trie spill handler. Returns True on success (node kept), False on disk-full."""
+        if self._disk_store is None:
+            return False
+        from vllm_mlx.cache_disk_store import (
+            DiskStoreFullError, NodePayload, SSDRef,
+        )
+        parent = node.parent
+        parent_hash = parent.context_hash if parent is not None else 0
+        key = (parent_hash, tuple(node.token_ids))
+        # Idempotent: already a handle.
+        if isinstance(node.kv_data, SSDRef) and isinstance(node.recurrent_data, SSDRef):
+            return True
+
+        kv_layers = node.kv_data if isinstance(node.kv_data, list) else []
+        rec_layers = node.recurrent_data if isinstance(node.recurrent_data, list) else []
+        parent_key = (
+            (parent.parent.context_hash if parent.parent is not None else 0,
+             tuple(parent.token_ids))
+            if parent is not None and parent is not self._inner.root
+            else None
+        )
+        payload = NodePayload(
+            parent_key=parent_key,
+            token_ids=tuple(node.token_ids),
+            n_tokens_cumulative=node.n_tokens,
+            last_access_ts=node.last_used,
+            kv_layers=kv_layers,
+            recurrent_layers=rec_layers,
+        )
+        try:
+            evicted_keys = self._disk_store.write(key, payload)
+        except DiskStoreFullError:
+            logger.warning("disk full; falling back to drop eviction")
+            return False
+
+        for ek in evicted_keys:
+            self._drop_node_by_key(ek)
+
+        from vllm_mlx.turn_prefix_cache import _node_data_bytes
+        freed = _node_data_bytes(node)
+        node.kv_data = SSDRef(key=key) if kv_layers else None
+        node.recurrent_data = SSDRef(key=key) if rec_layers else None
+        self._inner._memory_bytes = max(0, self._inner._memory_bytes - freed)
+        return True
 
     def _on_promote(self, ssd_ref):
-        """Stub promote handler — real implementation comes in Task 16."""
-        return None
+        """Trie promote handler. Returns (kv_layers, recurrent_layers) or None on miss."""
+        if self._disk_store is None:
+            return None
+        payload = self._disk_store.read(ssd_ref.key)
+        if payload is None:
+            return None
+        return payload.kv_layers, payload.recurrent_layers
+
+    def _drop_node_by_key(self, key) -> None:
+        """Walk the trie and drop the node whose (parent_hash, token_ids) matches key."""
+        from vllm_mlx.turn_prefix_cache import _context_hash
+        parent_hash, token_ids = key
+        node_hash = _context_hash(parent_hash, list(token_ids))
+        target = self._inner._find_node_by_hash(self._inner.root, node_hash)
+        if target is not None:
+            self._inner._drop_node(target)
 
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state
