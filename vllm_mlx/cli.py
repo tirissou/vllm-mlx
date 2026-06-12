@@ -786,7 +786,7 @@ def bench_kv_cache_command(args):
     import mlx.core as mx
     from mlx_lm.models.cache import KVCache
 
-    from .memory_cache import (
+    from .kv_quant_bench import (
         _dequantize_cache,
         _quantize_cache,
         estimate_kv_cache_memory,
