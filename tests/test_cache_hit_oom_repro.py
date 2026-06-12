@@ -175,3 +175,74 @@ def test_assemble_does_not_spike_on_first_decode_step(
         f"{threshold/1e6:.1f} MB (10% of {cache_bytes/1e6:.1f} MB cache). "
         f"Reconstruction is forcing an allocation+concat on the first decode step."
     )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="needs Metal")
+def test_disk_spill_promote_round_trip_does_not_spike(tmp_path):
+    """Spill + promote of 60k-token quantized KV layers must round-trip bit-exact
+    and must not allocate a transient buffer beyond a single copy of the cache.
+
+    The promote path re-materializes the on-disk payload back into memory, so a
+    ~1x allocation against the cache size is expected at the moment of promote.
+    The threshold guards against *double*-allocation (~2x) during the read.
+    """
+    from vllm_mlx.cache_disk_store import FilesystemCacheDiskStore, SSDRef
+    from vllm_mlx.cache_types import KVQuantPolicy
+    from vllm_mlx.turn_prefix_cache import (
+        Segment,
+        TurnPrefixCache,
+        TurnPrefixCacheConfig,
+    )
+
+    gc.collect()
+
+    n_tokens = N_TOKENS_UNALIGNED
+    trie = TurnPrefixCache(TurnPrefixCacheConfig())
+    store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=GROUP_SIZE)
+    mgr = TurnCacheManager(
+        trie,
+        policy=KVQuantPolicy(full_bits=BITS),
+        kv_group_size=GROUP_SIZE,
+        disk_store=store,
+    )
+
+    kv_layers = [_make_quantized_segment(i, n_tokens) for i in range(N_FULL_LAYERS)]
+    node = trie.insert(
+        trie.root,
+        Segment(role="user", token_ids=list(range(n_tokens))),
+        kv_data=kv_layers,
+    )
+    original_packed = [seg.keys.packed for seg in kv_layers]
+
+    mx.eval(
+        *[a for seg in kv_layers for a in _flatten_arrays(seg.keys)],
+        *[a for seg in kv_layers for a in _flatten_arrays(seg.values)],
+    )
+    mx.reset_peak_memory()
+    pre = mx.get_active_memory()
+
+    assert mgr._on_spill(node) is True
+    assert isinstance(node.kv_data, SSDRef)
+    assert any(tmp_path.glob("*.safetensors")), (
+        "expected cache to have spilled to disk"
+    )
+
+    promote_result = mgr._on_promote(node.kv_data)
+    assert promote_result is not None
+    promoted_kv, _ = promote_result
+    for orig, prom in zip(original_packed, promoted_kv):
+        assert mx.array_equal(orig, prom.keys.packed), "promoted KV not bit-exact"
+
+    peak = mx.get_peak_memory() - pre
+    cache_bytes = 2 * N_FULL_LAYERS * _per_layer_bytes_quantized(n_tokens)
+    # 0.60 budgets a single re-allocation of the payload (~1x cache) on promote
+    # without permitting a transient double-allocation (~2x).
+    threshold = int(0.60 * cache_bytes)
+    print(
+        f"\n[regress:disk_spill_promote] n_tokens={n_tokens} layers={N_FULL_LAYERS} "
+        f"peak={peak/1e6:.1f} MB threshold={threshold/1e6:.1f} MB"
+    )
+    assert peak < threshold, (
+        f"spill+promote peak {peak/1e6:.1f} MB exceeds {threshold/1e6:.1f} MB "
+        f"(60% of {cache_bytes/1e6:.1f} MB cache)"
+    )
