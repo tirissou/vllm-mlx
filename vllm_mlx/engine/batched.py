@@ -217,6 +217,7 @@ class BatchedEngine(BaseEngine):
         self._engine = None  # AsyncEngineCore for LLM
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
+        self._turn_cache_manager = None
         self._loaded = False
 
     @property
@@ -567,6 +568,10 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+        self._turn_cache_manager = getattr(
+            self._engine.engine.scheduler, "_prefix_cache", None
+        )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -1303,26 +1308,27 @@ class BatchedEngine(BaseEngine):
             return result
         return False
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
-        """Save prefix cache to disk for persistence across restarts."""
-        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
-            if pc is not None:
-                return pc.save_to_disk(cache_dir)
-        if self._engine:
-            return self._engine.save_cache_to_disk(cache_dir)
-        return False
+    def save_cache_to_disk(self) -> bool:
+        """Save prefix cache to disk for persistence across restarts.
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
-        """Load prefix cache from disk. Returns number of entries loaded."""
-        if self._mllm_scheduler:
-            self._mllm_scheduler._ensure_batch_generator()
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
-            if pc is not None:
-                return pc.load_from_disk(cache_dir)
-        if self._engine:
-            return self._engine.load_cache_from_disk(cache_dir)
-        return 0
+        Disk location and limits are configured via SchedulerConfig
+        (kv_cache_disk_dir / kv_cache_disk_max_bytes).
+        """
+        manager = getattr(self, "_turn_cache_manager", None)
+        if manager is None and self._engine is not None:
+            return self._engine.save_cache_to_disk()
+        if manager is None:
+            return False
+        return manager.save() > 0
+
+    def load_cache_from_disk(self) -> int:
+        """Load prefix cache from disk; returns number of entries restored."""
+        manager = getattr(self, "_turn_cache_manager", None)
+        if manager is None and self._engine is not None:
+            return self._engine.load_cache_from_disk()
+        if manager is None:
+            return 0
+        return manager.load()
 
     def clear_prefix_cache(self) -> None:
         """Clear the in-memory prefix cache. Used by bench-serve for clean

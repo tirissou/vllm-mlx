@@ -1987,16 +1987,14 @@ class Scheduler:
     # Cache persistence
     # -----------------------------------------------------------------
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
-        """Save prefix cache to disk for persistence across restarts."""
+    def save_cache_to_disk(self) -> bool:
         if self._prefix_cache is not None:
-            return self._prefix_cache.save(cache_dir)
+            return self._prefix_cache.save() > 0
         return False
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
-        """Load prefix cache from disk. Returns number of entries loaded."""
+    def load_cache_from_disk(self) -> int:
         if self._prefix_cache is not None:
-            return self._prefix_cache.load(cache_dir)
+            return self._prefix_cache.load()
         return 0
 
     def clear_prefix_cache(self) -> None:

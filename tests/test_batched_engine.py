@@ -107,25 +107,20 @@ class TestBatchedEngineCacheRestore:
         engine._is_mllm = True
         return engine
 
-    def test_load_cache_from_disk_bootstraps_mllm_batch_generator(self):
+    def test_load_cache_from_disk_routes_to_manager(self):
+        """The new save/load path goes through TurnCacheManager — not MLLM."""
         engine = self._make_mllm_engine()
 
-        prefix_cache = MagicMock()
-        prefix_cache.load_from_disk.return_value = 2
-        scheduler = MagicMock()
-        scheduler.batch_generator = None
+        manager = MagicMock()
+        manager.load.return_value = 2
 
-        def ensure_batch_generator():
-            scheduler.batch_generator = MagicMock(prefix_cache=prefix_cache)
+        # Engine is wired to expose a turn_cache_manager seam (added in this task).
+        engine._turn_cache_manager = manager
 
-        scheduler._ensure_batch_generator.side_effect = ensure_batch_generator
-        engine._mllm_scheduler = scheduler
-
-        loaded = engine.load_cache_from_disk("/tmp/cache")
+        loaded = engine.load_cache_from_disk()
 
         assert loaded == 2
-        scheduler._ensure_batch_generator.assert_called_once_with()
-        prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")
+        manager.load.assert_called_once_with()
 
 
 class TestBatchedEngineAbortRequest:

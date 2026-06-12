@@ -630,7 +630,7 @@ class EngineCore:
         """Get prefix cache statistics."""
         return self.scheduler.get_cache_stats()
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
+    def save_cache_to_disk(self) -> bool:
         """Save prefix cache to disk.
 
         MLX arrays computed on the engine worker thread are stream-affine:
@@ -642,15 +642,15 @@ class EngineCore:
         if executor is not None:
             try:
                 return executor.submit(
-                    self.scheduler.save_cache_to_disk, cache_dir
+                    self.scheduler.save_cache_to_disk
                 ).result()
             except RuntimeError:
                 pass  # executor already shut down
-        return self.scheduler.save_cache_to_disk(cache_dir)
+        return self.scheduler.save_cache_to_disk()
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def load_cache_from_disk(self) -> int:
         """Load prefix cache from disk."""
-        return self.scheduler.load_cache_from_disk(cache_dir)
+        return self.scheduler.load_cache_from_disk()
 
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
@@ -798,13 +798,13 @@ class AsyncEngineCore:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
 
-    def save_cache_to_disk(self, cache_dir: str) -> bool:
+    def save_cache_to_disk(self) -> bool:
         """Save prefix cache to disk."""
-        return self.engine.save_cache_to_disk(cache_dir)
+        return self.engine.save_cache_to_disk()
 
-    def load_cache_from_disk(self, cache_dir: str) -> int:
+    def load_cache_from_disk(self) -> int:
         """Load prefix cache from disk."""
-        return self.engine.load_cache_from_disk(cache_dir)
+        return self.engine.load_cache_from_disk()
 
     def clear_runtime_caches(self) -> Dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
