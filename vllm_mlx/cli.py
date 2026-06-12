@@ -87,6 +87,18 @@ def serve_command(args):
 
     import uvicorn
 
+    # Migration trap for the removed --ssd-cache-* flags. Runs before any other
+    # validation so cold-start scripts get a clear error even if --model is
+    # omitted or invalid.
+    if getattr(args, "ssd_cache_dir", None) is not None or \
+       getattr(args, "ssd_cache_max_gb", None) is not None:
+        print(
+            "ERROR: --ssd-cache-dir and --ssd-cache-max-gb were removed. "
+            "Use --kv-cache-disk-dir and --kv-cache-disk-max-bytes instead.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # Import unified server
     from . import server
     from .model_registry import RegistryServeDefaults
@@ -318,6 +330,11 @@ def serve_command(args):
             ),
             # KV cache size limit
             max_kv_size=getattr(args, "max_kv_size", None) or 0,
+            # KV cache disk persistence (Phase 5 SSD redesign).
+            kv_cache_disk_dir=getattr(args, "kv_cache_disk_dir", None),
+            kv_cache_disk_max_bytes=getattr(args, "kv_cache_disk_max_bytes", None),
+            kv_cache_load_on_startup=getattr(args, "kv_cache_load_on_startup", True),
+            kv_cache_save_on_shutdown=getattr(args, "kv_cache_save_on_shutdown", True),
             # Debug
             cache_key_log_path=getattr(args, "cache_key_log", None),
         )
@@ -1247,6 +1264,51 @@ Examples:
         metavar="GB",
         help="SSD budget in GB for TurnPrefixCache cold tier. 0 = disabled.",
     )
+    # KV-cache disk persistence (Phase 5 SSD redesign).
+    serve_parser.add_argument(
+        "--kv-cache-disk-dir",
+        type=str,
+        default=None,
+        help="Directory for the persistent KV-cache disk store (default: disabled).",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-disk-max-bytes",
+        type=int,
+        default=None,
+        help="Hard cap on disk-store size in bytes (default: unbounded).",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-load-on-startup",
+        action="store_true",
+        default=True,
+        help="Load the persisted cache at startup (default: True).",
+    )
+    serve_parser.add_argument(
+        "--no-kv-cache-load-on-startup",
+        dest="kv_cache_load_on_startup",
+        action="store_false",
+        help="Skip startup load (useful for cold-start benchmarks).",
+    )
+    serve_parser.add_argument(
+        "--kv-cache-save-on-shutdown",
+        action="store_true",
+        default=True,
+        help="Persist cache on graceful shutdown (default: True).",
+    )
+    serve_parser.add_argument(
+        "--no-kv-cache-save-on-shutdown",
+        dest="kv_cache_save_on_shutdown",
+        action="store_false",
+    )
+    # Migration trap for legacy --ssd-cache-* names. Accept silently so we can
+    # emit a helpful error in serve_command instead of an argparse usage dump.
+    for _legacy in ("--ssd-cache-dir", "--ssd-cache-max-gb"):
+        serve_parser.add_argument(
+            _legacy,
+            type=str,
+            default=None,
+            help=argparse.SUPPRESS,
+        )
     # Chunked prefill
     serve_parser.add_argument(
         "--chunked-prefill-tokens",
