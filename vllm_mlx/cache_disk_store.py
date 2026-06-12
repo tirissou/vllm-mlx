@@ -198,6 +198,7 @@ class FilesystemCacheDiskStore:
         self._max_bytes = max_bytes
         self._index_path = self._cache_dir / _INDEX_NAME
         self._index: dict[str, Any] = self._load_or_init_index()
+        self._sweep_orphan_tmp_files()
 
     def _load_or_init_index(self) -> dict[str, Any]:
         if not self._index_path.exists():
@@ -214,6 +215,18 @@ class FilesystemCacheDiskStore:
         with open(tmp, "w") as f:
             json.dump(self._index, f)
         os.replace(tmp, self._index_path)
+
+    def _sweep_orphan_tmp_files(self) -> None:
+        """Clean up orphan .tmp and .tmp.safetensors files left by crashes."""
+        # Handle both patterns: *.tmp (e.g., .meta.json.tmp, .json.tmp)
+        # and *.tmp.safetensors (created by mx.save_safetensors on tmp stem)
+        for pattern in ("*.tmp", "*.tmp.safetensors"):
+            for p in self._cache_dir.glob(pattern):
+                try:
+                    p.unlink()
+                    logger.warning("Removed orphan tmp file: %s", p)
+                except OSError:
+                    pass
 
     def has(self, key: NodeKey) -> bool:
         return _node_hash(key) in self._index["entries"]

@@ -285,3 +285,34 @@ class TestFilesystemRoundTripSlidingAndRecurrent:
         header = store.read_header(key)
         assert header is not None
         assert header.recurrent_class_paths[0].endswith("ArraysCache")
+
+
+class TestCrashAndCorruption:
+    def test_corrupt_safetensors_returns_none_and_deletes(self, tmp_path):
+        from vllm_mlx.cache_disk_store import (
+            FilesystemCacheDiskStore, NodePayload,
+        )
+        store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+        key = (0, (1,))
+        store.write(key, NodePayload(
+            parent_key=None, token_ids=(1,), n_tokens_cumulative=1,
+            last_access_ts=0.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+        # Corrupt the safetensors file in place.
+        st_file = next((tmp_path).glob("*.safetensors"))
+        st_file.write_bytes(b"not a real safetensors file")
+        assert store.read(key) is None
+        assert store.has(key) is False  # delete cascaded.
+
+    def test_orphan_tmp_files_cleaned_on_open(self, tmp_path):
+        # Simulate a crash mid-write: leave a .safetensors.tmp behind.
+        (tmp_path / "_index.json").write_text(
+            '{"_DISK_FORMAT_VERSION": 1, "entries": {}, "total_bytes": 0}'
+        )
+        (tmp_path / "abc123.safetensors.tmp").write_bytes(b"truncated")
+
+        from vllm_mlx.cache_disk_store import FilesystemCacheDiskStore
+        store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+        # Constructor should clean orphan tmp files.
+        assert not (tmp_path / "abc123.safetensors.tmp").exists()
