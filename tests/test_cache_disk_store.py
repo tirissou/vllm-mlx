@@ -316,3 +316,44 @@ class TestCrashAndCorruption:
         store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
         # Constructor should clean orphan tmp files.
         assert not (tmp_path / "abc123.safetensors.tmp").exists()
+
+
+class TestDiskFullError:
+    def test_raises_when_no_leaf_candidate(self, tmp_path):
+        from vllm_mlx.cache_disk_store import (
+            DiskStoreFullError, FilesystemCacheDiskStore, NodePayload,
+        )
+        # Start large enough to fit three writes for setup.
+        store = FilesystemCacheDiskStore(
+            cache_dir=str(tmp_path), kv_group_size=64, max_bytes=150_000,
+        )
+
+        parent_key = (0, (1,))
+        store.write(parent_key, NodePayload(
+            parent_key=None, token_ids=(1,), n_tokens_cumulative=1,
+            last_access_ts=1.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+        child_key = (hash(parent_key), (2,))
+        store.write(child_key, NodePayload(
+            parent_key=parent_key, token_ids=(2,), n_tokens_cumulative=2,
+            last_access_ts=2.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+        grandchild_key = (hash(child_key), (3,))
+        store.write(grandchild_key, NodePayload(
+            parent_key=child_key, token_ids=(3,), n_tokens_cumulative=3,
+            last_access_ts=3.0,
+            kv_layers=[_make_kv_segment(0, 16)], recurrent_layers=[],
+        ))
+        # Now only the grandchild is a leaf. Tighten the cap below the current
+        # total bytes, so no candidate has room and the next write fails.
+        store._max_bytes = store.get_total_bytes() // 2
+        new_key = (0, (99,))
+        with pytest.raises(DiskStoreFullError):
+            store.write(new_key, NodePayload(
+                parent_key=None, token_ids=(99,), n_tokens_cumulative=1,
+                last_access_ts=10.0,
+                kv_layers=[_make_kv_segment(0, 1024)],
+                recurrent_layers=[],
+            ))
