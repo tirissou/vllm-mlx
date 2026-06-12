@@ -90,9 +90,16 @@ class SchedulerConfig:
     cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
     cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
-    # KV cache quantization (reduces prefix cache memory)
+    # KV cache quantization (reduces prefix cache memory).
+    # Per-layer-type bits: sliding-window (RotatingKVCache) vs full-attention (KVCache).
+    # See KVQuantPolicy and _build_kv_quant_policy() below.
     kv_cache_quantization: bool = False
-    kv_cache_quantization_bits: int = 8
+    kv_cache_bits_sliding: int | None = None
+    kv_cache_bits_full: int | None = 8
+    # Provenance — True iff the value came from a user CLI override.
+    # Used by _build_kv_quant_policy to emit the right advisory warnings.
+    kv_cache_bits_sliding_override: bool = False
+    kv_cache_bits_full_override: bool = False
     kv_cache_quantization_group_size: int = 64
     kv_cache_min_quantize_tokens: int = 256
 
@@ -594,6 +601,61 @@ def _install_mtp(
     )
 
 
+def _build_kv_quant_policy(config: "SchedulerConfig") -> "KVQuantPolicy | None":
+    """Build the KVQuantPolicy for this config, emitting advisory warnings.
+
+    Returns None when kv_cache_quantization is disabled (overrides are ignored).
+    Otherwise returns a KVQuantPolicy with provenance flags threaded through.
+    """
+    from .cache_types import KVQuantPolicy
+
+    if not config.kv_cache_quantization:
+        if config.kv_cache_bits_sliding_override or config.kv_cache_bits_full_override:
+            logger.warning(
+                "`--kv-cache-bits-{sliding,full}` is ignored because "
+                "`--kv-cache-quantization` is disabled."
+            )
+        return None
+
+    sliding_bits = (
+        config.kv_cache_bits_sliding
+        if config.kv_cache_bits_sliding_override
+        else None  # smart default: bf16
+    )
+    full_bits = (
+        config.kv_cache_bits_full
+        if config.kv_cache_bits_full_override
+        else 8  # smart default: q8
+    )
+
+    if config.kv_cache_bits_full_override and full_bits is None:
+        logger.warning(
+            "Full-attention layers are the dominant memory consumer; "
+            "setting them to bf16 negates the memory benefit of "
+            "`--kv-cache-quantization`. Did you mean to leave the default (q8)?"
+        )
+    if config.kv_cache_bits_sliding_override and isinstance(sliding_bits, int):
+        logger.warning(
+            "Sliding-window layers use full RoPE and are sensitive to "
+            "quantization error. Recommended default is bf16; quantizing them "
+            "may degrade quality. Measure before relying on this setting."
+        )
+    if isinstance(full_bits, int) and full_bits <= 4:
+        logger.info(
+            "`--kv-cache-bits-full %d` is supported by the Qwen3.5 partial-RoPE "
+            "analogy but unverified for Gemma 4. Measure quality before relying "
+            "on this setting.",
+            full_bits,
+        )
+
+    return KVQuantPolicy(
+        sliding_bits=sliding_bits,
+        full_bits=full_bits,
+        sliding_override=config.kv_cache_bits_sliding_override,
+        full_override=config.kv_cache_bits_full_override,
+    )
+
+
 @dataclass
 class _PrefixCacheBundle:
     """All prefix-cache objects produced by _build_prefix_cache."""
@@ -622,16 +684,10 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             )
         )
         bundle.turn_cache = turn_cache
-        from .cache_types import KVQuantPolicy
-
-        _tcm_policy = (
-            KVQuantPolicy(full_bits=config.kv_cache_quantization_bits)
-            if config.kv_cache_quantization
-            else None
-        )
+        policy = _build_kv_quant_policy(config)
         bundle.adapter = TurnCacheManager(
             turn_cache,
-            policy=_tcm_policy,
+            policy=policy,
             kv_group_size=config.kv_cache_quantization_group_size,
         )
         logger.info(
@@ -833,8 +889,12 @@ class Scheduler:
             mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
             logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
 
+        # BatchGenerator needs the *live* decode-cache bit width — full-attention bits
+        # is the right choice because that's what shows up in update_and_fetch when
+        # mlx-lm allocates a fresh QuantizedKVCache. Sliding layers go through
+        # RotatingKVCache which is always float; no separate kv_bits needed there.
         kv_bits = (
-            self.config.kv_cache_quantization_bits
+            self.config.kv_cache_bits_full
             if self.config.use_turn_cache and self.config.kv_cache_quantization
             else None
         )
