@@ -7,12 +7,12 @@ from mlx_lm.models.cache import KVCache
 from vllm_mlx.kv_quant_bench import (
     _dequantize_cache,
     _quantize_cache,
+    _QuantizedCacheWrapper,
     estimate_kv_cache_memory,
 )
-from vllm_mlx.memory_cache import (
+from vllm_mlx.mllm_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
-    _QuantizedCacheWrapper,
     _trim_to_offset,
 )
 

@@ -1126,7 +1126,7 @@ def test_turn_cache_disables_memory_aware_cache():
     sched.turn_cache = None
 
     # Re-run just the cache-init logic by calling the relevant section inline
-    from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+    from vllm_mlx.mllm_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 
     if sched.config.enable_prefix_cache:
         if sched.config.use_memory_aware_cache and not sched.config.use_turn_cache:

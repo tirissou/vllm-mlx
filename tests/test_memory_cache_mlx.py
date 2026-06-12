@@ -26,7 +26,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         # Pretend a previous request wrote 500 tokens worth of data
@@ -53,7 +53,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         # Positions 0..60: shared prefix (same for everyone).  Positions 60..500:
@@ -77,7 +77,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         layer.keys = mx.ones((1, 4, 100, 8), dtype=mx.float32)
@@ -94,7 +94,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         layer.keys = mx.ones((1, 4, 80, 8), dtype=mx.float32)
@@ -116,7 +116,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         full = mx.arange(1 * 2 * 200 * 4, dtype=mx.float32).reshape(1, 2, 200, 4)
@@ -140,7 +140,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         # Source stored entry: positions 0..300 holding 5.0.
         layer = KVCache()
@@ -168,7 +168,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layers = []
         for _ in range(5):
@@ -193,7 +193,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         for dtype in (mx.float16, mx.bfloat16):
             layer = KVCache()
@@ -215,7 +215,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import RotatingKVCache
 
-        from vllm_mlx.memory_cache import _trim_cache_offset
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = RotatingKVCache(max_size=128, keep=0)
         # Layer already rotated once: offset=200, buffer holds max_size entries.
@@ -247,7 +247,7 @@ class TestTrimCacheOffset:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 
         model = MagicMock()
         cache = MemoryAwarePrefixCache(
@@ -299,11 +299,11 @@ class TestDequantizeCacheSlice:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import (
+        from vllm_mlx.kv_quant_bench import (
             _QuantizedCacheWrapper,
             _dequantize_cache,
-            _trim_cache_offset,
         )
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         # Build a KVCache with 500 tokens, quantize it, then trim to 60.
         layer = KVCache()
@@ -326,11 +326,11 @@ class TestDequantizeCacheSlice:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import (
+        from vllm_mlx.kv_quant_bench import (
             _QuantizedCacheWrapper,
             _dequantize_cache,
-            _trim_cache_offset,
         )
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         # First 64 positions: shared prefix (1.0), next 448: private (7.0)
@@ -357,7 +357,7 @@ class TestDequantizeCacheSlice:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import (
+        from vllm_mlx.kv_quant_bench import (
             _QuantizedCacheWrapper,
             _dequantize_cache,
         )
@@ -381,11 +381,11 @@ class TestDequantizeCacheSlice:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import (
+        from vllm_mlx.kv_quant_bench import (
             _QuantizedCacheWrapper,
             _dequantize_cache,
-            _trim_cache_offset,
         )
+        from vllm_mlx.mllm_cache import _trim_cache_offset
 
         layer = KVCache()
         layer.keys = mx.ones((1, 4, 256, 64), dtype=mx.float32)
@@ -409,7 +409,7 @@ class TestDequantizeCacheSlice:
         import mlx.core as mx
         from mlx_lm.models.cache import KVCache
 
-        from vllm_mlx.memory_cache import (
+        from vllm_mlx.mllm_cache import (
             MemoryAwarePrefixCache,
             MemoryCacheConfig,
         )
