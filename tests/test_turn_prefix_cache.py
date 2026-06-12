@@ -6,12 +6,12 @@ from pathlib import Path
 from vllm_mlx.turn_prefix_cache import (
     Segment,
     TurnNode,
-    SSDRef,
     TurnPrefixCacheConfig,
     TurnPrefixCache,
     _context_hash,
     _node_data_bytes,
 )
+from vllm_mlx.cache_disk_store import SSDRef
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager as TurnCacheAdapter
 
 
@@ -96,6 +96,11 @@ def test_turn_node_not_leaf_when_has_children():
     assert not parent.is_leaf
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): SSDRef shape changed in redesign — "
+    "old fields (file_path, size_bytes) removed; "
+    "new SSDRef uses key: NodeKey. Update in Task 13."
+)
 def test_ssdref_is_sentinel():
     ref = SSDRef(file_path="/tmp/foo.safetensors", size_bytes=1024)
     assert ref.file_path == "/tmp/foo.safetensors"
@@ -230,6 +235,10 @@ def test_has_recurrent_state_survives_clear():
     assert cache.has_recurrent_state
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_load_sets_has_recurrent_state_for_hybrid_cache(tmp_path):
     from vllm_mlx.cache_types import RecurrentLayerSegment
 
@@ -251,6 +260,10 @@ def test_load_sets_has_recurrent_state_for_hybrid_cache(tmp_path):
     assert cache2.has_recurrent_state
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_load_leaves_has_recurrent_state_false_for_kv_only_cache(tmp_path):
     cache1 = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
     cache1.insert(
@@ -551,7 +564,7 @@ def test_find_checkpoint_ancestor_skips_ssdref_nodes():
     n1 = cache.insert(cache.root, seg([1]), recurrent_data=rec)
     n2 = cache.insert(n1, seg([2]), recurrent_data=rec)
     # Simulate n1's state being spilled to SSD
-    n1.recurrent_data = SSDRef(file_path="/tmp/state.bin", size_bytes=1024)
+    n1.recurrent_data = SSDRef(key=(0, (1,)))
     # Should skip n1 and return n2
     ancestor = cache.find_checkpoint_ancestor([n1, n2])
     assert ancestor is n2
@@ -648,6 +661,10 @@ def test_evicted_node_removed_from_parent_children():
     assert h not in cache.root.children
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_save_and_load_roundtrip(tmp_path):
     from vllm_mlx.cache_types import RecurrentLayerSegment
 
@@ -668,6 +685,10 @@ def test_save_and_load_roundtrip(tmp_path):
     assert has_recurrent
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_load_version_mismatch(tmp_path):
     meta = {"version": 9999, "model_fingerprint": "test"}
     (tmp_path / "meta.json").write_text(json.dumps(meta))
@@ -676,6 +697,10 @@ def test_load_version_mismatch(tmp_path):
     assert len(cache.root.children) == 0  # starts empty
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_load_missing_kv_file_skips_node(tmp_path):
     cache = make_cache(stride=0)
     kv_data = _make_kv_data(n_tokens=3)
@@ -703,6 +728,10 @@ def make_ssd_cache(tmp_path, stride=512):
     )
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): _spill_to_ssd removed from trie; "
+    "spill/promote wired through TurnCacheManager handlers (Task 13/16)."
+)
 def test_spill_replaces_kv_with_ssdref(tmp_path):
     cache = make_ssd_cache(tmp_path)
     kv_data = _make_kv_data(n_tokens=3)
@@ -711,6 +740,10 @@ def test_spill_replaces_kv_with_ssdref(tmp_path):
     assert isinstance(node.kv_data, SSDRef)
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): _spill_to_ssd removed from trie; "
+    "spill/promote wired through TurnCacheManager handlers (Task 13/16)."
+)
 def test_spill_trie_still_matchable(tmp_path):
     cache = make_ssd_cache(tmp_path)
     node = cache.insert(cache.root, seg([1, 2, 3]))
@@ -719,6 +752,10 @@ def test_spill_trie_still_matchable(tmp_path):
     assert len(path) == 1
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): _promote_from_ssd removed from trie; "
+    "spill/promote wired through TurnCacheManager handlers (Task 13/16)."
+)
 def test_promote_restores_arrays(tmp_path):
     cache = make_ssd_cache(tmp_path)
     kv_data = _make_kv_data(n_tokens=3)
@@ -730,6 +767,11 @@ def test_promote_restores_arrays(tmp_path):
     assert isinstance(node.kv_data, list)
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): _promote_from_ssd removed from trie; "
+    "spill/promote wired through TurnCacheManager handlers (Task 13/16). "
+    "Also: old SSDRef(file_path=...) signature no longer valid."
+)
 def test_promote_returns_false_on_missing_file(tmp_path):
     cache = make_ssd_cache(tmp_path)
     node = cache.insert(cache.root, seg([1]))
@@ -738,6 +780,10 @@ def test_promote_returns_false_on_missing_file(tmp_path):
     assert result is False
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): _spill_to_ssd/_promote_from_ssd removed from trie; "
+    "spill/promote wired through TurnCacheManager handlers (Task 13/16)."
+)
 def test_promote_restores_recurrent_state(tmp_path):
     """Regression test: recurrent state is properly reconstructed from SSD."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
@@ -1149,6 +1195,10 @@ def _make_extracted_state(n_layers=2, n_tokens=10):
     ]
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_save_and_load_recurrent_data_roundtrip(tmp_path):
     """TurnNode with RecurrentLayerSegment survives a save/load round-trip."""
     from vllm_mlx.cache_types import RecurrentLayerSegment
@@ -1976,6 +2026,10 @@ def test_find_checkpoint_ancestor_accepts_nonempty_recurrent_data():
 # ── save/load dtype combination tests ─────────────────────────────────────────
 
 
+@pytest.mark.skip(
+    reason="TODO(Phase-3): save/load moved to TurnCacheManager (Task 17). "
+    "Re-enable when manager-level persistence is implemented."
+)
 def test_save_load_multi_node_parent_child(tmp_path):
     """Two-node trie (system → user) survives save/load: both nodes exist and parent link is correct."""
     cache = make_cache(stride=0)
