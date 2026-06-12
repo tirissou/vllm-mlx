@@ -63,7 +63,7 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
             enable_mtp=False,
             mtp_num_draft_tokens=1,
             kv_cache_quantization=False,
-            kv_cache_quantization_bits=8,
+            kv_cache_bits_full=8,
             kv_cache_quantization_group_size=64,
             chunked_prefill_tokens=0,
             max_kv_size=0,

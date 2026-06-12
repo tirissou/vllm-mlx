@@ -359,7 +359,14 @@ class BatchedEngine(BaseEngine):
         )
         mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
         kv_quant = getattr(self._scheduler_config, "kv_cache_quantization", False)
-        kv_bits = getattr(self._scheduler_config, "kv_cache_quantization_bits", 8)
+        kv_bits_sliding = getattr(self._scheduler_config, "kv_cache_bits_sliding", None)
+        kv_bits_full = getattr(self._scheduler_config, "kv_cache_bits_full", 8)
+        kv_bits_sliding_override = getattr(
+            self._scheduler_config, "kv_cache_bits_sliding_override", False
+        )
+        kv_bits_full_override = getattr(
+            self._scheduler_config, "kv_cache_bits_full_override", False
+        )
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
@@ -391,7 +398,10 @@ class BatchedEngine(BaseEngine):
             enable_mtp=enable_mtp,
             mtp_num_draft_tokens=mtp_num_draft,
             kv_cache_quantization=kv_quant,
-            kv_cache_quantization_bits=kv_bits,
+            kv_cache_bits_sliding=kv_bits_sliding,
+            kv_cache_bits_full=kv_bits_full,
+            kv_cache_bits_sliding_override=kv_bits_sliding_override,
+            kv_cache_bits_full_override=kv_bits_full_override,
             kv_cache_quantization_group_size=kv_group_size,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,

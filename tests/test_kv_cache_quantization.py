@@ -469,9 +469,10 @@ class TestInstallChunkedPrefillAcceptsKvQuantParams:
         from vllm_mlx.scheduler import SchedulerConfig
         config = SchedulerConfig(
             kv_cache_quantization=True,
-            kv_cache_quantization_bits=4,
+            kv_cache_bits_full=4,
+            kv_cache_bits_full_override=True,
             kv_cache_quantization_group_size=32,
         )
         assert config.kv_cache_quantization is True
-        assert config.kv_cache_quantization_bits == 4
+        assert config.kv_cache_bits_full == 4
         assert config.kv_cache_quantization_group_size == 32

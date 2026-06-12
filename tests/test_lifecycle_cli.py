@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_mlx.cli import _KV_BITS_UNSET
+
 
 @pytest.fixture(autouse=True)
 def restore_server_globals():
@@ -180,7 +182,8 @@ class TestLifecycleCli:
             cache_memory_percent=0.20,
             no_memory_aware_cache=False,
             kv_cache_quantization=False,
-            kv_cache_quantization_bits=8,
+            kv_cache_bits_sliding=_KV_BITS_UNSET,
+            kv_cache_bits_full=_KV_BITS_UNSET,
             kv_cache_quantization_group_size=64,
             kv_cache_min_quantize_tokens=256,
             stream_interval=7,
@@ -268,7 +271,8 @@ class TestLifecycleCli:
             cache_memory_percent=0.20,
             no_memory_aware_cache=False,
             kv_cache_quantization=False,
-            kv_cache_quantization_bits=8,
+            kv_cache_bits_sliding=_KV_BITS_UNSET,
+            kv_cache_bits_full=_KV_BITS_UNSET,
             kv_cache_quantization_group_size=64,
             kv_cache_min_quantize_tokens=256,
             stream_interval=7,
@@ -379,7 +383,8 @@ class TestLifecycleCli:
             cache_memory_percent=0.20,
             no_memory_aware_cache=False,
             kv_cache_quantization=False,
-            kv_cache_quantization_bits=8,
+            kv_cache_bits_sliding=_KV_BITS_UNSET,
+            kv_cache_bits_full=_KV_BITS_UNSET,
             kv_cache_quantization_group_size=64,
             kv_cache_min_quantize_tokens=256,
             stream_interval=1,

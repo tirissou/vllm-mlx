@@ -77,9 +77,13 @@ class MLLMSchedulerConfig:
     use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
-    # KV cache quantization for prefix cache store/fetch
+    # KV cache quantization for prefix cache store/fetch.
+    # Per-layer-type: sliding-window (RotatingKVCache) vs full-attention (KVCache).
     kv_cache_quantization: bool = False
-    kv_cache_quantization_bits: int = 8
+    kv_cache_bits_sliding: int | None = None
+    kv_cache_bits_full: int | None = 8
+    kv_cache_bits_sliding_override: bool = False
+    kv_cache_bits_full_override: bool = False
     kv_cache_quantization_group_size: int = 64
     # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
     chunked_prefill_tokens: int = 0
@@ -301,7 +305,7 @@ class MLLMScheduler:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
                     kv_quantize=self.config.kv_cache_quantization,
-                    kv_bits=self.config.kv_cache_quantization_bits,
+                    kv_bits=self.config.kv_cache_bits_full,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                 )
 
