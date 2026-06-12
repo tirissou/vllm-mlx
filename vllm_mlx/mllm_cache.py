@@ -455,3 +455,14 @@ VLMPrefixCacheEntry = MLLMPrefixCacheEntry
 VLMCacheEntry = MLLMPrefixCacheEntry
 VLMPrefixCacheManager = MLLMPrefixCacheManager
 VLMCacheManager = MLLMPrefixCacheManager
+
+# ---------------------------------------------------------------------------
+# memory_cache re-exports — public seam for MLLM batch generator / scheduler.
+# The actual symbols live in memory_cache.py for now; they will be inlined
+# here and memory_cache.py deleted in Phase 7 of the SSD persistence redesign.
+# ---------------------------------------------------------------------------
+from vllm_mlx.memory_cache import (  # noqa: F401
+    MemoryAwarePrefixCache,
+    MemoryCacheConfig,
+    _trim_cache_offset,
+)

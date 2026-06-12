@@ -291,7 +291,7 @@ class MLLMScheduler:
         if self.batch_generator is None:
             from mlx_lm.sample_utils import make_sampler
 
-            from .memory_cache import MemoryCacheConfig
+            from .mllm_cache import MemoryCacheConfig
 
             # Default sampler (can be overridden per-request in future)
             sampler = make_sampler(temp=0.7, top_p=0.9)
