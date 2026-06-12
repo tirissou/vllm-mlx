@@ -140,3 +140,29 @@ def test_load_rejects_policy_mismatch(tmp_path):
                             kv_group_size=64, disk_store=store2)
     with pytest.raises(CachePolicyMismatchError):
         mgr2.load()
+
+
+def test_fetch_promotes_spilled_node_on_access(tmp_path):
+    from vllm_mlx.cache_disk_store import FilesystemCacheDiskStore, SSDRef
+    from vllm_mlx.cache_types import KVQuantPolicy
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.turn_prefix_cache import (
+        Segment, TurnPrefixCache, TurnPrefixCacheConfig,
+    )
+    trie = TurnPrefixCache(TurnPrefixCacheConfig())
+    store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr = TurnCacheManager(trie, policy=KVQuantPolicy(full_bits=8),
+                           kv_group_size=64, disk_store=store)
+
+    node = trie.insert(trie.root, Segment(role="user", token_ids=[1, 2]),
+                       kv_data=[_make_kv_seg(0, 8, bits=8)])
+    original_packed = node.kv_data[0].keys.packed
+    mgr._on_spill(node)
+    assert isinstance(node.kv_data, SSDRef)
+
+    # collect_path_data should auto-promote.
+    kv, rec = trie.collect_path_data(node)
+    assert len(kv) == 1
+    assert mx.array_equal(kv[0].keys.packed, original_packed)
+    # Node has its real KV back.
+    assert not isinstance(node.kv_data, SSDRef)

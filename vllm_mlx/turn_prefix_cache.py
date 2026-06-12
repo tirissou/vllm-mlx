@@ -322,7 +322,25 @@ class TurnPrefixCache:
         RotatingKVCache layers: deepest node only (full ring buffer).
         Recurrent data: leaf node only.
         """
+        from vllm_mlx.cache_disk_store import CacheMissDuringWalk
         path = self._inorder_path(node)
+
+        for n in path:
+            kv_is_ref = isinstance(n.kv_data, SSDRef)
+            rec_is_ref = isinstance(n.recurrent_data, SSDRef)
+            if not (kv_is_ref or rec_is_ref):
+                continue
+            if self._promote_handler is None:
+                raise CacheMissDuringWalk(n)
+            ref = n.kv_data if kv_is_ref else n.recurrent_data
+            result = self._promote_handler(ref)
+            if result is None:
+                self._drop_node(n)
+                raise CacheMissDuringWalk(n)
+            kv_layers, rec_layers = result
+            n.kv_data = kv_layers if kv_layers else None
+            n.recurrent_data = rec_layers if rec_layers else None
+            self._memory_bytes += _node_data_bytes(n)
 
         kv_by_layer: dict[int, list[KVLayerSegment]] = {}
         for n in path:

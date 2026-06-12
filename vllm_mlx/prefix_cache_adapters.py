@@ -652,7 +652,14 @@ class TurnCacheManager(CacheManager):
 
         _probe_req_id = getattr(request, "request_id", None) or getattr(request, "uid", "?")
         _probe_pre_active = mx.get_active_memory()
-        kv_data, rec_data = self._inner.collect_path_data(ancestor)
+        from vllm_mlx.cache_disk_store import CacheMissDuringWalk
+        try:
+            kv_data, rec_data = self._inner.collect_path_data(ancestor)
+        except CacheMissDuringWalk:
+            self._inner.release([path[-1]])
+            self._pinned_leaves.pop(request.request_id, None)
+            self._set_miss_state(request)
+            return False
         reconstructed = self._assemble(kv_data, rec_data, self._kv_group_size)
         _probe_n_tokens = sum(l.metadata.get("n_tokens", 0) for l in (kv_data or []) if l is not None)
         del kv_data, rec_data
