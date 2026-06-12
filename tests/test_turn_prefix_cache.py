@@ -111,9 +111,6 @@ def test_config_defaults():
     cfg = TurnPrefixCacheConfig()
     assert cfg.checkpoint_stride == 512
     assert cfg.max_memory_gb == 8.0
-    assert cfg.kv_dtype == "int8"
-    assert cfg.persist_dir is None
-    assert cfg.ssd_max_gb == 0.0
 
 
 def test_node_data_bytes_counts_dict_format_recurrent_state():
@@ -174,13 +171,11 @@ def test_node_data_bytes_zero_for_empty_state():
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
 
 
-def make_cache(stride=512, max_gb=8.0, kv_dtype="bf16", recurrent_dtype="bf16"):
+def make_cache(stride=512, max_gb=8.0):
     return TurnPrefixCache(
         TurnPrefixCacheConfig(
             checkpoint_stride=stride,
             max_memory_gb=max_gb,
-            kv_dtype=kv_dtype,
-            recurrent_dtype=recurrent_dtype,
         )
     )
 
@@ -721,9 +716,6 @@ def make_ssd_cache(tmp_path, stride=512):
         TurnPrefixCacheConfig(
             checkpoint_stride=stride,
             max_memory_gb=8.0,
-            kv_dtype="bf16",
-            ssd_max_gb=10.0,
-            ssd_dir=str(tmp_path),
         )
     )
 

@@ -68,11 +68,6 @@ class TurnNode:
 class TurnPrefixCacheConfig:
     checkpoint_stride: int = 512  # tokens between permanent checkpoints; 0 = every node
     max_memory_gb: float = 8.0
-    kv_dtype: str = "int8"  # "bf16" or "int8"
-    recurrent_dtype: str = "bf16"  # "none", "fp16", "bf16", or "int8" (per-channel)
-    persist_dir: str | None = None  # None = disabled
-    ssd_max_gb: float = 0.0  # 0 = disabled
-    ssd_dir: str | None = None  # SSD spill directory (defaults to persist_dir/ssd)
 
 
 def _context_hash(parent_hash: int, token_ids: list[int]) -> int:

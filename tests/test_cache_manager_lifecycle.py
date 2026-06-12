@@ -35,7 +35,7 @@ def _make_trie() -> TurnPrefixCache:
     """Trie where every node is a permanent checkpoint (stride=0) and stored
     in bf16. Keeps configuration deterministic and removes eviction races."""
     return TurnPrefixCache(
-        TurnPrefixCacheConfig(checkpoint_stride=0, kv_dtype="bf16")
+        TurnPrefixCacheConfig(checkpoint_stride=0)
     )
 
 
