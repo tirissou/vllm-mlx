@@ -451,6 +451,80 @@ class TurnPrefixCache:
         )
         return "\n".join(lines) + "\n" + summary
 
+    def walk_all_nodes_preorder(self) -> list[TurnNode]:
+        """Yield every non-root node in preorder (parent before children)."""
+        result = []
+        stack = [self.root]
+        while stack:
+            n = stack.pop()
+            if n is not self.root:
+                result.append(n)
+            # Reverse children so the preorder is left-to-right.
+            stack.extend(reversed(list(n.children.values())))
+        return result
+
+    def insert_prebuilt(
+        self,
+        parent_key,
+        token_ids,
+        last_access_ts: float,
+        n_tokens_cumulative: int,
+        kv_data,
+        recurrent_data,
+    ) -> TurnNode:
+        """Insert a node restored from disk with explicit state.
+
+        ``parent_key`` is ``(parent_hash, parent_token_ids)`` or ``None``
+        to attach directly to root.  The matching parent TurnNode is found
+        by walking children by hash (cheap when restore is topo-sorted).
+        """
+        with self._lock:
+            if parent_key is None:
+                parent_hash = self.root.context_hash
+            else:
+                parent_hash = parent_key[0]
+            parent = self._find_node_by_hash(self.root, parent_hash)
+            if parent is None:
+                raise ValueError(
+                    f"insert_prebuilt: parent with hash {parent_hash} not yet restored"
+                )
+
+            token_ids = list(token_ids)
+            h = _context_hash(parent.context_hash, token_ids)
+            if h in parent.children:
+                # Idempotent re-insert (e.g. duplicate restore); return existing.
+                return parent.children[h]
+
+            node = TurnNode(
+                token_ids=token_ids,
+                context_hash=h,
+                kv_data=kv_data,
+                recurrent_data=recurrent_data,
+                parent=parent,
+                is_permanent_checkpoint=False,
+                tokens_since_checkpoint=0,
+            )
+            node.last_used = last_access_ts
+            parent.children[h] = node
+            self._memory_bytes += _node_data_bytes(node)
+            heapq.heappush(self._eviction_heap, (node.last_used, id(node), node))
+            return node
+
+    def _find_node_by_hash(self, root: TurnNode, target_hash: int) -> TurnNode | None:
+        """DFS search for a node with the given context_hash."""
+        if root.context_hash == target_hash:
+            return root
+        for child in root.children.values():
+            found = self._find_node_by_hash(child, target_hash)
+            if found is not None:
+                return found
+        return None
+
+    def _drop_node(self, node: TurnNode) -> None:
+        """Public-by-convention: manager calls this when promote fails or disk LRU evicts a node."""
+        with self._lock:
+            self._evict_node(node)
+
     def _count_nodes(self) -> int:
         """Count total nodes in trie."""
         count = 1  # root
