@@ -359,14 +359,19 @@ class BatchedEngine(BaseEngine):
         )
         mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
         kv_quant = getattr(self._scheduler_config, "kv_cache_quantization", False)
-        kv_bits_sliding = getattr(self._scheduler_config, "kv_cache_bits_sliding", None)
-        kv_bits_full = getattr(self._scheduler_config, "kv_cache_bits_full", 8)
-        kv_bits_sliding_override = getattr(
-            self._scheduler_config, "kv_cache_bits_sliding_override", False
+        # The MLLM cache uses a single bits value (per ADR-0007). Build the
+        # policy from the upstream SchedulerConfig so smart defaults and
+        # provenance are honored, then collapse to policy.full_bits. The
+        # --kv-cache-bits-sliding flag has no effect on the MLLM path; any
+        # advisory warning about that already fired at CLI args→config time
+        # via _warn_about_kv_quant_policy.
+        from ..scheduler import _build_kv_quant_policy
+        kv_policy = (
+            _build_kv_quant_policy(self._scheduler_config)
+            if self._scheduler_config is not None
+            else None
         )
-        kv_bits_full_override = getattr(
-            self._scheduler_config, "kv_cache_bits_full_override", False
-        )
+        kv_bits_full = kv_policy.full_bits if kv_policy is not None else 8
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
@@ -398,10 +403,7 @@ class BatchedEngine(BaseEngine):
             enable_mtp=enable_mtp,
             mtp_num_draft_tokens=mtp_num_draft,
             kv_cache_quantization=kv_quant,
-            kv_cache_bits_sliding=kv_bits_sliding,
             kv_cache_bits_full=kv_bits_full,
-            kv_cache_bits_sliding_override=kv_bits_sliding_override,
-            kv_cache_bits_full_override=kv_bits_full_override,
             kv_cache_quantization_group_size=kv_group_size,
             chunked_prefill_tokens=chunked_prefill_tokens,
             max_kv_size=max_kv_size,

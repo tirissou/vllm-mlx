@@ -6,7 +6,11 @@ import logging
 import pytest
 
 from vllm_mlx.cache_types import KVQuantPolicy
-from vllm_mlx.scheduler import SchedulerConfig, _build_kv_quant_policy
+from vllm_mlx.scheduler import (
+    SchedulerConfig,
+    _build_kv_quant_policy,
+    _warn_about_kv_quant_policy,
+)
 
 
 def _cfg(**overrides) -> SchedulerConfig:
@@ -49,8 +53,14 @@ def test_warning_when_overrides_set_but_quantization_off(caplog):
         kv_cache_bits_full_override=True,
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        _warn_about_kv_quant_policy(cfg)
         assert _build_kv_quant_policy(cfg) is None
-    assert any("is ignored because" in r.message for r in caplog.records)
+    # The "ignored because" warning names the specific flag that was set,
+    # not a generic `{sliding,full}` brace string.
+    matching = [r for r in caplog.records if "is ignored because" in r.message]
+    assert matching, caplog.records
+    assert "--kv-cache-bits-full" in matching[0].getMessage()
+    assert "{" not in matching[0].getMessage()
 
 
 def test_warning_when_full_explicitly_none(caplog):
@@ -61,7 +71,7 @@ def test_warning_when_full_explicitly_none(caplog):
         kv_cache_bits_full_override=True,
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
-        _build_kv_quant_policy(cfg)
+        _warn_about_kv_quant_policy(cfg)
     assert any("dominant memory consumer" in r.message for r in caplog.records)
 
 
@@ -72,7 +82,7 @@ def test_warning_when_sliding_set_to_int(caplog):
         kv_cache_bits_sliding_override=True,
     )
     with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
-        _build_kv_quant_policy(cfg)
+        _warn_about_kv_quant_policy(cfg)
     assert any("sensitive to quantization error" in r.message for r in caplog.records)
 
 
@@ -83,8 +93,45 @@ def test_info_when_full_bits_le_4(caplog):
         kv_cache_bits_full_override=True,
     )
     with caplog.at_level(logging.INFO, logger="vllm_mlx.scheduler"):
-        _build_kv_quant_policy(cfg)
+        _warn_about_kv_quant_policy(cfg)
     assert any("Qwen3.5 partial-RoPE analogy" in r.message for r in caplog.records)
+
+
+def test_build_kv_quant_policy_is_pure(caplog):
+    """_build_kv_quant_policy must not emit warnings even on aggressive configs.
+
+    Regression for the duplicate-warning issue where calling it once from the
+    startup log line and again from _build_prefix_cache produced two copies
+    of every advisory warning.
+    """
+    cfg = _cfg(
+        kv_cache_quantization=True,
+        kv_cache_bits_full=4,
+        kv_cache_bits_full_override=True,
+        kv_cache_bits_sliding=8,
+        kv_cache_bits_sliding_override=True,
+    )
+    with caplog.at_level(logging.DEBUG, logger="vllm_mlx.scheduler"):
+        for _ in range(3):
+            _build_kv_quant_policy(cfg)
+    assert caplog.records == []
+
+
+def test_warn_when_both_sides_off_names_both_flags(caplog):
+    """The 'ignored because' warning lists every flag the user passed."""
+    cfg = _cfg(
+        kv_cache_quantization=False,
+        kv_cache_bits_full=4,
+        kv_cache_bits_full_override=True,
+        kv_cache_bits_sliding=8,
+        kv_cache_bits_sliding_override=True,
+    )
+    with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        _warn_about_kv_quant_policy(cfg)
+    msgs = [r.getMessage() for r in caplog.records if "is ignored because" in r.message]
+    assert msgs, caplog.records
+    assert "--kv-cache-bits-sliding" in msgs[0]
+    assert "--kv-cache-bits-full" in msgs[0]
 
 
 def test_unset_vs_explicit_none_distinct():

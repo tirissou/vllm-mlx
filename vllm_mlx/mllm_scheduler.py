@@ -78,12 +78,12 @@ class MLLMSchedulerConfig:
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
     # KV cache quantization for prefix cache store/fetch.
-    # Per-layer-type: sliding-window (RotatingKVCache) vs full-attention (KVCache).
+    # The MLLM cache layer (MemoryCacheConfig) uses a single bits value and is
+    # not yet per-layer-type aware; only kv_cache_bits_full is consulted here.
+    # Per-layer policy lives upstream on SchedulerConfig; engine/batched.py
+    # builds the policy and forwards policy.full_bits into this field. See ADR-0007.
     kv_cache_quantization: bool = False
-    kv_cache_bits_sliding: int | None = None
     kv_cache_bits_full: int | None = 8
-    kv_cache_bits_sliding_override: bool = False
-    kv_cache_bits_full_override: bool = False
     kv_cache_quantization_group_size: int = 64
     # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
     chunked_prefill_tokens: int = 0

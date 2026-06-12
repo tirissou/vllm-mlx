@@ -47,6 +47,7 @@ def test_request_cache_state_defaults():
     assert cs.remaining_tokens is None
     assert cs.prefill_boundaries == []
     assert cs.decoded_cache is None
+<<<<<<< Updated upstream
     assert cs.prev_recurrent is None
     assert cs.turn_path == []
     # Removed fields must not exist
@@ -55,6 +56,36 @@ def test_request_cache_state_defaults():
     assert not hasattr(cs, "store_tokens")
     assert not hasattr(cs, "mid_prefill_last_save")
     assert not hasattr(cs, "mid_prefill_cache_key")
+=======
+    assert cs.n_minus_one_state is None
+    assert cs.mid_prefill_last_save == 0
+    assert cs.mid_prefill_cache_key is None
+    assert cs.adapter_state is None
+
+
+def _make_dummy_adapters():
+    return [
+        MemoryCacheAdapter(None),
+        TurnCacheAdapter(None),
+        PagedCacheAdapter(None),
+        LegacyCacheAdapter(None),
+    ]
+
+
+def test_all_adapters_implement_on_prefill_checkpoint():
+    for adapter in _make_dummy_adapters():
+        assert callable(getattr(adapter, "on_prefill_checkpoint", None)), (
+            f"{type(adapter).__name__} missing on_prefill_checkpoint"
+        )
+
+
+def test_on_prefill_checkpoint_no_op_does_not_raise():
+    """No-op implementations must not raise on None inputs."""
+    from unittest.mock import MagicMock
+    request = MagicMock()
+    for adapter in _make_dummy_adapters():
+        adapter.on_prefill_checkpoint(request, 100, [])
+>>>>>>> Stashed changes
 
 
 from unittest.mock import MagicMock, call, patch
@@ -241,6 +272,7 @@ def test_extract_recurrent_state_empty_for_pure_kv():
     assert result == []
 
 
+<<<<<<< Updated upstream
 # ════════════════════════════════════════════════════════════════════════════
 # Task 1: TurnCacheManager validate, extract_cache, close, error handling
 # ════════════════════════════════════════════════════════════════════════════
@@ -365,6 +397,8 @@ def test_turn_cache_manager_close_is_noop():
     adapter.close()  # must not raise
     inner.close.assert_not_called()
 
+=======
+>>>>>>> Stashed changes
 
 class TestBuildPrefixCache:
     """_build_prefix_cache selects the right adapter for each SchedulerConfig variant."""
@@ -419,6 +453,7 @@ from unittest.mock import MagicMock
 # ════════════════════════════════════════════════════════════════════════════
 
 
+<<<<<<< Updated upstream
 def _make_request(
     prompt_token_ids, turn_boundaries, output_token_ids=None, cached_tokens=0
 ):
@@ -559,6 +594,271 @@ def test_fetch_hit_populates_turn_path_on_cache_state():
             prompt_token_ids=list(range(10)),
             turn_boundaries=[5],
             cached_tokens=0,
+=======
+import pytest
+
+
+def _make_mock_request_with_cache_state(n_minus_one_state=None):
+    from unittest.mock import MagicMock
+    from vllm_mlx.kv_cache import RequestCacheState
+    req = MagicMock()
+    req._cache_state = RequestCacheState()
+    req._cache_state.n_minus_one_state = n_minus_one_state
+    return req
+
+
+class TestCacheManagerNMinusOne:
+    """Regression tests for per-step N-1 cache state tracking."""
+
+    def test_reconstruct_standard_kv_decrements_offset(self):
+        """_reconstruct trims standard KV offset by 1."""
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import CacheIndexMap
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+        adapter._cache_index_map = CacheIndexMap(
+            kv_indices=[0], rotating_indices=[], recurrent_indices=[]
+        )
+
+        kv_state = {
+            "state": (mx.zeros((1, 2, 5, 4)), mx.zeros((1, 2, 5, 4))),
+            "meta_state": ("5", "64", "4"),
+            "class_name": "BatchKVCache",
+            "class_ref": None,
+        }
+
+        req = _make_mock_request_with_cache_state(
+            n_minus_one_state={"rotating": [], "recurrent": None}
+        )
+        result = adapter._reconstruct(req, [kv_state])
+
+        assert result[0]["meta_state"][0] == "4"  # offset 5 → 4
+
+    def test_reconstruct_standard_kv_clamps_offset_at_zero(self):
+        """Offset at 0 stays 0, does not go negative."""
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import CacheIndexMap
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+        adapter._cache_index_map = CacheIndexMap(
+            kv_indices=[0], rotating_indices=[], recurrent_indices=[]
+        )
+
+        kv_state = {
+            "state": (mx.zeros((1, 2, 1, 4)), mx.zeros((1, 2, 1, 4))),
+            "meta_state": ("0",),
+            "class_name": "BatchKVCache",
+            "class_ref": None,
+        }
+
+        req = _make_mock_request_with_cache_state(
+            n_minus_one_state={"rotating": [], "recurrent": None}
+        )
+        result = adapter._reconstruct(req, [kv_state])
+        assert int(result[0]["meta_state"][0]) == 0
+
+    def test_reconstruct_rotating_kv_uses_shadow(self):
+        """_reconstruct uses shadow RotatingKVCache for rotating layers."""
+        from mlx_lm.models.cache import RotatingKVCache
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import CacheIndexMap
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+        adapter._cache_index_map = CacheIndexMap(
+            kv_indices=[], rotating_indices=[0], recurrent_indices=[]
+        )
+
+        # Build shadow with 3 tokens (N-1 state)
+        shadow = RotatingKVCache(max_size=8, keep=0)
+        for i in range(3):
+            k = mx.full((1, 2, 1, 4), float(i))
+            v = mx.full((1, 2, 1, 4), float(i))
+            shadow.update_and_fetch(k, v)
+        mx.eval(shadow.keys)
+        assert shadow.offset == 3
+
+        # N-state extracted cache (4 tokens)
+        rotating_state = {
+            "state": (mx.zeros((1, 2, 4, 4)), mx.zeros((1, 2, 4, 4))),
+            "meta_state": ("0", "8", "4", "4"),
+            "class_name": "RotatingKVCache",
+            "class_ref": RotatingKVCache,
+        }
+
+        req = _make_mock_request_with_cache_state(
+            n_minus_one_state={"rotating": [shadow], "recurrent": None}
+        )
+        result = adapter._reconstruct(req, [rotating_state])
+
+        # Result must come from shadow, not from extracted_cache
+        # Shadow has 3 tokens; extracted has 4
+        assert result[0]["class_name"] == "RotatingKVCache"
+        assert int(result[0]["meta_state"][2]) == 3  # shadow offset == 3
+
+    def test_reconstruct_recurrent_uses_saved_refs(self):
+        """_reconstruct uses saved ArraysCache refs for recurrent layers."""
+        from mlx_lm.models.cache import ArraysCache
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import CacheIndexMap
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+        adapter._cache_index_map = CacheIndexMap(
+            kv_indices=[], rotating_indices=[], recurrent_indices=[0]
+        )
+
+        # Saved N-1 ArraysCache (step N-1 values)
+        saved = ArraysCache(2)
+        saved[0] = mx.full((1, 4), 42.0)
+        saved[1] = mx.full((1, 4), 43.0)
+
+        # N-state extracted cache (step N values, different)
+        recurrent_state = {
+            "state": [mx.full((1, 4), 99.0), mx.full((1, 4), 99.0)],
+            "meta_state": "",
+            "class_name": "ArraysCache",
+            "class_ref": ArraysCache,
+        }
+
+        req = _make_mock_request_with_cache_state(
+            n_minus_one_state={"rotating": [], "recurrent": [saved]}
+        )
+        result = adapter._reconstruct(req, [recurrent_state])
+
+        # Result state must come from saved (42.0), not extracted (99.0)
+        mx.eval(*result[0]["state"])
+        assert float(result[0]["state"][0][0, 0]) == pytest.approx(42.0)
+        assert float(result[0]["state"][1][0, 0]) == pytest.approx(43.0)
+
+    def test_update_n_minus_one_initializes_on_first_call(self):
+        """First call initializes shadow instances but does not mirror (no previous step)."""
+        from unittest.mock import MagicMock
+        from mlx_lm.models.cache import BatchRotatingKVCache
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import RequestCacheState
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+
+        # Simulate a live BatchRotatingKVCache with 1 token prefilled
+        live_rotating = BatchRotatingKVCache(max_size=8, left_padding=[0])
+        k = mx.zeros((1, 2, 1, 4))
+        v = mx.zeros((1, 2, 1, 4))
+        live_rotating.update_and_fetch(k, v)
+
+        req = MagicMock()
+        req._cache_state = RequestCacheState()
+        assert req._cache_state.n_minus_one_state is None
+
+        adapter.update_n_minus_one(req, [live_rotating], uid_idx=0)
+
+        # After first call: shadow initialized, no tokens mirrored
+        state = req._cache_state.n_minus_one_state
+        assert state is not None
+        assert "rotating" in state
+        assert len(state["rotating"]) == 1
+        shadow = state["rotating"][0]
+        assert shadow.offset == 0  # no tokens mirrored yet
+
+    def test_update_n_minus_one_mirrors_on_second_call(self):
+        """Second call mirrors the previous step's write into the shadow."""
+        from unittest.mock import MagicMock
+        from mlx_lm.models.cache import BatchRotatingKVCache
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import RequestCacheState
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+
+        live_rotating = BatchRotatingKVCache(max_size=8, left_padding=[0])
+
+        req = MagicMock()
+        req._cache_state = RequestCacheState()
+
+        # Simulate: first call (init), then a decode step writes token, then second call (mirror)
+        adapter.update_n_minus_one(req, [live_rotating], uid_idx=0)
+
+        # Decode step: live gets one token
+        k = mx.full((1, 2, 1, 4), 7.0)
+        v = mx.full((1, 2, 1, 4), 7.0)
+        live_rotating.update_and_fetch(k, v)
+        mx.eval(live_rotating.keys)
+
+        # Second call: should mirror the token just written
+        adapter.update_n_minus_one(req, [live_rotating], uid_idx=0)
+
+        shadow = req._cache_state.n_minus_one_state["rotating"][0]
+        mx.eval(shadow.keys)
+        assert shadow.offset == 1
+        assert float(shadow.keys[0, 0, 0, 0]) == pytest.approx(7.0)
+
+    def test_reconstruct_hybrid_model_correct_layer_order(self):
+        """_reconstruct handles hybrid models with both rotating and recurrent layers."""
+        from mlx_lm.models.cache import RotatingKVCache, ArraysCache
+        from vllm_mlx.prefix_cache_adapters import TurnCacheAdapter
+        from vllm_mlx.kv_cache import CacheIndexMap
+        import mlx.core as mx
+
+        adapter = TurnCacheAdapter(None)
+        # 3 layers: [rotating, recurrent, kv]
+        adapter._cache_index_map = CacheIndexMap(
+            kv_indices=[2],
+            rotating_indices=[0],
+            recurrent_indices=[1],
+        )
+
+        shadow = RotatingKVCache(max_size=4, keep=0)
+        shadow.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 4)))
+
+        saved_recurrent = ArraysCache(1)
+        saved_recurrent[0] = mx.full((1, 4), 55.0)
+
+        extracted_cache = [
+            {  # rotating, layer 0 — should be replaced by shadow
+                "state": (mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))),
+                "meta_state": ("0", "4", "2", "2"),
+                "class_name": "RotatingKVCache",
+                "class_ref": RotatingKVCache,
+            },
+            {  # recurrent, layer 1 — should be replaced by saved ref
+                "state": [mx.full((1, 4), 99.0)],
+                "meta_state": "",
+                "class_name": "ArraysCache",
+                "class_ref": ArraysCache,
+            },
+            {  # kv, layer 2 — offset decremented
+                "state": (mx.zeros((1, 1, 3, 4)), mx.zeros((1, 1, 3, 4))),
+                "meta_state": ("3",),
+                "class_name": "BatchKVCache",
+                "class_ref": None,
+            },
+        ]
+
+        req = _make_mock_request_with_cache_state(
+            n_minus_one_state={"rotating": [shadow], "recurrent": [saved_recurrent]}
+        )
+        result = adapter._reconstruct(req, extracted_cache)
+
+        assert len(result) == 3
+        # Layer 0: shadow has 1 token
+        assert int(result[0]["meta_state"][2]) == 1
+        # Layer 1: saved recurrent (55.0)
+        mx.eval(*result[1]["state"])
+        assert float(result[1]["state"][0][0, 0]) == pytest.approx(55.0)
+        # Layer 2: KV offset 3 → 2
+        assert result[2]["meta_state"][0] == "2"
+
+
+class TestBuildPrefixCacheSSDWiring:
+    def test_no_ssd_does_not_wrap_with_ssd_offloaded_cache(self):
+        config = SchedulerConfig(
+            enable_prefix_cache=True,
+            use_memory_aware_cache=True,
+            ssd_cache_dir=None,
+>>>>>>> Stashed changes
         )
         result = adapter.fetch(req)
     assert result is True

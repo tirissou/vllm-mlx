@@ -14,7 +14,7 @@ KV cache precision is selected per layer type by a structural rule keyed on the 
 | Cache class | Default bits | Rationale |
 |---|---|---|
 | `RotatingKVCache` | `None` (bf16) | Full RoPE quantizes poorly; storing float removes the round-trip. |
-| Any `*KVCache` (full-attention) | `8` (q8) | Pruned RoPE; dominant memory consumer; clean quantization signal. |
+| Any other class name ending in `KVCache` (full-attention) | `8` (q8) | Pruned RoPE; dominant memory consumer; clean quantization signal. |
 | Recurrent (everything else) | `None` (bf16) | No quantization path for recurrent caches. |
 
 A new `KVQuantPolicy` dataclass (`vllm_mlx/cache_types.py`) owns the mapping. CLI flags are per-side: `--kv-cache-bits-sliding`, `--kv-cache-bits-full`. The single global `--kv-cache-quantization-bits` flag is removed; argparse rejects it with a migration hint. To make the smart defaults work without ambiguity, the CLI uses a private sentinel default so that "flag omitted" and "flag explicitly set to `none`" are distinguishable — `SchedulerConfig` carries an explicit `*_override` companion field for each side.
@@ -38,4 +38,4 @@ The `bits` value lives on each `KVLayerSegment.metadata` rather than as a `TurnC
 
 - SSD persistence is broken and unused; this spec is runtime-only. No `_CACHE_FORMAT_VERSION` bump.
 - Quantization path for recurrent caches.
-- MLLM-side per-layer-type policy. `MLLMSchedulerConfig` carries the same four fields as `SchedulerConfig` (for symmetry with `engine/batched.py`'s forwarding), but only `kv_cache_bits_full` is consulted by `MemoryCacheConfig`. Full per-layer-type wiring of the MLLM cache is a future spec.
+- MLLM-side per-layer-type policy. `MLLMSchedulerConfig` carries a single `kv_cache_bits_full` field; `engine/batched.py` builds the upstream `KVQuantPolicy` and forwards `policy.full_bits` only. `--kv-cache-bits-sliding` has no effect on the MLLM path. (Advisory warnings still fire at the args→config boundary, so a user who sets `--kv-cache-bits-sliding 8` against an MLLM model sees the "sensitive to quantization error" warning even though the flag will then be silently dropped on this code path.) Full per-layer-type wiring of the MLLM cache is a future spec.

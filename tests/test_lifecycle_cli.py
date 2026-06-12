@@ -254,7 +254,10 @@ class TestLifecycleCli:
         monkeypatch.setitem(
             sys.modules,
             "vllm_mlx.scheduler",
-            SimpleNamespace(SchedulerConfig=FakeSchedulerConfig),
+            SimpleNamespace(
+                SchedulerConfig=FakeSchedulerConfig,
+                _warn_about_kv_quant_policy=lambda *_: None,
+            ),
         )
 
         args = SimpleNamespace(

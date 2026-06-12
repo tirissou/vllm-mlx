@@ -83,8 +83,10 @@ class KVQuantPolicy:
 
     bits_for(class_name) returns the int bit-width to use for that class, or
     None for "store float — do not quantize". Class dispatch is purely structural:
-    'RotatingKVCache' uses sliding_bits, any other 'KVCache' uses full_bits,
-    everything else returns None (recurrent caches are never quantized).
+    'RotatingKVCache' uses sliding_bits, any other class whose name ends in
+    'KVCache' uses full_bits, everything else returns None (recurrent caches
+    are never quantized). The endswith check intentionally accepts subclasses
+    like 'BatchKVCache' while rejecting unrelated names.
     """
 
     sliding_bits: int | None = None       # bf16 by default
@@ -96,7 +98,7 @@ class KVQuantPolicy:
     def bits_for(self, class_name: str) -> int | None:
         if class_name == "RotatingKVCache":
             return self.sliding_bits
-        if "KVCache" in class_name:
+        if class_name.endswith("KVCache"):
             return self.full_bits
         return None
 

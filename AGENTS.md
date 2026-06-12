@@ -8,6 +8,7 @@ When uncertain, look it up. Do not fabricate API signatures, file contents, conf
 - All tests lives in `./tests/`.
 - All docs live in `./docs/`.
 - Python virtual environment at `.venv` is managed by `uv`. Use `uv pip` always.
+- Never use `grep`. Use `rg` instead.
 
 #### Research
 - Use the available web search tool for:

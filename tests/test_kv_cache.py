@@ -590,8 +590,20 @@ class TestArraysCacheReferenceSemantics:
 class TestRotatingKVShadowCorrectness:
     """Shadow RotatingKVCache mirrors live instance one step behind."""
 
+<<<<<<< Updated upstream
     def test_shadow_mirrors_live_unwrapped(self):
         from mlx_lm.models.cache import RotatingKVCache
+=======
+        class MinimalSpillable:
+            def fetch(self, request): ...
+            def store(self, request, cache): ...
+            def release(self, handle): ...
+            def get_stats(self): ...
+            def clear(self): ...
+            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            def update_n_minus_one(self, request, prompt_cache, uid_idx): ...
+            def set_spill_delegate(self, on_spill, on_promote): ...
+>>>>>>> Stashed changes
 
         max_size, n_heads, head_dim = 8, 2, 4
         live = RotatingKVCache(max_size=max_size, keep=0)
@@ -610,6 +622,7 @@ class TestRotatingKVShadowCorrectness:
         assert live.offset == 4
         assert shadow.offset == 3
 
+<<<<<<< Updated upstream
     def test_shadow_mirrors_live_wrapped(self):
         from mlx_lm.models.cache import RotatingKVCache
 
@@ -628,11 +641,158 @@ class TestRotatingKVShadowCorrectness:
             )
         assert live.offset == 8
         assert shadow.offset == 7
+=======
+    def test_missing_set_spill_delegate_fails_check(self):
+        """A class with all PrefixCache methods but missing set_spill_delegate should not satisfy SpillableCache."""
+        class NoDelegate:
+            def fetch(self, request): ...
+            def store(self, request, cache): ...
+            def release(self, handle): ...
+            def get_stats(self): ...
+            def clear(self): ...
+            def on_prefill_checkpoint(self, request, processed_tokens, extracted_cache): ...
+            # No set_spill_delegate
+        assert not isinstance(NoDelegate(), SpillableCache)
+
+
+# ------------------------------------------------------------------
+# N-1 State Tracking: ArraysCache Reference Semantics
+# ------------------------------------------------------------------
+
+class TestArraysCacheReferenceSemantics:
+    """Validate that ArraysCache updates replace Python references rather than mutating in-place.
+
+    This assumption is critical for per-step N-1 tracking: we save refs to cache.cache lists
+    before each decode step, and those refs must remain valid after the step updates the cache.
+    """
+
+    def test_setitem_replaces_reference_not_mutates(self):
+        """ArraysCache.__setitem__ replaces the list entry; old ref still valid."""
+        from mlx_lm.models.cache import ArraysCache
+        cache = ArraysCache(2)
+        old_array = mx.zeros((1, 4))
+        cache[0] = old_array
+
+        # Save ref before "decode step"
+        saved_ref = cache.cache[0]
+
+        # Simulate a decode step: model replaces cache entry
+        new_array = mx.ones((1, 4))
+        cache[0] = new_array
+
+        # Saved ref must still point to old array (reference semantics, not mutation)
+        assert saved_ref is old_array
+        assert cache.cache[0] is new_array
+        # Evaluate to confirm old array has original values
+        mx.eval(saved_ref, cache.cache[0])
+        assert float(saved_ref[0, 0]) == 0.0
+        assert float(cache.cache[0][0, 0]) == 1.0
+
+    def test_saved_refs_survive_multiple_steps(self):
+        """Refs saved at step N-1 remain valid after step N updates the cache."""
+        from mlx_lm.models.cache import ArraysCache
+        cache = ArraysCache(3)
+
+        step0 = [mx.full((1, 4), float(i)) for i in range(3)]
+        step1 = [mx.full((1, 4), float(i + 10)) for i in range(3)]
+        step2 = [mx.full((1, 4), float(i + 20)) for i in range(3)]
+
+        for i, v in enumerate(step0): cache[i] = v
+        saved_after_step0 = list(cache.cache)  # save refs
+
+        for i, v in enumerate(step1): cache[i] = v
+        saved_after_step1 = list(cache.cache)  # save refs
+
+        for i, v in enumerate(step2): cache[i] = v
+
+        # Refs saved after step0 still valid
+        mx.eval(*saved_after_step0)
+        assert all(float(a[0, 0]) == float(i) for i, a in enumerate(saved_after_step0))
+        # Refs saved after step1 still valid
+        mx.eval(*saved_after_step1)
+        assert all(float(a[0, 0]) == float(i + 10) for i, a in enumerate(saved_after_step1))
+
+
+# ------------------------------------------------------------------
+# N-1 State Tracking: RotatingKVCache Shadow Correctness
+# ------------------------------------------------------------------
+
+class TestRotatingKVShadowCorrectness:
+    """Validate that a shadow RotatingKVCache can mirror the live instance one step behind.
+
+    Because RotatingKVCache._update_in_place mutates the Metal buffer, we cannot save Python refs.
+    Instead, we maintain a separate shadow instance that lags one step behind the live instance,
+    giving us a snapshot of the cache state at N-1.
+    """
+
+    def test_shadow_mirrors_live_unwrapped(self):
+        """Shadow mirrors live RotatingKV one step behind (buffer not yet full)."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        max_size = 8
+        n_heads, head_dim = 2, 4
+
+        live = RotatingKVCache(max_size=max_size, keep=0)
+        shadow = RotatingKVCache(max_size=max_size, keep=0)
+
+        n_steps = 4  # stays within max_size, buffer doesn't wrap
+
+        for step in range(n_steps):
+            k = mx.full((1, n_heads, 1, head_dim), float(step))
+            v = mx.full((1, n_heads, 1, head_dim), float(step + 100))
+
+            # Mirror PREVIOUS step's write into shadow (before this step)
+            if step > 0:
+                # Write what the live wrote last step into shadow
+                shadow_k = mx.full((1, n_heads, 1, head_dim), float(step - 1))
+                shadow_v = mx.full((1, n_heads, 1, head_dim), float(step - 1 + 100))
+                shadow.update_and_fetch(shadow_k, shadow_v)
+
+            # Advance live instance
+            live.update_and_fetch(k, v)
+
+        # After n_steps, shadow should reflect state after step n_steps-1 (N-1)
+        # Live is at step n_steps-1, shadow is at step n_steps-2
+        # For offset: live.offset == n_steps, shadow.offset == n_steps - 1
+        mx.eval(live.keys, shadow.keys)
+        assert live.offset == n_steps
+        assert shadow.offset == n_steps - 1
+
+    def test_shadow_mirrors_live_wrapped(self):
+        """Shadow mirrors live RotatingKV one step behind when buffer has wrapped."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        max_size = 4
+        n_heads, head_dim = 2, 4
+
+        live = RotatingKVCache(max_size=max_size, keep=0)
+        shadow = RotatingKVCache(max_size=max_size, keep=0)
+
+        n_steps = 8  # > max_size, buffer wraps
+
+        for step in range(n_steps):
+            k = mx.full((1, n_heads, 1, head_dim), float(step))
+            v = mx.full((1, n_heads, 1, head_dim), float(step + 100))
+
+            # Mirror previous step into shadow before this step
+            if step > 0:
+                shadow_k = mx.full((1, n_heads, 1, head_dim), float(step - 1))
+                shadow_v = mx.full((1, n_heads, 1, head_dim), float(step - 1 + 100))
+                shadow.update_and_fetch(shadow_k, shadow_v)
+
+            live.update_and_fetch(k, v)
+
+        # After n_steps on live, shadow has n_steps-1 tokens written
+        assert live.offset == n_steps
+        assert shadow.offset == n_steps - 1
+        # Both should have max_size-sized buffers after wrapping
+>>>>>>> Stashed changes
         mx.eval(live.keys, shadow.keys)
         assert live.keys.shape[2] == max_size
         assert shadow.keys.shape[2] == max_size
 
     def test_shadow_n_minus_one_has_correct_last_token(self):
+<<<<<<< Updated upstream
         import pytest
         from mlx_lm.models.cache import RotatingKVCache
 
@@ -655,3 +815,36 @@ class TestRotatingKVShadowCorrectness:
         assert shadow.offset == 2
         assert float(shadow_keys[0, 0, -1, 0]) == pytest.approx(1.0)
         assert float(live_keys[0, 0, -1, 0]) == pytest.approx(2.0)
+=======
+        """N-1 shadow's last seen token is step N-2, not N-1."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        max_size = 8
+        n_heads, head_dim = 1, 4
+
+        live = RotatingKVCache(max_size=max_size, keep=0)
+        shadow = RotatingKVCache(max_size=max_size, keep=0)
+
+        # 3 steps, each with distinct key values
+        keys_written = []
+        for step in range(3):
+            k = mx.full((1, n_heads, 1, head_dim), float(step))
+            v = mx.zeros((1, n_heads, 1, head_dim))
+            keys_written.append(float(step))
+
+            if step > 0:
+                # Mirror step-1 into shadow
+                sk = mx.full((1, n_heads, 1, head_dim), float(step - 1))
+                sv = mx.zeros((1, n_heads, 1, head_dim))
+                shadow.update_and_fetch(sk, sv)
+
+            live.update_and_fetch(k, v)
+
+        mx.eval(live.keys, shadow.keys)
+        # Shadow has 2 tokens (steps 0 and 1); live has 3 (steps 0, 1, 2)
+        assert shadow.offset == 2
+        # Last token in shadow (at position offset-1) should be step 1 (key value 1.0)
+        assert float(shadow.keys[0, 0, shadow.offset - 1, 0]) == pytest.approx(1.0)
+        # Last token in live (at position offset-1) should be step 2 (key value 2.0)
+        assert float(live.keys[0, 0, live.offset - 1, 0]) == pytest.approx(2.0)
+>>>>>>> Stashed changes

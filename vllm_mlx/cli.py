@@ -326,6 +326,9 @@ def serve_command(args):
             cache_key_log_path=getattr(args, "cache_key_log", None),
         )
 
+        from .scheduler import _warn_about_kv_quant_policy
+        _warn_about_kv_quant_policy(scheduler_config)
+
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
@@ -580,6 +583,9 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
+
+        from .scheduler import _warn_about_kv_quant_policy
+        _warn_about_kv_quant_policy(scheduler_config)
 
         engine_config = EngineConfig(
             model_name=args.model,

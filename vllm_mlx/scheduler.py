@@ -602,7 +602,11 @@ def _install_mtp(
 
 
 def _build_kv_quant_policy(config: "SchedulerConfig") -> "KVQuantPolicy | None":
-    """Build the KVQuantPolicy for this config, emitting advisory warnings.
+    """Build the KVQuantPolicy for this config. Pure — no logging side effects.
+
+    Call `_warn_about_kv_quant_policy(config)` once at the args→config boundary
+    to emit advisory warnings; this function may be called any number of times
+    downstream without re-emitting them.
 
     Returns None when kv_cache_quantization is disabled (overrides are ignored).
     Otherwise returns a KVQuantPolicy with provenance flags threaded through.
@@ -610,11 +614,6 @@ def _build_kv_quant_policy(config: "SchedulerConfig") -> "KVQuantPolicy | None":
     from .cache_types import KVQuantPolicy
 
     if not config.kv_cache_quantization:
-        if config.kv_cache_bits_sliding_override or config.kv_cache_bits_full_override:
-            logger.warning(
-                "`--kv-cache-bits-{sliding,full}` is ignored because "
-                "`--kv-cache-quantization` is disabled."
-            )
         return None
 
     sliding_bits = (
@@ -628,13 +627,49 @@ def _build_kv_quant_policy(config: "SchedulerConfig") -> "KVQuantPolicy | None":
         else 8  # smart default: q8
     )
 
-    if config.kv_cache_bits_full_override and full_bits is None:
+    return KVQuantPolicy(
+        sliding_bits=sliding_bits,
+        full_bits=full_bits,
+        sliding_override=config.kv_cache_bits_sliding_override,
+        full_override=config.kv_cache_bits_full_override,
+    )
+
+
+def _warn_about_kv_quant_policy(config: "SchedulerConfig") -> None:
+    """Emit advisory warnings about a KV quant configuration.
+
+    Call this once at the args→SchedulerConfig boundary (CLI). Downstream code
+    paths should use the pure `_build_kv_quant_policy` so warnings don't repeat.
+    """
+    sliding_set = config.kv_cache_bits_sliding_override
+    full_set = config.kv_cache_bits_full_override
+
+    if not config.kv_cache_quantization:
+        if sliding_set or full_set:
+            which = " and ".join(
+                name
+                for name, present in (
+                    ("--kv-cache-bits-sliding", sliding_set),
+                    ("--kv-cache-bits-full", full_set),
+                )
+                if present
+            )
+            logger.warning(
+                "`%s` is ignored because `--kv-cache-quantization` is disabled.",
+                which,
+            )
+        return
+
+    sliding_bits = config.kv_cache_bits_sliding if sliding_set else None
+    full_bits = config.kv_cache_bits_full if full_set else 8
+
+    if full_set and full_bits is None:
         logger.warning(
             "Full-attention layers are the dominant memory consumer; "
             "setting them to bf16 negates the memory benefit of "
             "`--kv-cache-quantization`. Did you mean to leave the default (q8)?"
         )
-    if config.kv_cache_bits_sliding_override and isinstance(sliding_bits, int):
+    if sliding_set and isinstance(sliding_bits, int):
         logger.warning(
             "Sliding-window layers use full RoPE and are sensitive to "
             "quantization error. Recommended default is bf16; quantizing them "
@@ -647,13 +682,6 @@ def _build_kv_quant_policy(config: "SchedulerConfig") -> "KVQuantPolicy | None":
             "on this setting.",
             full_bits,
         )
-
-    return KVQuantPolicy(
-        sliding_bits=sliding_bits,
-        full_bits=full_bits,
-        sliding_override=config.kv_cache_bits_sliding_override,
-        full_override=config.kv_cache_bits_full_override,
-    )
 
 
 @dataclass

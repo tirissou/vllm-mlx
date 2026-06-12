@@ -1998,3 +1998,271 @@ def test_save_load_multi_node_parent_child(tmp_path):
     assert len(path) == 2
     assert path[1].parent is path[0]
     assert path[0].parent is cache2.root
+<<<<<<< Updated upstream
+=======
+
+
+@pytest.mark.parametrize("recurrent_dtype", ["none", "fp16", "bf16", "int8"])
+def test_save_load_recurrent_legacy_ssm_dtype(tmp_path, recurrent_dtype):
+    """Legacy SSM recurrent state survives save/load for every recurrent_dtype config."""
+    cache = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    raw_state = [mx.array([[0.5, -0.3, 0.8, -1.2]], dtype=mx.float32)]
+    quantized, scales = _quantize_recurrent(raw_state, recurrent_dtype)
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [], [], quantized, is_system_prompt=True, recurrent_scales=scales)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    cache2.load(str(tmp_path))
+
+    path, has_rec = cache2.match([s])
+    assert len(path) == 1
+    assert has_rec
+    loaded = path[0]
+    if recurrent_dtype == "int8":
+        assert loaded.recurrent_scales is not None
+    else:
+        assert loaded.recurrent_scales is None
+
+    dq = cache2.get_dequantized_recurrent(loaded)
+    assert dq is not None
+    result = dq if isinstance(dq, mx.array) else dq[0]
+    if isinstance(result, (list, tuple)):
+        result = result[0]
+    diff = mx.abs(result.astype(mx.float32) - raw_state[0].astype(mx.float32))
+    assert mx.max(diff).item() < 0.02
+
+
+def test_save_load_recurrent_dict_int8_scales_preserved(tmp_path):
+    """Dict-format recurrent state with int8 per-channel scales survives save/load."""
+    from mlx_lm.models.cache import KVCache
+    cache = make_cache(stride=0, recurrent_dtype="int8")
+
+    raw_arr = mx.array([[0.5, -0.3, 0.8, -1.2]], dtype=mx.float32)
+    raw_state = [{"state": (raw_arr,), "meta_state": "", "class_name": "KVCache", "class_ref": KVCache}]
+    quantized, scales = _quantize_recurrent(raw_state, "int8")
+    mx.eval(*[t for d in quantized for t in d["state"]])
+
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [], [], quantized, is_system_prompt=True, recurrent_scales=scales)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, recurrent_dtype="int8")
+    cache2.load(str(tmp_path))
+
+    path, has_rec = cache2.match([s])
+    assert len(path) == 1 and has_rec
+    loaded = path[0]
+    assert loaded.recurrent_scales is not None
+
+    dq = cache2.get_dequantized_recurrent(loaded)
+    assert dq is not None
+    restored = dq[0]["state"][0]
+    diff = mx.abs(restored.astype(mx.float32) - raw_arr.astype(mx.float32))
+    assert mx.max(diff).item() < 0.02
+
+
+@pytest.mark.parametrize("recurrent_dtype,expected_dtype", [
+    ("fp16", mx.float16),
+    ("bf16", mx.bfloat16),
+    ("int8", mx.bfloat16),  # int8 stored, dequantized to bf16
+])
+def test_get_dequantized_recurrent_after_load_output_dtype(tmp_path, recurrent_dtype, expected_dtype):
+    """get_dequantized_recurrent returns the correct dtype after a save/load roundtrip."""
+    cache = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    raw_state = [mx.array([[1.0, -0.5, 0.25, -0.125]], dtype=mx.float32)]
+    quantized, scales = _quantize_recurrent(raw_state, recurrent_dtype)
+    s = seg([1, 2], role="system")
+    cache.insert(cache.root, s, [], [], quantized, is_system_prompt=True, recurrent_scales=scales)
+
+    cache.save(str(tmp_path))
+    cache2 = make_cache(stride=0, recurrent_dtype=recurrent_dtype)
+    cache2.load(str(tmp_path))
+
+    path, _ = cache2.match([s])
+    dq = cache2.get_dequantized_recurrent(path[0])
+    assert dq is not None
+    result = dq if isinstance(dq, mx.array) else dq[0]
+    if isinstance(result, (list, tuple)):
+        result = result[0]
+    assert result.dtype == expected_dtype
+
+
+# --- RotatingKVCache handling ---
+
+def _rotating_state_dict(keys, values, max_size, offset=None, _idx=None, keep=0):
+    """Build an extracted-state dict for a RotatingKVCache (mirrors extract_layer_state output)."""
+    from mlx_lm.models.cache import RotatingKVCache
+    n = keys.shape[2]
+    return {
+        "state": (keys, values),
+        "meta_state": (str(keep), str(max_size), str(n if offset is None else offset), str(n if _idx is None else _idx)),
+        "class_name": "RotatingKVCache",
+        "class_ref": RotatingKVCache,
+    }
+
+
+def _split_and_reconstruct(states):
+    """Run the full split → reassemble → reconstruct pipeline on extracted states."""
+    from vllm_mlx.turn_prefix_cache import reconstruct_cache_from_states
+    cache = make_cache(stride=0)
+    kv, recurrent = cache._split_cache_arrays(states)
+    assembled = cache._reassemble_cache_fn(kv, recurrent)
+    return reconstruct_cache_from_states(assembled)
+
+
+def test_rotating_kvcache_roundtrip_produces_rotating_type():
+    from mlx_lm.models.cache import RotatingKVCache
+    keys = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    states = [_rotating_state_dict(keys, values, max_size=16)]
+    caches = _split_and_reconstruct(states)
+    assert isinstance(caches[0], RotatingKVCache)
+
+
+def test_rotating_kvcache_roundtrip_not_quantized_kvcache_type():
+    from mlx_lm.models.cache import QuantizedKVCache
+    keys = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    states = [_rotating_state_dict(keys, values, max_size=16)]
+    caches = _split_and_reconstruct(states)
+    assert not isinstance(caches[0], QuantizedKVCache)
+
+
+def test_rotating_kvcache_roundtrip_preserves_max_size():
+    from mlx_lm.models.cache import RotatingKVCache
+    keys = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    states = [_rotating_state_dict(keys, values, max_size=32)]
+    caches = _split_and_reconstruct(states)
+    assert caches[0].max_size == 32
+
+
+def test_rotating_kvcache_roundtrip_values_within_tolerance():
+    keys = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    states = [_rotating_state_dict(keys, values, max_size=16)]
+    caches = _split_and_reconstruct(states)
+    restored_keys = caches[0].keys.astype(mx.float32)
+    restored_values = caches[0].values.astype(mx.float32)
+    key_err = mx.max(mx.abs(restored_keys - keys.astype(mx.float32))).item()
+    val_err = mx.max(mx.abs(restored_values - values.astype(mx.float32))).item()
+    assert key_err < 0.1, f"key max error {key_err} exceeds tolerance"
+    assert val_err < 0.1, f"value max error {val_err} exceeds tolerance"
+
+
+def test_rotating_kvcache_roundtrip_wrapped_buffer_temporal_order():
+    """Wrapped circular buffer is linearized to temporal order before quantizing."""
+    from mlx_lm.models.cache import RotatingKVCache
+    # 4-slot buffer; older tokens at positions [2,3], newer at [0,1] (_idx=2)
+    # Temporal order should be: positions [2,3] then [0,1]
+    older = mx.ones((1, 2, 2, 64), dtype=mx.bfloat16) * 0.8
+    newer = mx.ones((1, 2, 2, 64), dtype=mx.bfloat16) * 0.2
+    keys = mx.concatenate([newer, older], axis=2)   # storage: [newer, older]
+    values = mx.concatenate([newer, older], axis=2)
+    # offset=4 (processed 4 tokens), _idx=2 (write head wrapped to pos 2)
+    states = [_rotating_state_dict(keys, values, max_size=4, offset=4, _idx=2)]
+    caches = _split_and_reconstruct(states)
+    restored = caches[0].keys.astype(mx.float32)
+    # Temporal order: older tokens first, then newer → restored[..., :2, :] ≈ 0.8
+    first_half_mean = mx.mean(restored[..., :2, :]).item()
+    second_half_mean = mx.mean(restored[..., 2:, :]).item()
+    assert first_half_mean > 0.5, f"expected older (0.8) tokens first, got {first_half_mean:.3f}"
+    assert second_half_mean < 0.5, f"expected newer (0.2) tokens second, got {second_half_mean:.3f}"
+
+
+def test_rotating_kvcache_roundtrip_trims_when_concatenation_exceeds_max_size():
+    """When multi-turn concatenation produces more than max_size tokens, trim to max_size."""
+    from mlx_lm.models.cache import RotatingKVCache
+    max_size = 4
+    # Simulate concatenated result of 8 tokens (two 4-token turns merged)
+    keys = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    states = [_rotating_state_dict(keys, values, max_size=max_size)]
+    caches = _split_and_reconstruct(states)
+    assert caches[0].keys.shape[2] <= max_size
+
+
+def test_rotating_kvcache_offset_set_correctly():
+    from mlx_lm.models.cache import RotatingKVCache
+    keys = mx.random.uniform(shape=(1, 2, 6, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 6, 64)).astype(mx.bfloat16)
+    states = [_rotating_state_dict(keys, values, max_size=16)]
+    caches = _split_and_reconstruct(states)
+    assert caches[0].offset == 6
+
+
+# --- N-1 trim_last tests ---
+
+
+def test_split_cache_arrays_trim_last_reduces_token_count():
+    """_split_cache_arrays with trim_last=True produces one fewer token than without."""
+    keys = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    values = mx.random.uniform(shape=(1, 2, 8, 64)).astype(mx.bfloat16)
+    state_normal = _rotating_state_dict(keys, values, max_size=16)
+    state_trim = {**_rotating_state_dict(keys, values, max_size=16), "trim_last": True}
+
+    cache = make_cache(stride=0)
+    kv_normal, _ = cache._split_cache_arrays([state_normal])
+    assembled_normal = cache._reassemble_cache_fn(kv_normal, [])
+    n_normal = assembled_normal[0]["meta_state"][0]  # n_tokens string
+
+    kv_trim, _ = cache._split_cache_arrays([state_trim])
+    assembled_trim = cache._reassemble_cache_fn(kv_trim, [])
+    n_trim = assembled_trim[0]["meta_state"][0]
+
+    assert int(n_trim) == int(n_normal) - 1
+
+
+def test_split_cache_arrays_trim_last_drops_last_temporal_token():
+    """trim_last drops the most-recent token (last in temporal order)."""
+    # 8-token linear buffer: tokens 0..7; last token (index 7) has value 99.0
+    keys = mx.ones((1, 2, 8, 64), dtype=mx.bfloat16)
+    last_token = mx.ones((1, 2, 1, 64), dtype=mx.bfloat16) * 99.0
+    keys = mx.concatenate([keys[..., :7, :], last_token], axis=2)
+    values = mx.ones((1, 2, 8, 64), dtype=mx.bfloat16)
+
+    state = {**_rotating_state_dict(keys, values, max_size=16), "trim_last": True}
+    cache = make_cache(stride=0)
+    kv, _ = cache._split_cache_arrays([state])
+    assembled = cache._reassemble_cache_fn(kv, [])
+
+    from vllm_mlx.turn_prefix_cache import reconstruct_cache_from_states
+    restored = reconstruct_cache_from_states(assembled)
+    restored_keys = restored[0].keys.astype(mx.float32)
+
+    assert restored_keys.shape[2] == 7, f"expected 7 tokens, got {restored_keys.shape[2]}"
+    max_val = mx.max(restored_keys).item()
+    assert max_val < 50.0, f"last token (99.0) should have been dropped, max={max_val}"
+
+
+def test_split_cache_arrays_trim_last_case4_wrap_around():
+    """Case 4: _idx==keep (just wrapped). trim_last must drop the token at max_size-1."""
+    # Buffer: keep=0, max_size=4, _idx=0 (just wrapped from 3→0=keep).
+    # Storage slots: [t0, t1, t2, t3]; temporal order (oldest first): [t0, t1, t2, t3].
+    # After trim: [t0, t1, t2] (drop t3 = slot max_size-1 = the last-written).
+    t0 = mx.ones((1, 2, 1, 64), dtype=mx.bfloat16) * 1.0
+    t1 = mx.ones((1, 2, 1, 64), dtype=mx.bfloat16) * 2.0
+    t2 = mx.ones((1, 2, 1, 64), dtype=mx.bfloat16) * 3.0
+    t3 = mx.ones((1, 2, 1, 64), dtype=mx.bfloat16) * 99.0  # last-written, should be dropped
+    keys = mx.concatenate([t0, t1, t2, t3], axis=2)
+    values = mx.ones((1, 2, 4, 64), dtype=mx.bfloat16)
+
+    # _idx=0 (== keep=0), offset=4 (wrapped): all 4 slots are valid
+    state = {
+        **_rotating_state_dict(keys, values, max_size=4, offset=4, _idx=0, keep=0),
+        "trim_last": True,
+    }
+
+    cache = make_cache(stride=0)
+    kv, _ = cache._split_cache_arrays([state])
+    assembled = cache._reassemble_cache_fn(kv, [])
+
+    from vllm_mlx.turn_prefix_cache import reconstruct_cache_from_states
+    restored = reconstruct_cache_from_states(assembled)
+    restored_keys = restored[0].keys.astype(mx.float32)
+
+    assert restored_keys.shape[2] == 3, f"expected 3 tokens, got {restored_keys.shape[2]}"
+    max_val = mx.max(restored_keys).item()
+    assert max_val < 50.0, f"t3 (99.0) should have been dropped, max={max_val}"
+>>>>>>> Stashed changes

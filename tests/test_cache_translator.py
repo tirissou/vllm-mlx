@@ -128,8 +128,6 @@ def _make_rotating_state(n_tokens: int, max_size: int = 8, keep: int = 0):
 
 def test_segment_kvcache_produces_kv_layer_segment():
     """_segment on a KVCache state produces a KVLayerSegment."""
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states = [_make_kvcache_state(n_tokens=4)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, rec_list = TurnCacheManager._segment(states, policy=policy, group_size=64)
@@ -142,8 +140,6 @@ def test_segment_kvcache_produces_kv_layer_segment():
 
 def test_segment_rotating_kvcache_produces_last_strategy():
     """_segment on a RotatingKVCache state produces merge_strategy='last'."""
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states = [_make_rotating_state(n_tokens=4, max_size=4)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, rec_list = TurnCacheManager._segment(states, policy=policy, group_size=64)
@@ -153,7 +149,7 @@ def test_segment_rotating_kvcache_produces_last_strategy():
 
 def test_segment_recurrent_produces_recurrent_layer_segment():
     """_segment on a non-KV state produces a RecurrentLayerSegment."""
-    from vllm_mlx.cache_types import RecurrentLayerSegment, KVQuantPolicy
+    from vllm_mlx.cache_types import RecurrentLayerSegment
 
     states = [
         {"class_name": "MambaCache", "state": (mx.zeros((1, 4)),), "meta_state": ()}
@@ -168,8 +164,6 @@ def test_segment_recurrent_produces_recurrent_layer_segment():
 
 def test_segment_layer_index_matches_position():
     """layer_index in metadata matches position in input list."""
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states = [_make_kvcache_state(n_tokens=4), _make_kvcache_state(n_tokens=4)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
@@ -183,8 +177,6 @@ def test_segment_layer_index_matches_position():
 def test_assemble_kvcache_returns_batch_quantized_kv_cache():
     """_assemble on a KVLayerSegment returns a BatchQuantizedKVCache (ADR-0005)."""
     from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states = [_make_kvcache_state(n_tokens=4)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
@@ -196,8 +188,6 @@ def test_assemble_kvcache_returns_batch_quantized_kv_cache():
 
 def test_assemble_kvcache_offset_matches_n_tokens():
     """Reconstructed cache _idx (logical length) equals original n_tokens."""
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     n_tokens = 6
     states = [_make_kvcache_state(n_tokens=n_tokens)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
@@ -210,8 +200,6 @@ def test_assemble_kvcache_offset_matches_n_tokens():
 def test_assemble_rotating_returns_rotating_kv_cache():
     """_assemble on a RotatingKVCache segment returns a RotatingKVCache."""
     from mlx_lm.models.cache import RotatingKVCache
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states = [_make_rotating_state(n_tokens=4, max_size=4)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
@@ -223,8 +211,6 @@ def test_assemble_rotating_returns_rotating_kv_cache():
 
 def test_assemble_mixed_layer_ordering():
     """_assemble returns layers sorted by layer_index regardless of input order."""
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states = [_make_kvcache_state(n_tokens=4), _make_kvcache_state(n_tokens=4)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
@@ -241,8 +227,6 @@ def test_assemble_mixed_layer_ordering():
 
 def test_kvcache_round_trip_shape():
     """KVCache: segment, concat two nodes, assemble → correct sequence length."""
-    from vllm_mlx.cache_types import KVQuantPolicy
-
     states1 = [_make_kvcache_state(n_tokens=3)]
     states2 = [_make_kvcache_state(n_tokens=5)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
@@ -303,8 +287,6 @@ def test_concat_matching_float_bits_succeeds():
 
 
 # ── _segment with KVQuantPolicy ──────────────────────────────────────────────
-
-from vllm_mlx.cache_types import KVQuantPolicy
 
 
 def _make_rotating_live_state(n_tokens: int, layer_index: int) -> dict:
