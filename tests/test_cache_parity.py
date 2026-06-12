@@ -335,8 +335,8 @@ async def test_invalid_cache_falls_back_to_miss(model_and_tokenizer):
     # function, so we just reference it directly (no __func__ needed).
     _orig_assemble = TurnCacheManager._assemble
 
-    def _corrupt_assemble(kv_layers, rec_layers, group_size=64, bits=None):
-        result = _orig_assemble(kv_layers, rec_layers, group_size, bits)
+    def _corrupt_assemble(kv_layers, rec_layers, group_size=64):
+        result = _orig_assemble(kv_layers, rec_layers, group_size)
         # Corrupt batch dimension so validate() rejects it
         from mlx_lm.models.cache import KVCache
         import mlx.core as mx

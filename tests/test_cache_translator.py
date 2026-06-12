@@ -56,6 +56,7 @@ def _make_kv_segment(
             "layer_index": layer_index,
             "merge_strategy": "concatenate",
             "n_tokens": n_tokens,
+            "bits": bits,
         },
     )
 
@@ -188,7 +189,7 @@ def test_assemble_kvcache_returns_batch_quantized_kv_cache():
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
-    result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
+    result = TurnCacheManager._assemble(kv_layers, [], group_size=64)
     assert len(result) == 1
     assert isinstance(result[0], BatchQuantizedKVCache)
 
@@ -202,7 +203,7 @@ def test_assemble_kvcache_offset_matches_n_tokens():
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
-    result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
+    result = TurnCacheManager._assemble(kv_layers, [], group_size=64)
     assert result[0]._idx == n_tokens
 
 
@@ -215,7 +216,7 @@ def test_assemble_rotating_returns_rotating_kv_cache():
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
     kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
-    result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
+    result = TurnCacheManager._assemble(kv_layers, [], group_size=64)
     assert len(result) == 1
     assert isinstance(result[0], RotatingKVCache)
 
@@ -230,7 +231,7 @@ def test_assemble_mixed_layer_ordering():
     kv_layers = [k for k in kv_list if k is not None]
     # Reverse to test sorting
     result = TurnCacheManager._assemble(
-        list(reversed(kv_layers)), [], group_size=64, bits=8
+        list(reversed(kv_layers)), [], group_size=64
     )
     assert len(result) == 2
 
@@ -250,7 +251,7 @@ def test_kvcache_round_trip_shape():
     kv2, _ = TurnCacheManager._segment(states2, policy=policy, group_size=64)
 
     merged = KVLayerSegment.concat([kv1[0], kv2[0]])
-    result = TurnCacheManager._assemble([merged], [], group_size=64, bits=8)
+    result = TurnCacheManager._assemble([merged], [], group_size=64)
     assert len(result) == 1
     # logical length should be 3 + 5 = 8
     assert result[0]._idx == 8
@@ -365,3 +366,60 @@ def test_segment_policy_none_disables_quantization():
     for seg in kv_list:
         assert seg.metadata["bits"] is None
         assert not isinstance(seg.keys, QuantizedArray)
+
+
+# ── _assemble reads bits from metadata ───────────────────────────────────────
+
+
+def test_assemble_reads_bits_from_metadata_mixed():
+    """Build segments with mixed metadata['bits']; _assemble reconstructs correct cache types."""
+    from mlx_lm.models.cache import KVCache as _KVCache, RotatingKVCache as _RotatingKVCache
+    from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
+    from vllm_mlx.kv_cache import QuantizedArray
+
+    # Full-attention quantized layer (layer 0)
+    n = 128
+    k = mx.ones((1, 4, n, 128), dtype=mx.bfloat16)
+    v = mx.ones((1, 4, n, 128), dtype=mx.bfloat16)
+    qk = QuantizedArray(*mx.quantize(k, group_size=64, bits=8))
+    qv = QuantizedArray(*mx.quantize(v, group_size=64, bits=8))
+    full_seg = KVLayerSegment(
+        keys=qk,
+        values=qv,
+        metadata={
+            "class_name": "KVCache",
+            "layer_index": 0,
+            "merge_strategy": "concatenate",
+            "n_tokens": n,
+            "bits": 8,
+        },
+    )
+
+    # Sliding-window float layer (layer 1)
+    max_size = 256
+    rk = mx.ones((1, 4, max_size, 128), dtype=mx.bfloat16)
+    rv = mx.ones((1, 4, max_size, 128), dtype=mx.bfloat16)
+    sliding_seg = KVLayerSegment(
+        keys=rk,
+        values=rv,
+        metadata={
+            "class_name": "RotatingKVCache",
+            "layer_index": 1,
+            "merge_strategy": "last",
+            "n_tokens": max_size,
+            "max_size": max_size,
+            "keep": 0,
+            "offset": max_size,
+            "_idx": max_size,
+            "bits": None,
+        },
+    )
+
+    caches = TurnCacheManager._assemble(
+        kv_layers=[full_seg, sliding_seg],
+        recurrent_layers=[],
+        group_size=64,
+    )
+
+    assert isinstance(caches[0], BatchQuantizedKVCache)
+    assert isinstance(caches[1], _RotatingKVCache)

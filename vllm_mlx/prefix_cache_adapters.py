@@ -402,9 +402,11 @@ class TurnCacheManager(CacheManager):
         kv_layers: list,
         recurrent_layers: list,
         group_size: int = 64,
-        bits: int | None = 8,
     ) -> list:
-        """Reconstruct live cache objects from KVLayerSegment and RecurrentLayerSegment lists."""
+        """Reconstruct live cache objects from KVLayerSegment and RecurrentLayerSegment lists.
+
+        Each layer's bits is read from layer.metadata['bits'] (None = float).
+        """
         from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
         from .kv_cache import QuantizedArray
 
@@ -412,6 +414,7 @@ class TurnCacheManager(CacheManager):
 
         for layer in kv_layers:
             li = layer.metadata["layer_index"]
+            bits = layer.metadata.get("bits")
             is_quantized_payload = isinstance(layer.keys, QuantizedArray)
             if layer.metadata["class_name"] == "RotatingKVCache":
                 if is_quantized_payload:
@@ -577,7 +580,7 @@ class TurnCacheManager(CacheManager):
         _probe_req_id = getattr(request, "request_id", None) or getattr(request, "uid", "?")
         _probe_pre_active = mx.get_active_memory()
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
-        reconstructed = self._assemble(kv_data, rec_data, self._kv_group_size, self._kv_bits)
+        reconstructed = self._assemble(kv_data, rec_data, self._kv_group_size)
         _probe_n_tokens = sum(l.metadata.get("n_tokens", 0) for l in (kv_data or []) if l is not None)
         del kv_data, rec_data
         # Materialize the KVCache arrays now so the lazy computation graph
