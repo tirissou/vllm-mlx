@@ -1810,7 +1810,7 @@ class TestLifecycleFailureHandling:
             async def stop(self):
                 return None
 
-            def load_cache_from_disk(self, path):
+            def load_cache_from_disk(self):
                 time.sleep(0.2)
                 callback_seen_during_hook["value"] = callback_fired.is_set()
                 return 1
@@ -1857,10 +1857,10 @@ class TestLifecycleFailureHandling:
             async def stop(self):
                 return None
 
-            def load_cache_from_disk(self, path):
+            def load_cache_from_disk(self):
                 return 0
 
-            def save_cache_to_disk(self, path):
+            def save_cache_to_disk(self):
                 time.sleep(0.2)
                 callback_seen_during_hook["value"] = callback_fired.is_set()
                 return True
@@ -1916,10 +1916,10 @@ class TestLifecycleFailureHandling:
             async def stop(self):
                 return None
 
-            def load_cache_from_disk(self, path):
+            def load_cache_from_disk(self):
                 return 1
 
-            def save_cache_to_disk(self, path):
+            def save_cache_to_disk(self):
                 return True
 
         async def fake_engine_factory(spec):
@@ -1979,11 +1979,11 @@ class TestLifecycleFailureHandling:
             async def stop(self):
                 return None
 
-            def load_cache_from_disk(self, path):
+            def load_cache_from_disk(self):
                 load_calls["count"] += 1
                 return 1
 
-            def save_cache_to_disk(self, path):
+            def save_cache_to_disk(self):
                 save_calls["count"] += 1
                 return True
 

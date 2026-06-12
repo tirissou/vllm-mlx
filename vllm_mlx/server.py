@@ -1161,7 +1161,7 @@ def _load_prefix_cache_from_disk(engine: BaseEngine | None = None) -> None:
     try:
         d = _get_cache_dir()
         logger.info(f"[lifespan] Loading prefix cache from {d}")
-        loaded = target_engine.load_cache_from_disk(d)
+        loaded = target_engine.load_cache_from_disk()
         if loaded > 0:
             logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
         else:
@@ -1182,7 +1182,7 @@ def _save_prefix_cache_to_disk(engine: BaseEngine | None = None) -> None:
     try:
         d = _get_cache_dir()
         logger.info(f"[lifespan] Saving prefix cache to {d}")
-        saved = target_engine.save_cache_to_disk(d)
+        saved = target_engine.save_cache_to_disk()
         if saved:
             logger.info(f"[lifespan] Saved prefix cache to {d}")
         else:

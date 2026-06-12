@@ -106,11 +106,11 @@ class CacheManager(ABC):
         """
         return None
 
-    def save(self, cache_dir: str) -> bool:
+    def save(self) -> bool:
         """Persist cache to disk. Returns True on success."""
         return False
 
-    def load(self, cache_dir: str) -> int:
+    def load(self) -> int:
         """Load cache from disk. Returns entries loaded."""
         return 0
 
