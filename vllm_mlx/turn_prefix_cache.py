@@ -19,7 +19,7 @@ from mlx.nn.utils import checkpoint
 import numpy as np
 
 from vllm_mlx.cache_types import KVLayerSegment, RecurrentLayerSegment
-from vllm_mlx.cache_disk_store import SSDRef
+from vllm_mlx.cache_disk_store import CacheMissDuringWalk, SSDRef
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -322,7 +322,6 @@ class TurnPrefixCache:
         RotatingKVCache layers: deepest node only (full ring buffer).
         Recurrent data: leaf node only.
         """
-        from vllm_mlx.cache_disk_store import CacheMissDuringWalk
         path = self._inorder_path(node)
 
         for n in path:
@@ -335,11 +334,13 @@ class TurnPrefixCache:
             ref = n.kv_data if kv_is_ref else n.recurrent_data
             result = self._promote_handler(ref)
             if result is None:
-                self._drop_node(n)
+                self._drop_subtree(n)
                 raise CacheMissDuringWalk(n)
             kv_layers, rec_layers = result
-            n.kv_data = kv_layers if kv_layers else None
-            n.recurrent_data = rec_layers if rec_layers else None
+            if kv_is_ref:
+                n.kv_data = kv_layers if kv_layers else None
+            if rec_is_ref:
+                n.recurrent_data = rec_layers if rec_layers else None
             self._memory_bytes += _node_data_bytes(n)
 
         kv_by_layer: dict[int, list[KVLayerSegment]] = {}
@@ -542,6 +543,22 @@ class TurnPrefixCache:
         """Public-by-convention: manager calls this when promote fails or disk LRU evicts a node."""
         with self._lock:
             self._evict_node(node)
+
+    def _drop_subtree(self, node: TurnNode) -> None:
+        """Drop ``node`` and every descendant, accounting their bytes.
+
+        ``_evict_node`` only walks UP toward the root, so dropping a path-interior
+        node with descendants would leak their bytes from ``_memory_bytes`` and
+        leave the descendant Python objects unreachable.
+        """
+        with self._lock:
+            for descendant in self._walk_nodes(node):
+                self._memory_bytes -= _node_data_bytes(descendant)
+                descendant.kv_data = None
+                descendant.recurrent_data = None
+            parent = node.parent
+            if parent is not None and node.context_hash in parent.children:
+                del parent.children[node.context_hash]
 
     def _count_nodes(self) -> int:
         """Count total nodes in trie."""

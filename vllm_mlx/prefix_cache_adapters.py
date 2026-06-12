@@ -11,7 +11,12 @@ import mlx.core as mx
 
 from vllm_mlx.request import Request
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache
-from vllm_mlx.cache_disk_store import CacheDiskStore, NodePayload, SSDRef
+from vllm_mlx.cache_disk_store import (
+    CacheDiskStore,
+    CacheMissDuringWalk,
+    NodePayload,
+    SSDRef,
+)
 
 if TYPE_CHECKING:
     from vllm_mlx.turn_prefix_cache import TurnNode
@@ -652,7 +657,6 @@ class TurnCacheManager(CacheManager):
 
         _probe_req_id = getattr(request, "request_id", None) or getattr(request, "uid", "?")
         _probe_pre_active = mx.get_active_memory()
-        from vllm_mlx.cache_disk_store import CacheMissDuringWalk
         try:
             kv_data, rec_data = self._inner.collect_path_data(ancestor)
         except CacheMissDuringWalk:

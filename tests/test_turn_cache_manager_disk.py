@@ -166,3 +166,85 @@ def test_fetch_promotes_spilled_node_on_access(tmp_path):
     assert mx.array_equal(kv[0].keys.packed, original_packed)
     # Node has its real KV back.
     assert not isinstance(node.kv_data, SSDRef)
+
+
+def test_collect_path_data_raises_when_no_promote_handler():
+    """collect_path_data hits an SSDRef but no promote handler is installed."""
+    import pytest
+    from vllm_mlx.cache_disk_store import CacheMissDuringWalk, SSDRef
+    from vllm_mlx.turn_prefix_cache import (
+        Segment, TurnPrefixCache, TurnPrefixCacheConfig,
+    )
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig())
+    node = trie.insert(trie.root, Segment(role="user", token_ids=[1, 2]),
+                       kv_data=[_make_kv_seg(0, 8)])
+    node.kv_data = SSDRef(key=(0, (1, 2)))
+
+    assert trie._promote_handler is None
+    with pytest.raises(CacheMissDuringWalk):
+        trie.collect_path_data(node)
+
+
+def test_fetch_falls_back_to_miss_when_disk_read_returns_none(tmp_path):
+    """fetch must clean up pins and return False when promote returns None mid-walk.
+
+    Spills a path-interior node, deletes its on-disk file so promote returns
+    None during collect_path_data, then asserts:
+      - fetch returns False
+      - request id is not in _pinned_leaves
+      - cache state hit_type == "miss"
+      - the orphaned descendant subtree no longer contributes to _memory_bytes
+    """
+    from vllm_mlx.cache_disk_store import FilesystemCacheDiskStore, SSDRef
+    from vllm_mlx.cache_types import KVQuantPolicy
+    from vllm_mlx.kv_cache import RequestCacheState
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.request import Request, SamplingParams
+    from vllm_mlx.turn_prefix_cache import (
+        Segment, TurnPrefixCache, TurnPrefixCacheConfig,
+    )
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
+    store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr = TurnCacheManager(trie, policy=KVQuantPolicy(full_bits=8),
+                           kv_group_size=64, disk_store=store)
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    sys_node = trie.insert(
+        trie.root, Segment(role="system", token_ids=sys_tokens),
+        kv_data=[_make_kv_seg(0, 8, bits=8)], is_system_prompt=True,
+    )
+    user_leaf = trie.insert(
+        sys_node, Segment(role="user", token_ids=user_tokens),
+        kv_data=[_make_kv_seg(0, 8, bits=8)],
+    )
+
+    assert mgr._on_spill(sys_node) is True
+    assert isinstance(sys_node.kv_data, SSDRef)
+
+    # Wipe the on-disk payload so _on_promote returns None.
+    store.delete(sys_node.kv_data.key)
+
+    memory_before_fetch = trie._memory_bytes
+    assert memory_before_fetch > 0
+
+    req = Request(
+        request_id="req-miss-walk",
+        prompt=" ".join(str(t) for t in sys_tokens + user_tokens),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    req.prompt_token_ids = sys_tokens + user_tokens
+    req.num_prompt_tokens = len(req.prompt_token_ids)
+    req._turn_boundaries = [len(sys_tokens)]
+    req._cache_state = RequestCacheState()
+
+    assert mgr.fetch(req) is False
+    assert req.request_id not in mgr._pinned_leaves
+    assert req._cache_state.hit_type == "miss"
+
+    # The interior node and its descendant subtree are unreachable from root;
+    # their bytes are subtracted from _memory_bytes (no orphaned accounting).
+    assert sys_node.context_hash not in trie.root.children
+    assert trie._memory_bytes == 0
