@@ -1040,4 +1040,5 @@ class TurnCacheManager(CacheManager):
         return extract_cache_states(raw_cache)
 
     def close(self) -> None:
-        pass
+        if self._disk_store is not None:
+            self._disk_store.close()
