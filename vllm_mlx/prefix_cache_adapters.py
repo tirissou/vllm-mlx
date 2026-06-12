@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from vllm_mlx.turn_prefix_cache import TurnNode
 
 from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
-from .cache_types import KVLayerSegment, RecurrentLayerSegment
+from .cache_types import KVLayerSegment, KVQuantPolicy, RecurrentLayerSegment
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -195,10 +195,14 @@ class TurnCacheManager(CacheManager):
     @staticmethod
     def _segment(
         live_states: list[dict],
+        policy: "KVQuantPolicy | None" = None,
         group_size: int = 64,
-        bits: int | None = 8,
     ) -> tuple[list, list]:
-        """Transform live cache states into KVLayerSegment / RecurrentLayerSegment."""
+        """Transform live cache states into KVLayerSegment / RecurrentLayerSegment.
+
+        bits per layer is resolved via policy.bits_for(class_name); None means
+        store float. Each emitted KVLayerSegment carries metadata['bits'] = bits.
+        """
         from .kv_cache import QuantizedArray
 
         kv_list = [None] * len(live_states)
@@ -208,6 +212,7 @@ class TurnCacheManager(CacheManager):
             class_name = state_dict["class_name"]
             state = state_dict["state"]
             meta = state_dict.get("meta_state", ())
+            bits = policy.bits_for(class_name) if policy is not None else None
 
             if class_name == "RotatingKVCache":
                 try:
@@ -241,6 +246,7 @@ class TurnCacheManager(CacheManager):
                             "keep": keep,
                             "offset": offset,
                             "_idx": _idx,
+                            "bits": bits,
                         },
                     )
                     continue
@@ -286,6 +292,7 @@ class TurnCacheManager(CacheManager):
                         "keep": keep,
                         "offset": offset,
                         "_idx": _idx,
+                        "bits": bits,
                     },
                 )
 
@@ -330,6 +337,7 @@ class TurnCacheManager(CacheManager):
                             "layer_index": i,
                             "merge_strategy": "concatenate",
                             "n_tokens": actual_end,
+                            "bits": bits,
                         },
                     )
                     continue
@@ -373,6 +381,7 @@ class TurnCacheManager(CacheManager):
                         "layer_index": i,
                         "merge_strategy": "concatenate",
                         "n_tokens": actual_end,
+                        "bits": bits,
                     },
                 )
 

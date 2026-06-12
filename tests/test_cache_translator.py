@@ -127,8 +127,11 @@ def _make_rotating_state(n_tokens: int, max_size: int = 8, keep: int = 0):
 
 def test_segment_kvcache_produces_kv_layer_segment():
     """_segment on a KVCache state produces a KVLayerSegment."""
+    from vllm_mlx.cache_types import KVQuantPolicy
+
     states = [_make_kvcache_state(n_tokens=4)]
-    kv_list, rec_list = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, rec_list = TurnCacheManager._segment(states, policy=policy, group_size=64)
     assert kv_list[0] is not None
     assert rec_list[0] is None
     assert isinstance(kv_list[0], KVLayerSegment)
@@ -138,20 +141,24 @@ def test_segment_kvcache_produces_kv_layer_segment():
 
 def test_segment_rotating_kvcache_produces_last_strategy():
     """_segment on a RotatingKVCache state produces merge_strategy='last'."""
+    from vllm_mlx.cache_types import KVQuantPolicy
+
     states = [_make_rotating_state(n_tokens=4, max_size=4)]
-    kv_list, rec_list = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, rec_list = TurnCacheManager._segment(states, policy=policy, group_size=64)
     assert kv_list[0] is not None
     assert kv_list[0].metadata["merge_strategy"] == "last"
 
 
 def test_segment_recurrent_produces_recurrent_layer_segment():
     """_segment on a non-KV state produces a RecurrentLayerSegment."""
-    from vllm_mlx.cache_types import RecurrentLayerSegment
+    from vllm_mlx.cache_types import RecurrentLayerSegment, KVQuantPolicy
 
     states = [
         {"class_name": "MambaCache", "state": (mx.zeros((1, 4)),), "meta_state": ()}
     ]
-    kv_list, rec_list = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, rec_list = TurnCacheManager._segment(states, policy=policy, group_size=64)
     assert kv_list[0] is None
     assert rec_list[0] is not None
     assert isinstance(rec_list[0], RecurrentLayerSegment)
@@ -160,8 +167,11 @@ def test_segment_recurrent_produces_recurrent_layer_segment():
 
 def test_segment_layer_index_matches_position():
     """layer_index in metadata matches position in input list."""
+    from vllm_mlx.cache_types import KVQuantPolicy
+
     states = [_make_kvcache_state(n_tokens=4), _make_kvcache_state(n_tokens=4)]
-    kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     assert kv_list[0].metadata["layer_index"] == 0
     assert kv_list[1].metadata["layer_index"] == 1
 
@@ -172,9 +182,11 @@ def test_segment_layer_index_matches_position():
 def test_assemble_kvcache_returns_batch_quantized_kv_cache():
     """_assemble on a KVLayerSegment returns a BatchQuantizedKVCache (ADR-0005)."""
     from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
+    from vllm_mlx.cache_types import KVQuantPolicy
 
     states = [_make_kvcache_state(n_tokens=4)]
-    kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
     result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
     assert len(result) == 1
@@ -183,9 +195,12 @@ def test_assemble_kvcache_returns_batch_quantized_kv_cache():
 
 def test_assemble_kvcache_offset_matches_n_tokens():
     """Reconstructed cache _idx (logical length) equals original n_tokens."""
+    from vllm_mlx.cache_types import KVQuantPolicy
+
     n_tokens = 6
     states = [_make_kvcache_state(n_tokens=n_tokens)]
-    kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
     result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
     assert result[0]._idx == n_tokens
@@ -194,9 +209,11 @@ def test_assemble_kvcache_offset_matches_n_tokens():
 def test_assemble_rotating_returns_rotating_kv_cache():
     """_assemble on a RotatingKVCache segment returns a RotatingKVCache."""
     from mlx_lm.models.cache import RotatingKVCache
+    from vllm_mlx.cache_types import KVQuantPolicy
 
     states = [_make_rotating_state(n_tokens=4, max_size=4)]
-    kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
     result = TurnCacheManager._assemble(kv_layers, [], group_size=64, bits=8)
     assert len(result) == 1
@@ -205,8 +222,11 @@ def test_assemble_rotating_returns_rotating_kv_cache():
 
 def test_assemble_mixed_layer_ordering():
     """_assemble returns layers sorted by layer_index regardless of input order."""
+    from vllm_mlx.cache_types import KVQuantPolicy
+
     states = [_make_kvcache_state(n_tokens=4), _make_kvcache_state(n_tokens=4)]
-    kv_list, _ = TurnCacheManager._segment(states, group_size=64, bits=8)
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, _ = TurnCacheManager._segment(states, policy=policy, group_size=64)
     kv_layers = [k for k in kv_list if k is not None]
     # Reverse to test sorting
     result = TurnCacheManager._assemble(
@@ -220,11 +240,14 @@ def test_assemble_mixed_layer_ordering():
 
 def test_kvcache_round_trip_shape():
     """KVCache: segment, concat two nodes, assemble → correct sequence length."""
+    from vllm_mlx.cache_types import KVQuantPolicy
+
     states1 = [_make_kvcache_state(n_tokens=3)]
     states2 = [_make_kvcache_state(n_tokens=5)]
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
 
-    kv1, _ = TurnCacheManager._segment(states1, group_size=64, bits=8)
-    kv2, _ = TurnCacheManager._segment(states2, group_size=64, bits=8)
+    kv1, _ = TurnCacheManager._segment(states1, policy=policy, group_size=64)
+    kv2, _ = TurnCacheManager._segment(states2, policy=policy, group_size=64)
 
     merged = KVLayerSegment.concat([kv1[0], kv2[0]])
     result = TurnCacheManager._assemble([merged], [], group_size=64, bits=8)
@@ -276,3 +299,69 @@ def test_concat_matching_float_bits_succeeds():
     b = _make_kv_segment_with_bits(n_tokens=5, bits=None)
     merged = KVLayerSegment.concat([a, b])
     assert merged.metadata["bits"] is None
+
+
+# ── _segment with KVQuantPolicy ──────────────────────────────────────────────
+
+from vllm_mlx.cache_types import KVQuantPolicy
+
+
+def _make_rotating_live_state(n_tokens: int, layer_index: int) -> dict:
+    """Build a live RotatingKVCache state dict that exercises the float branch."""
+    max_size = max(n_tokens, 16)
+    keys = mx.ones((1, 1, max_size, 64), dtype=mx.bfloat16)
+    values = mx.ones((1, 1, max_size, 64), dtype=mx.bfloat16)
+    return {
+        "class_name": "RotatingKVCache",
+        "state": (keys, values),
+        "meta_state": (0, max_size, n_tokens, n_tokens),  # keep, max_size, offset, _idx
+    }
+
+
+def _make_kvcache_live_state(n_tokens: int, layer_index: int) -> dict:
+    keys = mx.ones((1, 1, n_tokens, 64), dtype=mx.bfloat16)
+    values = mx.ones((1, 1, n_tokens, 64), dtype=mx.bfloat16)
+    return {
+        "class_name": "KVCache",
+        "state": (keys, values),
+        "meta_state": (n_tokens,),
+    }
+
+
+def test_segment_mixed_policy_writes_bits_metadata():
+    """Alternating KVCache/RotatingKVCache layers — sliding gets float, full gets quantized."""
+    from vllm_mlx.kv_cache import QuantizedArray
+
+    live = [
+        _make_kvcache_live_state(n_tokens=128, layer_index=0),
+        _make_rotating_live_state(n_tokens=64, layer_index=1),
+        _make_kvcache_live_state(n_tokens=128, layer_index=2),
+        _make_rotating_live_state(n_tokens=64, layer_index=3),
+    ]
+    policy = KVQuantPolicy(sliding_bits=None, full_bits=8)
+
+    kv_list, rec_list = TurnCacheManager._segment(live, policy=policy, group_size=64)
+
+    assert rec_list == [None, None, None, None]
+    assert kv_list[0].metadata["bits"] == 8
+    assert isinstance(kv_list[0].keys, QuantizedArray)
+    assert kv_list[1].metadata["bits"] is None
+    assert not isinstance(kv_list[1].keys, QuantizedArray)
+    assert kv_list[2].metadata["bits"] == 8
+    assert kv_list[3].metadata["bits"] is None
+
+
+def test_segment_policy_none_disables_quantization():
+    """policy=None: everything stored as float regardless of class."""
+    from vllm_mlx.kv_cache import QuantizedArray
+
+    live = [
+        _make_kvcache_live_state(n_tokens=128, layer_index=0),
+        _make_rotating_live_state(n_tokens=64, layer_index=1),
+    ]
+
+    kv_list, _ = TurnCacheManager._segment(live, policy=None, group_size=64)
+
+    for seg in kv_list:
+        assert seg.metadata["bits"] is None
+        assert not isinstance(seg.keys, QuantizedArray)
