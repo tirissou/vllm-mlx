@@ -302,7 +302,6 @@ def serve_command(args):
             use_turn_cache=getattr(args, "use_turn_cache", False),
             turn_cache_stride=getattr(args, "turn_cache_stride", 512),
             turn_cache_memory_gb=getattr(args, "turn_cache_memory_gb", 20.0),
-            turn_cache_ssd_gb=getattr(args, "turn_cache_ssd_gb", 50.0),
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
             # MTP
@@ -317,9 +316,6 @@ def serve_command(args):
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
-            # SSD cache tiering
-            ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
-            ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
             # KV cache size limit
             max_kv_size=getattr(args, "max_kv_size", None) or 0,
             # Debug
@@ -357,11 +353,6 @@ def serve_command(args):
             print(
                 f"Turn cache: stride={getattr(args, 'turn_cache_stride', 512)} tokens, "
                 f"memory={getattr(args, 'turn_cache_memory_gb', 20.0)}GB"
-                + (
-                    f", SSD={getattr(args, 'turn_cache_ssd_gb', 50.0)}GB"
-                    if getattr(args, "turn_cache_ssd_gb", 50.0) > 0
-                    else ""
-                )
             )
     else:
         print("Mode: Simple (maximum throughput)")
@@ -573,7 +564,6 @@ def bench_command(args):
             use_turn_cache=getattr(args, "use_turn_cache", False),
             turn_cache_stride=getattr(args, "turn_cache_stride", 512),
             turn_cache_memory_gb=getattr(args, "turn_cache_memory_gb", 20.0),
-            turn_cache_ssd_gb=getattr(args, "turn_cache_ssd_gb", 50.0),
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             **_build_kv_quant_kwargs(args),
@@ -1155,19 +1145,6 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
-    )
-    # SSD cache tiering options
-    serve_parser.add_argument(
-        "--ssd-cache-dir",
-        type=str,
-        default=None,
-        help="Directory for SSD KV cache tier (default: disabled)",
-    )
-    serve_parser.add_argument(
-        "--ssd-cache-max-gb",
-        type=float,
-        default=10.0,
-        help="Maximum SSD cache size in GB (default: 10.0)",
     )
     # Prompt warm-up options
     serve_parser.add_argument(

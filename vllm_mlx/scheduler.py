@@ -113,8 +113,16 @@ class SchedulerConfig:
     # TurnPrefixCache settings
     use_turn_cache: bool = False
     turn_cache_stride: int = 512
-    turn_cache_ssd_gb: float = 50.0
     turn_cache_memory_gb: float = 20.0
+
+    # KV cache persistence (Phase 5: SSD redesign). When kv_cache_disk_dir is
+    # set, TurnCacheManager runs intra-cache spill/promote and the engine
+    # save_cache_to_disk/load_cache_from_disk go through the new
+    # FilesystemCacheDiskStore.
+    kv_cache_disk_dir: Optional[str] = None
+    kv_cache_disk_max_bytes: Optional[int] = None
+    kv_cache_load_on_startup: bool = True
+    kv_cache_save_on_shutdown: bool = True
 
     # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
     # When enabled, large prompts are split into chunks so that active
@@ -126,10 +134,6 @@ class SchedulerConfig:
     # saved cache is reused for the next request with the same prefix.
     # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
     mid_prefill_save_interval: int = 8192
-
-    # SSD cache tiering
-    ssd_cache_dir: Optional[str] = None  # None = disabled
-    ssd_cache_max_gb: float = 10.0
 
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
     max_kv_size: int = 0
@@ -680,7 +684,6 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             TurnPrefixCacheConfig(
                 checkpoint_stride=config.turn_cache_stride,
                 max_memory_gb=config.turn_cache_memory_gb,
-                ssd_max_gb=config.turn_cache_ssd_gb,
             )
         )
         bundle.turn_cache = turn_cache
