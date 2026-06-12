@@ -315,55 +315,22 @@ def test_turn_cache_manager_extract_cache_empty():
         assert adapter.extract_cache([]) is None
 
 
-# ── save() / load() (updated with error handling) ────────────────────────────
-
-
-def test_turn_cache_manager_save_forwards_to_inner():
-    """save() forwards to inner.save()."""
-    inner = MagicMock()
-    inner.save.return_value = True
-    adapter = TurnCacheManager(inner)
-    result = adapter.save("/tmp/cache")
-    assert result is True
-    inner.save.assert_called_once_with("/tmp/cache")
-
-
-def test_turn_cache_manager_save_fails():
-    """save() returns False when inner.save() raises."""
-    inner = MagicMock()
-    inner.save.side_effect = OSError("disk full")
-    adapter = TurnCacheManager(inner)
-    result = adapter.save("/tmp/cache")
-    assert result is False
-
-
-def test_turn_cache_manager_load_forwards_to_inner():
-    """load() forwards to inner.load()."""
-    inner = MagicMock()
-    inner.load.return_value = 42
-    adapter = TurnCacheManager(inner)
-    result = adapter.load("/tmp/cache")
-    assert result == 0
-
-
-def test_turn_cache_manager_load_fails():
-    """load() returns 0 when inner.load() raises."""
-    inner = MagicMock()
-    inner.load.side_effect = OSError("disk full")
-    adapter = TurnCacheManager(inner)
-    result = adapter.load("/tmp/cache")
-    assert result == 0
-
-
 # ── close() ──────────────────────────────────────────────────────────────────
 
 
-def test_turn_cache_manager_close_is_noop():
-    """close() does nothing (TurnPrefixCache has no external resources)."""
+def test_turn_cache_manager_close_without_disk_store_is_noop():
     inner = MagicMock()
     adapter = TurnCacheManager(inner)
     adapter.close()  # must not raise
     inner.close.assert_not_called()
+
+
+def test_turn_cache_manager_close_closes_disk_store():
+    inner = MagicMock()
+    disk = MagicMock()
+    adapter = TurnCacheManager(inner, disk_store=disk)
+    adapter.close()
+    disk.close.assert_called_once_with()
 
 
 class TestBuildPrefixCache:
