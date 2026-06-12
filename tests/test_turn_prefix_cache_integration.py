@@ -180,3 +180,46 @@ def test_collect_path_data_layer_ordering(trie):
     # layer 0 = KVCache → BatchQuantizedKVCache (ADR-0005), layer 1 = recurrent (ArraysCache)
     assert isinstance(assembled[0], BatchQuantizedKVCache)
     assert isinstance(assembled[1], ArraysCache)
+
+
+def _make_kv_seg(layer_index, n_tokens, bits=8):
+    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.kv_cache import QuantizedArray
+    k = mx.random.normal((1, 4, n_tokens, 64), dtype=mx.bfloat16)
+    v = mx.random.normal((1, 4, n_tokens, 64), dtype=mx.bfloat16)
+    qk = QuantizedArray(*mx.quantize(k, group_size=64, bits=bits))
+    qv = QuantizedArray(*mx.quantize(v, group_size=64, bits=bits))
+    mx.eval(qk.packed, qk.scales, qk.biases, qv.packed, qv.scales, qv.biases)
+    return KVLayerSegment(
+        keys=qk, values=qv,
+        metadata={"class_name": "KVCache", "layer_index": layer_index,
+                  "merge_strategy": "concatenate", "n_tokens": n_tokens, "bits": bits},
+    )
+
+
+def test_pinned_leaf_is_not_spilled(tmp_path):
+    """Active Leaf + leaf-only-eviction must hold even with spill enabled."""
+    from vllm_mlx.cache_disk_store import FilesystemCacheDiskStore, SSDRef
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(max_memory_gb=1e-9))
+    store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+    mgr = TurnCacheManager(
+        trie, policy=KVQuantPolicy(full_bits=8),
+        kv_group_size=64, disk_store=store,
+    )
+
+    # Insert the pinned node with no KV payload so its own insertion doesn't
+    # push memory over budget before we can mark it pinned.
+    pinned = trie.insert(trie.root, Segment(role="user", token_ids=[1]),
+                         kv_data=None)
+    pinned.ref_count = 1  # simulate Active Leaf pin.
+
+    # Trigger eviction by inserting many nodes with real KV bytes; the heap
+    # pops the pinned node, sees ref_count > 0, and skips it.
+    for i in range(10):
+        trie.insert(trie.root, Segment(role="user", token_ids=[100 + i]),
+                    kv_data=[_make_kv_seg(0, 8)])
+
+    # The pinned leaf must not be spilled.
+    assert not isinstance(pinned.kv_data, SSDRef)
+    assert pinned.ref_count == 1
