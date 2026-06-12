@@ -65,3 +65,40 @@ class RecurrentLayerSegment:
     #   class_ref: type | None   — concrete mlx-lm class for from_state() reconstruction
     #                              (None when loaded from disk — use class_name fallback)
     scales: list[list[float]] | None = None
+
+
+@dataclass(frozen=True)
+class KVQuantPolicy:
+    """Per-layer-type KV cache quantization policy.
+
+    bits_for(class_name) returns the int bit-width to use for that class, or
+    None for "store float — do not quantize". Class dispatch is purely structural:
+    'RotatingKVCache' uses sliding_bits, any other 'KVCache' uses full_bits,
+    everything else returns None (recurrent caches are never quantized).
+    """
+
+    sliding_bits: int | None = None       # bf16 by default
+    full_bits: int | None = 8             # q8 by default
+    # Provenance — True iff the value came from a user CLI override (vs. defaulted).
+    sliding_override: bool = False
+    full_override: bool = False
+
+    def bits_for(self, class_name: str) -> int | None:
+        if class_name == "RotatingKVCache":
+            return self.sliding_bits
+        if "KVCache" in class_name:
+            return self.full_bits
+        return None
+
+    def describe(self) -> str:
+        def _label(bits: int | None) -> str:
+            return "bf16" if bits is None else f"q{bits}"
+
+        s = _label(self.sliding_bits)
+        f = _label(self.full_bits)
+        if self.sliding_override:
+            s += " (user override)"
+        if self.full_override:
+            f += " (user override)"
+        suffix = "" if (self.sliding_override or self.full_override) else " (smart defaults)"
+        return f"sliding={s}, full={f}{suffix}"
