@@ -59,7 +59,7 @@ Replace the current broken-and-unused SSD persistence subsystem (`ssd_cache.py`,
 - `_on_promote(ssd_ref) -> list | None` — reads from disk; on `None` the trie drops the node.
 
 **`TurnPrefixCache`** — pure in-memory trie. Disk concerns removed entirely.
-- New: `set_spill_handler(handler)`, `walk_all_nodes_preorder()`, `insert_prebuilt(parent_key, token_ids, last_access_ts, n_tokens_cumulative, segments)`, `replace_segments(node, new)`, `restore_segments(node, new)`, `_drop_node(node)`.
+- New: `set_spill_handler(handler)`, `walk_all_nodes_preorder()`, `insert_prebuilt(parent_key, token_ids, last_access_ts, n_tokens_cumulative, segments)`, `_drop_node(node)`. The manager mutates `node.segments` directly during spill/promote — same coupling pattern already used elsewhere where the manager touches `TurnNode` fields.
 - Removed: `SSDRef`, `_spill_to_ssd`, `_promote_from_ssd`, `_ssd_path`, `_tokens_to_node`, `save`, `load`.
 
 **`CacheDiskStore`** — protocol in new `vllm_mlx/cache_disk_store.py`. `FilesystemCacheDiskStore` is the only concrete implementation that ships.
@@ -275,8 +275,9 @@ def load(self) -> int:
 Before populating the trie, `load()` validates:
 
 1. `_index.json` exists and `_DISK_FORMAT_VERSION == 1` — else `IncompatibleCacheDirError`.
-2. Every header's per-layer `bits` (and `group_size` where applicable) matches the current `KVQuantPolicy` — else `CachePolicyMismatchError`. Mixing policies in one trie would corrupt assembly.
-3. For recurrent layers, every persisted `class_ref` path resolves via `importlib.import_module` — else `MissingCacheClassError`.
+2. Every header's per-layer `bits` matches the current `KVQuantPolicy` (per-layer-class) — else `CachePolicyMismatchError`, message includes both policies' `describe()` strings. Mixing policies in one trie would corrupt assembly.
+3. Every header's per-layer `group_size` matches the value the current code constructs `QuantizedArray` with (today: mlx-lm default 64). This is a separate compatibility axis from policy — it catches mlx-lm version drift, not user config mismatch. Same `CachePolicyMismatchError` with a `kind="group_size"` discriminator.
+4. For recurrent layers, every persisted `class_ref` path resolves via `importlib.import_module` — else `MissingCacheClassError`.
 
 All three errors are fatal at startup. The engine does not silently ignore a non-empty cache dir.
 
@@ -329,7 +330,7 @@ If no leaf candidate exists (every entry has on-disk children), the disk store c
 |------|--------|-----|
 | `vllm_mlx/ssd_cache.py` | Delete entirely | ~1131 |
 | `vllm_mlx/memory_cache.py` | Delete entirely (deprecated per ADR-0003 addendum) | ~1418 |
-| `vllm_mlx/turn_prefix_cache.py` | Remove `SSDRef`, `_spill_to_ssd`, `_promote_from_ssd`, `_ssd_path`, `_tokens_to_node`, `save`, `load`. Add `set_spill_handler`, `walk_all_nodes_preorder`, `insert_prebuilt`, `replace_segments`, `restore_segments`, `_drop_node`. Net ~−350 LOC; final size ~540 LOC | — |
+| `vllm_mlx/turn_prefix_cache.py` | Remove `SSDRef`, `_spill_to_ssd`, `_promote_from_ssd`, `_ssd_path`, `_tokens_to_node`, `save`, `load`. Add `set_spill_handler`, `walk_all_nodes_preorder`, `insert_prebuilt`, `_drop_node`. Net ~−350 LOC; final size ~540 LOC | — |
 | `vllm_mlx/prefix_cache_adapters.py` | `TurnCacheManager.__init__` accepts `disk_store`. Adds `save`, `load`, `_on_spill`, `_on_promote`, `_build_payload`. Net +~200 LOC | — |
 | `vllm_mlx/cache_disk_store.py` | **New.** Protocol, types, `FilesystemCacheDiskStore`, custom exceptions. ~400 LOC | — |
 | `vllm_mlx/engine/batched.py` | Rewire `save_cache_to_disk` / `load_cache_from_disk` to call manager methods; remove `cache_dir` argument | — |
