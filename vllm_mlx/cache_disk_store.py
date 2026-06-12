@@ -269,6 +269,22 @@ class FilesystemCacheDiskStore:
                 tensors[f"l{li}_v"] = kv.values
             layer_meta.append({"kind": "kv", **kv.metadata})
 
+        for rec in payload.recurrent_layers:
+            li = rec.metadata["layer_index"]
+            arrays = rec.arrays if isinstance(rec.arrays, (list, tuple)) else [rec.arrays]
+            for k, arr in enumerate(arrays):
+                tensors[f"r{li}_a{k}"] = arr
+            class_ref = rec.metadata.get("class_ref")
+            class_path = (
+                f"{class_ref.__module__}.{class_ref.__qualname__}"
+                if class_ref is not None else None
+            )
+            md = {k: v for k, v in rec.metadata.items() if k != "class_ref"}
+            md["_n_arrays"] = len(arrays)
+            md["_class_path"] = class_path
+            md["_scales"] = rec.scales
+            layer_meta.append({"kind": "recurrent", **md})
+
         # mx.save_safetensors appends ".safetensors" automatically;
         # pass a .tmp stem so the written file becomes <stem>.tmp.safetensors,
         # then rename to the final <hash>.safetensors.
@@ -298,9 +314,11 @@ class FilesystemCacheDiskStore:
             "last_access_ts": payload.last_access_ts,
             "size_bytes": size,
             "child_count": 0,
-            "layer_bits": [m.get("bits") for m in layer_meta],
+            "layer_bits": [m.get("bits") for m in layer_meta if m.get("kind") == "kv"],
             "layer_class_names": [m.get("class_name") for m in layer_meta],
-            "recurrent_class_paths": [],
+            "recurrent_class_paths": [
+                m.get("_class_path") for m in layer_meta if m.get("kind") == "recurrent"
+            ],
             "kv_group_size": self._kv_group_size,
         }
         self._index["total_bytes"] += size
@@ -334,29 +352,47 @@ class FilesystemCacheDiskStore:
         kv_layers: list[KVLayerSegment] = []
         recurrent_layers: list[RecurrentLayerSegment] = []
         for layer_meta in meta_blob["layers"]:
-            if layer_meta["kind"] != "kv":
-                continue  # recurrent handled in Task 9.
-            li = layer_meta["layer_index"]
-            md = {k: v for k, v in layer_meta.items() if k != "kind"}
-            if md.get("bits") is None:
-                kv_layers.append(KVLayerSegment(
-                    keys=tensors[f"l{li}_k"],
-                    values=tensors[f"l{li}_v"],
-                    metadata=md,
-                ))
-            else:
-                kv_layers.append(KVLayerSegment(
-                    keys=QuantizedArray(
-                        packed=tensors[f"l{li}_k_packed"],
-                        scales=tensors[f"l{li}_k_scales"],
-                        biases=tensors[f"l{li}_k_biases"],
-                    ),
-                    values=QuantizedArray(
-                        packed=tensors[f"l{li}_v_packed"],
-                        scales=tensors[f"l{li}_v_scales"],
-                        biases=tensors[f"l{li}_v_biases"],
-                    ),
-                    metadata=md,
+            if layer_meta["kind"] == "kv":
+                li = layer_meta["layer_index"]
+                md = {k: v for k, v in layer_meta.items() if k != "kind"}
+                if md.get("bits") is None:
+                    kv_layers.append(KVLayerSegment(
+                        keys=tensors[f"l{li}_k"],
+                        values=tensors[f"l{li}_v"],
+                        metadata=md,
+                    ))
+                else:
+                    kv_layers.append(KVLayerSegment(
+                        keys=QuantizedArray(
+                            packed=tensors[f"l{li}_k_packed"],
+                            scales=tensors[f"l{li}_k_scales"],
+                            biases=tensors[f"l{li}_k_biases"],
+                        ),
+                        values=QuantizedArray(
+                            packed=tensors[f"l{li}_v_packed"],
+                            scales=tensors[f"l{li}_v_scales"],
+                            biases=tensors[f"l{li}_v_biases"],
+                        ),
+                        metadata=md,
+                    ))
+            elif layer_meta["kind"] == "recurrent":
+                li = layer_meta["layer_index"]
+                n_arrays = layer_meta["_n_arrays"]
+                class_path = layer_meta.get("_class_path")
+                scales = layer_meta.get("_scales")
+                md = {k: v for k, v in layer_meta.items()
+                      if not k.startswith("_") and k != "kind"}
+                if class_path is not None:
+                    import importlib
+                    module_name, _, class_name = class_path.rpartition(".")
+                    try:
+                        module = importlib.import_module(module_name)
+                        md["class_ref"] = getattr(module, class_name)
+                    except (ImportError, AttributeError) as e:
+                        raise MissingCacheClassError(class_path) from e
+                arrays = [tensors[f"r{li}_a{k}"] for k in range(n_arrays)]
+                recurrent_layers.append(RecurrentLayerSegment(
+                    arrays=arrays, metadata=md, scales=scales,
                 ))
 
         parent_key = (

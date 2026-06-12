@@ -201,3 +201,87 @@ class TestDiskLRU:
         # child must be evicted before parent.
         assert child_key in evicted
         assert parent_key not in evicted
+
+
+def _make_rotating_segment(layer_index: int, n_tokens: int = 16):
+    """RotatingKVCache lives in bf16 (sliding_bits=None default)."""
+    from vllm_mlx.cache_types import KVLayerSegment
+    keys = mx.random.normal((1, 4, n_tokens, 64), dtype=mx.bfloat16)
+    values = mx.random.normal((1, 4, n_tokens, 64), dtype=mx.bfloat16)
+    mx.eval(keys, values)
+    return KVLayerSegment(
+        keys=keys, values=values,
+        metadata={
+            "class_name": "RotatingKVCache",
+            "layer_index": layer_index,
+            "merge_strategy": "last",
+            "n_tokens": n_tokens,
+            "max_size": 256,
+            "keep": 0,
+            "offset": n_tokens,
+            "_idx": n_tokens,
+            "bits": None,
+        },
+    )
+
+
+def _make_recurrent_segment(layer_index: int):
+    from vllm_mlx.cache_types import RecurrentLayerSegment
+    arrays = [mx.zeros((1, 8, 16), dtype=mx.bfloat16)]
+    mx.eval(*arrays)
+    from mlx_lm.models.cache import ArraysCache
+    return RecurrentLayerSegment(
+        arrays=arrays,
+        metadata={
+            "class_name": "ArraysCache",
+            "layer_index": layer_index,
+            "class_ref": ArraysCache,
+        },
+        scales=None,
+    )
+
+
+class TestFilesystemRoundTripSlidingAndRecurrent:
+    def test_rotating_bf16_round_trip(self, tmp_path):
+        from vllm_mlx.cache_disk_store import (
+            FilesystemCacheDiskStore, NodePayload,
+        )
+        store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+        key = (0, (1,))
+        payload = NodePayload(
+            parent_key=None, token_ids=(1,), n_tokens_cumulative=1,
+            last_access_ts=0.0,
+            kv_layers=[_make_rotating_segment(0)],
+            recurrent_layers=[],
+        )
+        store.write(key, payload)
+        rt = store.read(key)
+        assert rt is not None
+        assert rt.kv_layers[0].metadata["max_size"] == 256
+        assert mx.array_equal(rt.kv_layers[0].keys, payload.kv_layers[0].keys)
+        assert mx.array_equal(rt.kv_layers[0].values, payload.kv_layers[0].values)
+
+    def test_recurrent_round_trip(self, tmp_path):
+        from vllm_mlx.cache_disk_store import (
+            FilesystemCacheDiskStore, NodePayload,
+        )
+        store = FilesystemCacheDiskStore(str(tmp_path), kv_group_size=64)
+        key = (0, (2,))
+        payload = NodePayload(
+            parent_key=None, token_ids=(2,), n_tokens_cumulative=1,
+            last_access_ts=0.0,
+            kv_layers=[],
+            recurrent_layers=[_make_recurrent_segment(0)],
+        )
+        store.write(key, payload)
+        rt = store.read(key)
+        assert rt is not None
+        assert len(rt.recurrent_layers) == 1
+        assert rt.recurrent_layers[0].metadata["class_ref"] is not None
+        assert mx.array_equal(
+            rt.recurrent_layers[0].arrays[0], payload.recurrent_layers[0].arrays[0]
+        )
+
+        header = store.read_header(key)
+        assert header is not None
+        assert header.recurrent_class_paths[0].endswith("ArraysCache")
