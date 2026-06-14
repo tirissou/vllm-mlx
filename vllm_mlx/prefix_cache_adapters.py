@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Any, TYPE_CHECKING
 
@@ -27,6 +28,68 @@ def _linearize(tensor: "mx.array", offset: int, max_size: int) -> "mx.array":
     if offset == max_size:
         return tensor[..., :offset, :]
     return mx.concatenate([tensor[..., offset:, :], tensor[..., :offset, :]], axis=-2)
+
+
+def _kv_segment_bytes(seg) -> int:
+    """Sum on-device bytes held by one KVLayerSegment (keys + values)."""
+    from .kv_cache import QuantizedArray
+
+    total = 0
+    for arr in (seg.keys, seg.values):
+        if isinstance(arr, QuantizedArray):
+            total += int(arr.packed.nbytes) + int(arr.scales.nbytes) + int(arr.biases.nbytes)
+        else:
+            total += int(arr.nbytes)
+    return total
+
+
+def _log_segment_breakdown(label: str, kv_layers: list, rec_layers: list) -> None:
+    """Emit one log line per checkpoint with byte breakdown by layer class.
+
+    Gated by VLLM_MLX_MEMPROBE_SEGMENTS=1. Cheap when off (env check, early return).
+    """
+    if os.environ.get("VLLM_MLX_MEMPROBE_SEGMENTS") != "1":
+        return
+    if not kv_layers and not rec_layers:
+        logger.warning("[segprobe:%s] no layers", label)
+        return
+
+    # Aggregate by (class_name, merge_strategy)
+    groups: dict[tuple[str, str], dict] = {}
+    n_tokens_seen: dict[tuple[str, str], list[int]] = {}
+    for seg in kv_layers:
+        meta = seg.metadata
+        key = (meta.get("class_name", "?"), meta.get("merge_strategy", "?"))
+        g = groups.setdefault(key, {"count": 0, "bytes": 0, "max": 0})
+        b = _kv_segment_bytes(seg)
+        g["count"] += 1
+        g["bytes"] += b
+        g["max"] = max(g["max"], b)
+        n_tokens_seen.setdefault(key, []).append(int(meta.get("n_tokens", -1)))
+
+    parts = []
+    grand_total = 0
+    for (cname, strategy), g in sorted(groups.items()):
+        toks = n_tokens_seen[(cname, strategy)]
+        tok_min, tok_max = min(toks), max(toks)
+        mean_mb = g["bytes"] / g["count"] / 1e6
+        max_mb = g["max"] / 1e6
+        total_mb = g["bytes"] / 1e6
+        grand_total += g["bytes"]
+        tok_str = f"{tok_min}" if tok_min == tok_max else f"{tok_min}..{tok_max}"
+        parts.append(
+            f"{cname}[{strategy}] n={g['count']} tok={tok_str} "
+            f"sum={total_mb:.1f}MB mean={mean_mb:.2f}MB max={max_mb:.2f}MB"
+        )
+
+    n_rec = len([r for r in rec_layers if r is not None])
+    logger.warning(
+        "[segprobe:%s] total=%.1fMB rec_layers=%d | %s",
+        label,
+        grand_total / 1e6,
+        n_rec,
+        " | ".join(parts),
+    )
 
 
 class CacheManager(ABC):
@@ -679,6 +742,12 @@ class TurnCacheManager(CacheManager):
             )
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
+            _log_segment_breakdown(
+                f"store rid={getattr(request, 'request_id', '?')} "
+                f"tok_seg={len(response_tokens)} prev_end={prev_end}",
+                kv_layers,
+                rec_layers,
+            )
         else:
             kv_layers, rec_layers = [], []
 
@@ -802,6 +871,13 @@ class TurnCacheManager(CacheManager):
             )
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
+            _log_segment_breakdown(
+                f"checkpoint rid={getattr(request, 'request_id', '?')} "
+                f"abs_idx={abs_idx} tok_seg={len(segment.token_ids)} "
+                f"prev_end={prev_end} total={total_tokens_prefilled}",
+                kv_layers,
+                rec_layers,
+            )
         else:
             kv_layers, rec_layers = [], []
 
