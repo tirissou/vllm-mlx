@@ -30,6 +30,25 @@ def _linearize(tensor: "mx.array", offset: int, max_size: int) -> "mx.array":
     return mx.concatenate([tensor[..., offset:, :], tensor[..., :offset, :]], axis=-2)
 
 
+def _apply_rotating_window(arr: "mx.array", keep: int, max_size: int) -> "mx.array":
+    """Cap a linearized rotating buffer to max_size rows.
+
+    Mirrors mlx-lm RotatingKVCache._trim: preserves the first `keep` rows
+    (head anchor) + the last `max_size - keep` rows (sliding ring), dropping
+    the middle. Bit-identical to what _update_in_place applies on the first
+    decode token after a multi-token prefill.
+    """
+    n = arr.shape[-2]
+    if n <= max_size:
+        return arr
+    if keep <= 0:
+        return arr[..., -max_size:, :]
+    trim_size = n - max_size
+    return mx.concatenate(
+        [arr[..., :keep, :], arr[..., trim_size + keep:, :]], axis=-2
+    )
+
+
 def _kv_segment_bytes(seg) -> int:
     """Sum on-device bytes held by one KVLayerSegment (keys + values)."""
     from .kv_cache import QuantizedArray
@@ -294,6 +313,21 @@ class TurnCacheManager(CacheManager):
                 # Using raw offset here would slice out-of-bounds when offset > max_size.
                 lin_keys = _linearize(state[0], _idx, max_size)
                 lin_values = _linearize(state[1], _idx, max_size)
+
+                # Eagerly cap the buffer to max_size. _update_concat (mlx-lm's
+                # multi-token path) leaves the buffer at max_size + S - 1 to
+                # give every new token max_size of preceding context — that
+                # extra is only needed for in-flight attention, not storage.
+                # The first decode tick would trim it via _trim; we do the
+                # same here so the trie doesn't pay for transient rows.
+                pre_trim = lin_keys.shape[-2]
+                lin_keys = _apply_rotating_window(lin_keys, keep, max_size)
+                lin_values = _apply_rotating_window(lin_values, keep, max_size)
+                if lin_keys.shape[-2] < pre_trim:
+                    # After trim the ring is full; signal mlx-lm to wrap on
+                    # the next decode write (matches the post-_trim assignment
+                    # `self._idx = self.max_size` in _update_in_place).
+                    _idx = max_size
 
                 if bits is None:
                     # Track B: store float arrays, no quantization
