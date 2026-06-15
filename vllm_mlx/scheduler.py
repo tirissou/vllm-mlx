@@ -689,7 +689,6 @@ class _PrefixCacheBundle:
     """All prefix-cache objects produced by _build_prefix_cache."""
 
     adapter: "CacheManager | None" = None
-    turn_cache: "TurnPrefixCache | None" = None
 
 
 def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBundle:
@@ -711,7 +710,6 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
                 ssd_max_gb=config.turn_cache_ssd_gb,
             )
         )
-        bundle.turn_cache = turn_cache
         policy = _build_kv_quant_policy(config)
         bundle.adapter = TurnCacheManager(
             turn_cache,
@@ -792,7 +790,6 @@ class Scheduler:
 
         # Prefix cache for KV state reuse — attributes set by _init_cache_bundle()
         self._prefix_cache = None
-        self.turn_cache: Optional[TurnPrefixCache] = None
         self._init_cache_bundle()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
@@ -819,7 +816,6 @@ class Scheduler:
         if self.config.enable_prefix_cache:
             _bundle = _build_prefix_cache(self.config, self.model)
             self._prefix_cache = _bundle.adapter
-            self.turn_cache = _bundle.turn_cache
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
         """
@@ -911,9 +907,7 @@ class Scheduler:
 
         save_interval = self.config.mid_prefill_save_interval
         mid_prefill_cb = None
-        if self._prefix_cache is not None and (
-            save_interval > 0 or self.turn_cache is not None
-        ):
+        if self._prefix_cache is not None and save_interval > 0:
             mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
             logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
 
