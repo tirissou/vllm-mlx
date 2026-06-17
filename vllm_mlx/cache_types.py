@@ -1,46 +1,90 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import mlx.core as mx
 
 
-@dataclass
-class KVLayerSegment:
-    """Immutable KV snapshot for one transformer layer, stored in a TurnNode.
+@dataclass(frozen=True)
+class KVLayerSegment(ABC):
+    """Abstract per-layer KV snapshot stored in a TurnNode.
 
-    Keys and values can be either:
-    - QuantizedArray(packed, scales, biases) for quantized storage (bits is not None)
-    - mx.array for float precision storage (bits is None, Track B)
-    Use KVLayerSegment.concat() to merge incremental segments along the sequence axis.
+    Two concrete subclasses dispatch path-merge and reconstruction polymorphically:
+    - KVConcatSegment: standard KVCache (incremental accumulation, axis=-2 concat)
+    - KVRotatingSegment: RotatingKVCache (ring buffer, only last node's segment used)
+
+    Holds evaluated, graph-detached arrays per the segment contract (CONTEXT.md).
     """
 
-    keys: Any  # QuantizedArray(packed, scales, biases) or mx.array
-    values: Any  # QuantizedArray(packed, scales, biases) or mx.array
-    metadata: dict[str, Any]
-    # metadata keys:
-    #   class_name: str          — 'KVCache' or 'RotatingKVCache'
-    #   layer_index: int         — position in the live cache list
-    #   merge_strategy: str      — 'concatenate' (KVCache) or 'last' (RotatingKVCache)
-    #   n_tokens: int            — token count represented by this segment
-    #   max_size: int            — (RotatingKVCache) ring-buffer capacity
-    #   keep: int                — (RotatingKVCache) attention sink tokens kept
-    #   offset: int              — (RotatingKVCache) linearized write-head position
+    keys: Any           # QuantizedArray | mx.array
+    values: Any         # QuantizedArray | mx.array
+    layer_index: int
+    n_tokens: int
+    bits: int | None    # None = bf16, int = quantized at that precision
+    class_name: str     # the live mlx-lm class name this segment was extracted from
 
-    @classmethod
-    def concat(cls, layers: list[KVLayerSegment]) -> KVLayerSegment:
-        """Concatenate incremental KV segments along the sequence axis (axis=-2)."""
+    @abstractmethod
+    def merge_path(self, path: list["KVLayerSegment"]) -> "KVLayerSegment":
+        """Merge a path of same-layer segments. ``path`` includes self at path[-1]."""
+
+    @abstractmethod
+    def reconstruct(self, group_size: int) -> Any:
+        """Reconstruct a live mlx-lm cache object for this layer."""
+
+
+@dataclass(frozen=True)
+class KVConcatSegment(KVLayerSegment):
+    """KV snapshot for a standard KVCache layer (incremental, concatenated)."""
+
+    class_name: str = "KVCache"
+
+    def merge_path(self, path: list[KVLayerSegment]) -> KVLayerSegment:
+        return KVConcatSegment.concat(path)  # type: ignore[arg-type]
+
+    def reconstruct(self, group_size: int) -> Any:
+        from vllm_mlx.batch_quantized_kv_cache import BatchQuantizedKVCache
         from vllm_mlx.kv_cache import QuantizedArray
 
-        # All segments in a concat must agree on quantization bits: a single
-        # policy writes the whole path in one process, so a mismatch is a bug.
-        first_bits = layers[0].metadata.get("bits")
+        if isinstance(self.keys, QuantizedArray):
+            # Pad to step boundary so the first decode lands on in-place update.
+            step = BatchQuantizedKVCache.step
+            padded_len = ((self.n_tokens // step) + 1) * step
+            pad = padded_len - self.n_tokens
+
+            def _pad_qa(qa: QuantizedArray) -> QuantizedArray:
+                if pad == 0:
+                    return qa
+                return QuantizedArray(*[
+                    mx.concatenate(
+                        [c, mx.zeros((*c.shape[:-2], pad, c.shape[-1]), dtype=c.dtype)],
+                        axis=-2,
+                    )
+                    for c in (qa.packed, qa.scales, qa.biases)
+                ])
+
+            return BatchQuantizedKVCache.from_quantized_arrays(
+                keys=_pad_qa(self.keys),
+                values=_pad_qa(self.values),
+                n_tokens=self.n_tokens,
+                group_size=group_size,
+                bits=self.bits,
+            )
+        # Float path: TODO mirror the existing float reconstruction in _assemble.
+        raise NotImplementedError("Float KVConcatSegment.reconstruct not yet wired")
+
+    @classmethod
+    def concat(cls, layers: list["KVConcatSegment"]) -> "KVConcatSegment":
+        """Concat same-layer segments along the sequence axis."""
+        from vllm_mlx.kv_cache import QuantizedArray
+
+        first_bits = layers[0].bits
         for l in layers[1:]:
-            assert l.metadata.get("bits") == first_bits, (
-                f"KVLayerSegment.concat: mismatched bits "
-                f"{first_bits!r} vs {l.metadata.get('bits')!r}"
+            assert l.bits == first_bits, (
+                f"KVConcatSegment.concat: mismatched bits "
+                f"{first_bits!r} vs {l.bits!r}"
             )
 
         if isinstance(layers[0].keys, QuantizedArray):
@@ -57,10 +101,64 @@ class KVLayerSegment:
         else:
             merged_keys = mx.concatenate([l.keys for l in layers], axis=-2)
             merged_values = mx.concatenate([l.values for l in layers], axis=-2)
-        meta = dict(layers[-1].metadata)
-        meta["n_tokens"] = sum(l.metadata.get("n_tokens", 0) for l in layers)
-        meta["bits"] = first_bits
-        return cls(keys=merged_keys, values=merged_values, metadata=meta)
+        return cls(
+            keys=merged_keys,
+            values=merged_values,
+            layer_index=layers[-1].layer_index,
+            n_tokens=sum(l.n_tokens for l in layers),
+            bits=first_bits,
+            class_name=layers[-1].class_name,
+        )
+
+
+@dataclass(frozen=True)
+class KVRotatingSegment(KVLayerSegment):
+    """KV snapshot for a RotatingKVCache layer (ring buffer)."""
+
+    max_size: int = 0
+    keep: int = 0
+    offset: int = 0
+    idx: int = 0          # ring write position (was _idx in old metadata dict)
+    class_name: str = "RotatingKVCache"
+
+    def merge_path(self, path: list[KVLayerSegment]) -> KVLayerSegment:
+        # Rotating state is not cumulative — only the deepest node's segment matters.
+        return path[-1]
+
+    def reconstruct(self, group_size: int) -> Any:
+        from mlx_lm.models.cache import RotatingKVCache
+        from vllm_mlx.kv_cache import QuantizedArray
+
+        is_quantized = isinstance(self.keys, QuantizedArray)
+        if is_quantized:
+            dq_keys = mx.dequantize(
+                self.keys.packed, self.keys.scales, self.keys.biases,
+                group_size=group_size, bits=self.bits,
+            )
+            dq_values = mx.dequantize(
+                self.values.packed, self.values.scales, self.values.biases,
+                group_size=group_size, bits=self.bits,
+            )
+        else:
+            dq_keys = self.keys
+            dq_values = self.values
+
+        if dq_keys.shape[-2] > self.max_size:
+            dq_keys = dq_keys[..., -self.max_size:, :]
+            dq_values = dq_values[..., -self.max_size:, :]
+
+        # Rotate back so the ring write position lands at idx, matching live layout.
+        if 0 < self.idx < self.max_size and dq_keys.shape[-2] == self.max_size:
+            split = self.max_size - self.idx
+            dq_keys = mx.concatenate([dq_keys[..., split:, :], dq_keys[..., :split, :]], axis=-2)
+            dq_values = mx.concatenate([dq_values[..., split:, :], dq_values[..., :split, :]], axis=-2)
+
+        cache = RotatingKVCache(self.max_size, self.keep)
+        cache.keys = dq_keys
+        cache.values = dq_values
+        cache.offset = self.offset
+        cache._idx = self.idx
+        return cache
 
 
 @dataclass
