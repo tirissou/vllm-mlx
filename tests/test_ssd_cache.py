@@ -1084,3 +1084,229 @@ class TestIntegrationSpillAndFetch:
             assert stats["ssd_hits"] >= 1
             assert stats["reload_bytes"] > 0
             assert stats["avg_reload_latency_ms"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Task 5: KVLayerSegment subclass identity preserved across SSD spill/promote
+# ---------------------------------------------------------------------------
+
+def _make_quantized_array(n_tokens: int = 8, head_dim: int = 64):
+    """Return a QuantizedArray with realistic shape for 1-head, n_tokens, head_dim."""
+    from vllm_mlx.kv_cache import QuantizedArray
+    import mlx.core as mx
+
+    # group_size=64 → scales/biases have 1 value per group along head_dim axis
+    groups = head_dim // 64
+    packed = mx.zeros((1, 1, n_tokens, head_dim // 2), dtype=mx.uint32)
+    scales = mx.ones((1, 1, n_tokens, groups), dtype=mx.bfloat16)
+    biases = mx.zeros((1, 1, n_tokens, groups), dtype=mx.bfloat16)
+    return QuantizedArray(packed=packed, scales=scales, biases=biases)
+
+
+class TestKVSegmentHelpers:
+    """Direct unit tests for _kv_segment_to_meta / _meta_to_kv_segment."""
+
+    def test_concat_segment_roundtrip_via_helpers(self):
+        """KVConcatSegment serializes and deserializes with all fields preserved."""
+        from vllm_mlx.cache_types import KVConcatSegment
+        from vllm_mlx.turn_prefix_cache import _kv_segment_to_meta, _meta_to_kv_segment
+
+        keys = _make_quantized_array(n_tokens=4)
+        values = _make_quantized_array(n_tokens=4)
+        seg = KVConcatSegment(
+            keys=keys,
+            values=values,
+            layer_index=2,
+            n_tokens=4,
+            bits=8,
+            class_name="KVCache",
+        )
+
+        meta = _kv_segment_to_meta(seg)
+        assert meta["class_name"] == "KVCache"
+        assert meta["layer_index"] == 2
+        assert meta["n_tokens"] == 4
+        assert meta["bits"] == 8
+        assert meta["merge_strategy"] == "concatenate"
+
+        restored = _meta_to_kv_segment(keys, values, meta)
+        assert isinstance(restored, KVConcatSegment), (
+            f"Expected KVConcatSegment, got {type(restored).__name__}"
+        )
+        assert restored.layer_index == 2
+        assert restored.n_tokens == 4
+        assert restored.bits == 8
+        assert restored.class_name == "KVCache"
+
+    def test_rotating_segment_roundtrip_via_helpers(self):
+        """KVRotatingSegment serializes and deserializes with all fields preserved."""
+        from vllm_mlx.cache_types import KVRotatingSegment
+        from vllm_mlx.turn_prefix_cache import _kv_segment_to_meta, _meta_to_kv_segment
+
+        keys = _make_quantized_array(n_tokens=16)
+        values = _make_quantized_array(n_tokens=16)
+        seg = KVRotatingSegment(
+            keys=keys,
+            values=values,
+            layer_index=0,
+            n_tokens=16,
+            bits=None,
+            class_name="RotatingKVCache",
+            max_size=16,
+            keep=4,
+            offset=12,
+            idx=5,
+        )
+
+        meta = _kv_segment_to_meta(seg)
+        assert meta["class_name"] == "RotatingKVCache"
+        assert meta["merge_strategy"] == "last"
+        assert meta["max_size"] == 16
+        assert meta["keep"] == 4
+        assert meta["offset"] == 12
+        assert meta["_idx"] == 5  # backward-compat key with underscore
+
+        restored = _meta_to_kv_segment(keys, values, meta)
+        assert isinstance(restored, KVRotatingSegment), (
+            f"Expected KVRotatingSegment, got {type(restored).__name__}"
+        )
+        assert restored.layer_index == 0
+        assert restored.max_size == 16
+        assert restored.keep == 4
+        assert restored.offset == 12
+        assert restored.idx == 5
+
+    def test_old_format_with_underscore_idx_key_backward_compat(self):
+        """Legacy on-disk dict with '_idx' key (not 'idx') must deserialize correctly."""
+        from vllm_mlx.cache_types import KVRotatingSegment
+        from vllm_mlx.turn_prefix_cache import _meta_to_kv_segment
+
+        keys = _make_quantized_array(n_tokens=8)
+        values = _make_quantized_array(n_tokens=8)
+
+        # Simulate the exact dict shape that the legacy spill code wrote to disk
+        old_format_meta = {
+            "class_name": "RotatingKVCache",
+            "layer_index": 1,
+            "merge_strategy": "last",
+            "n_tokens": 8,
+            "bits": None,
+            "max_size": 8,
+            "keep": 0,
+            "offset": 3,
+            "_idx": 7,  # the underscore form — if renamed to "idx" this test fails
+        }
+
+        restored = _meta_to_kv_segment(keys, values, old_format_meta)
+        assert isinstance(restored, KVRotatingSegment)
+        assert restored.idx == 7, (
+            "backward-compat: '_idx' key must be read as idx; "
+            "if this fails, '_idx' was renamed to 'idx' in the on-disk format"
+        )
+
+
+class TestSSDRoundTripSubclassIdentity:
+    """SSD spill → promote must preserve KVLayerSegment subclass."""
+
+    @pytest.fixture
+    def trie_with_ssd(self, tmp_path):
+        """TurnPrefixCache with SSD spill dir pointed at tmp_path."""
+        from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+        cfg = TurnPrefixCacheConfig(
+            checkpoint_stride=0,
+            max_memory_gb=4.0,
+            ssd_dir=str(tmp_path / "ssd"),
+        )
+        return TurnPrefixCache(cfg)
+
+    def _insert_kv_node(self, trie, kv_segments):
+        """Helper: insert a node with the given kv_data list; return the node."""
+        from vllm_mlx.turn_prefix_cache import Segment
+
+        seg = Segment(role="system", token_ids=[1, 2, 3, 4])
+        return trie.insert(trie.root, seg, kv_data=kv_segments)
+
+    def test_ssd_roundtrip_preserves_kv_concat_segment_type(self, trie_with_ssd):
+        """Spilling a KVConcatSegment to SSD then promoting returns KVConcatSegment."""
+        from vllm_mlx.cache_types import KVConcatSegment
+        from vllm_mlx.turn_prefix_cache import SSDRef
+
+        keys = _make_quantized_array(n_tokens=4)
+        values = _make_quantized_array(n_tokens=4)
+        seg = KVConcatSegment(
+            keys=keys,
+            values=values,
+            layer_index=0,
+            n_tokens=4,
+            bits=8,
+            class_name="KVCache",
+        )
+
+        node = self._insert_kv_node(trie_with_ssd, [seg])
+        assert isinstance(node.kv_data, list)
+        assert isinstance(node.kv_data[0], KVConcatSegment)
+
+        # Spill to SSD
+        trie_with_ssd._spill_to_ssd(node)
+        assert isinstance(node.kv_data, SSDRef), "kv_data should be SSDRef after spill"
+
+        # Promote from SSD
+        ok = trie_with_ssd._promote_from_ssd(node)
+        assert ok, "_promote_from_ssd returned False (read error)"
+        assert isinstance(node.kv_data, list)
+        assert len(node.kv_data) == 1
+
+        promoted = node.kv_data[0]
+        assert isinstance(promoted, KVConcatSegment), (
+            f"Expected KVConcatSegment after SSD round-trip, got {type(promoted).__name__}"
+        )
+        assert promoted.layer_index == 0
+        assert promoted.n_tokens == 4
+        assert promoted.bits == 8
+
+    def test_ssd_roundtrip_preserves_kv_rotating_segment_type(self, trie_with_ssd):
+        """Spilling a KVRotatingSegment to SSD then promoting returns KVRotatingSegment."""
+        from vllm_mlx.cache_types import KVRotatingSegment
+        from vllm_mlx.turn_prefix_cache import SSDRef
+
+        keys = _make_quantized_array(n_tokens=16)
+        values = _make_quantized_array(n_tokens=16)
+        seg = KVRotatingSegment(
+            keys=keys,
+            values=values,
+            layer_index=0,
+            n_tokens=16,
+            bits=None,
+            class_name="RotatingKVCache",
+            max_size=16,
+            keep=4,
+            offset=13,
+            idx=3,
+        )
+
+        node = self._insert_kv_node(trie_with_ssd, [seg])
+        assert isinstance(node.kv_data, list)
+        assert isinstance(node.kv_data[0], KVRotatingSegment)
+
+        # Spill to SSD
+        trie_with_ssd._spill_to_ssd(node)
+        assert isinstance(node.kv_data, SSDRef), "kv_data should be SSDRef after spill"
+
+        # Promote from SSD
+        ok = trie_with_ssd._promote_from_ssd(node)
+        assert ok, "_promote_from_ssd returned False (read error)"
+        assert isinstance(node.kv_data, list)
+        assert len(node.kv_data) == 1
+
+        promoted = node.kv_data[0]
+        assert isinstance(promoted, KVRotatingSegment), (
+            f"Expected KVRotatingSegment after SSD round-trip, "
+            f"got {type(promoted).__name__}"
+        )
+        # Verify all rotating-specific fields survive the round-trip
+        assert promoted.layer_index == 0
+        assert promoted.max_size == 16
+        assert promoted.keep == 4
+        assert promoted.offset == 13
+        assert promoted.idx == 3
