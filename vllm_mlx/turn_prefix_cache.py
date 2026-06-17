@@ -20,12 +20,62 @@ import mlx.core as mx
 from mlx.nn.utils import checkpoint
 import numpy as np
 
-from vllm_mlx.cache_types import KVLayerSegment, RecurrentLayerSegment
+from vllm_mlx.cache_types import KVLayerSegment, KVConcatSegment, KVRotatingSegment, RecurrentLayerSegment
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 _CACHE_FORMAT_VERSION = 5
+
+
+def _kv_segment_to_meta(seg: KVLayerSegment) -> dict:
+    """Serialize a typed KVLayerSegment to a JSON-serializable metadata dict."""
+    if isinstance(seg, KVRotatingSegment):
+        return {
+            "class_name": seg.class_name,
+            "layer_index": seg.layer_index,
+            "merge_strategy": "last",
+            "n_tokens": seg.n_tokens,
+            "bits": seg.bits,
+            "max_size": seg.max_size,
+            "keep": seg.keep,
+            "offset": seg.offset,
+            "_idx": seg.idx,
+        }
+    # KVConcatSegment (or any other subclass — treat as concat)
+    return {
+        "class_name": seg.class_name,
+        "layer_index": seg.layer_index,
+        "merge_strategy": "concatenate",
+        "n_tokens": seg.n_tokens,
+        "bits": seg.bits,
+    }
+
+
+def _meta_to_kv_segment(keys, values, meta: dict) -> KVLayerSegment:
+    """Reconstruct a typed KVLayerSegment from a metadata dict and key/value arrays."""
+    merge_strategy = meta.get("merge_strategy", "concatenate")
+    if merge_strategy == "last":
+        return KVRotatingSegment(
+            keys=keys,
+            values=values,
+            layer_index=meta["layer_index"],
+            n_tokens=meta.get("n_tokens", 0),
+            bits=meta.get("bits"),
+            class_name=meta.get("class_name", "RotatingKVCache"),
+            max_size=meta.get("max_size", 0),
+            keep=meta.get("keep", 0),
+            offset=meta.get("offset", 0),
+            idx=meta.get("_idx", meta.get("idx", 0)),
+        )
+    return KVConcatSegment(
+        keys=keys,
+        values=values,
+        layer_index=meta["layer_index"],
+        n_tokens=meta.get("n_tokens", 0),
+        bits=meta.get("bits"),
+        class_name=meta.get("class_name", "KVCache"),
+    )
 
 
 @dataclass
@@ -309,8 +359,8 @@ class TurnPrefixCache:
     ) -> tuple[list[KVLayerSegment], list[RecurrentLayerSegment]]:
         """Walk from root to node and merge KV data per layer.
 
-        KVCache layers: concatenated via KVLayerSegment.concat() (incremental).
-        RotatingKVCache layers: deepest node only (full ring buffer).
+        KVCache layers: merged via KVConcatSegment.merge_path() (incremental concat).
+        RotatingKVCache layers: merged via KVRotatingSegment.merge_path() (deepest node only).
         Recurrent data: leaf node only.
         """
         path = self._inorder_path(node)
@@ -319,16 +369,13 @@ class TurnPrefixCache:
         for n in path:
             if isinstance(n.kv_data, list):
                 for item in n.kv_data:
-                    li = item.metadata["layer_index"]
+                    li = item.layer_index
                     kv_by_layer.setdefault(li, []).append(item)
 
         merged_kv: list[KVLayerSegment] = []
         for li in sorted(kv_by_layer):
             items = kv_by_layer[li]
-            if items[0].metadata.get("merge_strategy", "concatenate") == "last":
-                merged_kv.append(items[-1])
-            else:
-                merged_kv.append(KVLayerSegment.concat(items))
+            merged_kv.append(items[-1].merge_path(items))
 
         leaf = path[-1] if path else None
         recurrent: list[RecurrentLayerSegment] = (
@@ -449,7 +496,7 @@ class TurnPrefixCache:
                         tensors[f"layer_{j}_values_biases"] = np.array(
                             kv_item.values.biases.astype(mx.float32)
                         )
-                        all_meta.append(kv_item.metadata)
+                        all_meta.append(_kv_segment_to_meta(kv_item))
                     tmp = kv_path + ".tmp"
                     st_save(tensors, tmp)
                     os.replace(tmp, kv_path)
@@ -578,9 +625,7 @@ class TurnPrefixCache:
                                 ).astype(mx.bfloat16),
                             )
                             kv_items.append(
-                                KVLayerSegment(
-                                    keys=keys, values=values, metadata=item_meta
-                                )
+                                _meta_to_kv_segment(keys, values, item_meta)
                             )
                         kv_data = kv_items if kv_items else None
                 except Exception as e:
@@ -705,7 +750,7 @@ class TurnPrefixCache:
                 tensors[f"layer_{j}_values_biases"] = np.array(
                     kv_item.values.biases.astype(mx.float32)
                 )
-                all_meta.append(kv_item.metadata)
+                all_meta.append(_kv_segment_to_meta(kv_item))
             tmp = path + ".tmp"
             st_save(tensors, tmp)
             os.replace(tmp, path)
@@ -784,7 +829,7 @@ class TurnPrefixCache:
                             ),
                         )
                         kv_items.append(
-                            KVLayerSegment(keys=keys, values=values, metadata=item_meta)
+                            _meta_to_kv_segment(keys, values, item_meta)
                         )
                     node.kv_data = kv_items if kv_items else None
                 else:

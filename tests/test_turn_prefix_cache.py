@@ -563,8 +563,8 @@ def _make_kv(n_tokens=1):
 
 
 def _make_kv_data(n_tokens=1):
-    """Small KVLayerSegment for memory-tracked tests."""
-    from vllm_mlx.cache_types import KVLayerSegment
+    """Small KVConcatSegment for memory-tracked tests."""
+    from vllm_mlx.cache_types import KVConcatSegment
     from vllm_mlx.kv_cache import QuantizedArray
 
     keys = _make_kv(n_tokens)
@@ -572,15 +572,13 @@ def _make_kv_data(n_tokens=1):
     q_keys = QuantizedArray(*mx.quantize(keys, group_size=64, bits=8))
     q_values = QuantizedArray(*mx.quantize(values, group_size=64, bits=8))
     return [
-        KVLayerSegment(
+        KVConcatSegment(
             keys=q_keys,
             values=q_values,
-            metadata={
-                "layer_index": 0,
-                "merge_strategy": "concatenate",
-                "class_name": "KVCache",
-                "n_tokens": n_tokens,
-            },
+            layer_index=0,
+            n_tokens=n_tokens,
+            bits=8,
+            class_name="KVCache",
         )
     ]
 

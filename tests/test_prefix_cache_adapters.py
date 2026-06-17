@@ -8,6 +8,7 @@ import pytest
 from vllm_mlx.cache_types import KVQuantPolicy
 from vllm_mlx.kv_cache import RequestCacheState
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+from vllm_mlx.cache_translator import segment, assemble
 
 
 def test_cache_manager_is_abstract():
@@ -167,8 +168,9 @@ def test_turn_cache_adapter_release_noop_when_no_pinned_leaf():
 
 def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     """TurnCacheManager.on_prefill_checkpoint eagerly inserts the turn into the trie."""
+    from unittest.mock import patch as _patch
     from vllm_mlx.kv_cache import RequestCacheState
-    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.cache_types import KVConcatSegment
     from vllm_mlx.kv_cache import QuantizedArray
 
     inner = MagicMock()
@@ -185,7 +187,8 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     )  # 10 tokens; B_sys=5 → sys=[0-4], user=[5-9]
     request._turn_boundaries = [5]
 
-    # Patch _segment so it returns empty sparse lists without needing real arrays
+    # Patch segment (module-level in prefix_cache_adapters) so it returns
+    # empty sparse lists without needing real arrays
     import mlx.core as mx
 
     qa = QuantizedArray(
@@ -193,9 +196,9 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
         scales=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
         biases=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
     )
-    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={"layer_index": 0})
-    with patch.object(
-        TurnCacheManager, "_segment", return_value=([kv_placeholder], [None])
+    kv_placeholder = KVConcatSegment(keys=qa, values=qa, layer_index=0, n_tokens=1, bits=8)
+    with _patch(
+        "vllm_mlx.prefix_cache_adapters._segment_fn", return_value=([kv_placeholder], [None])
     ):
         extracted = [{"state": (None, None), "class_name": "KVCache"}]
         adapter.on_prefill_checkpoint(request, 5, extracted)
@@ -570,8 +573,8 @@ def test_fetch_hit_populates_turn_path_on_cache_state():
     inner.find_checkpoint_ancestor.return_value = ancestor
     # Mock collect_path_data to return empty lists (no real MLX arrays needed)
     inner.collect_path_data.return_value = ([], [])
-    # Patch _assemble and validate_cache so fetch() doesn't need real MLX arrays
-    with patch.object(TurnCacheManager, "_assemble", return_value=[]), patch(
+    # Patch assemble and validate_cache so fetch() doesn't need real MLX arrays
+    with patch("vllm_mlx.prefix_cache_adapters.assemble", return_value=[]), patch(
         "vllm_mlx.prefix_cache_adapters.validate_cache", return_value=True
     ):
         adapter = TurnCacheManager(inner)
@@ -597,7 +600,7 @@ def test_fetch_sets_prefill_boundaries_via_boundaries():
     ancestor.n_tokens = 5
     inner.find_checkpoint_ancestor.return_value = ancestor
     inner.collect_path_data.return_value = ([], [])
-    with patch.object(TurnCacheManager, "_assemble", return_value=[]), patch(
+    with patch("vllm_mlx.prefix_cache_adapters.assemble", return_value=[]), patch(
         "vllm_mlx.prefix_cache_adapters.validate_cache", return_value=True
     ):
         adapter = TurnCacheManager(inner)
@@ -659,7 +662,8 @@ def test_store_reads_turn_path_from_cache_state():
 
 
 def test_on_prefill_checkpoint_at_boundary_inserts_node():
-    from vllm_mlx.cache_types import KVLayerSegment
+    from unittest.mock import patch as _patch
+    from vllm_mlx.cache_types import KVConcatSegment
     from vllm_mlx.kv_cache import QuantizedArray
 
     inner = _make_inner()
@@ -682,9 +686,9 @@ def test_on_prefill_checkpoint_at_boundary_inserts_node():
         scales=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
         biases=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
     )
-    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={"layer_index": 0})
-    with patch.object(
-        TurnCacheManager, "_segment", return_value=([kv_placeholder], [None])
+    kv_placeholder = KVConcatSegment(keys=qa, values=qa, layer_index=0, n_tokens=1, bits=8)
+    with _patch(
+        "vllm_mlx.prefix_cache_adapters._segment_fn", return_value=([kv_placeholder], [None])
     ):
         adapter.on_prefill_checkpoint(
             req, total_tokens_prefilled=10, extracted_cache=extracted
@@ -712,7 +716,8 @@ def test_on_prefill_checkpoint_not_at_boundary_is_noop():
 
 def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     """Prefill boundaries store cache @ N, not N-1; n_minus_one_state must be ignored."""
-    from vllm_mlx.cache_types import KVLayerSegment
+    from unittest.mock import patch as _patch
+    from vllm_mlx.cache_types import KVConcatSegment
     from vllm_mlx.kv_cache import QuantizedArray
 
     inner = _make_inner()
@@ -725,7 +730,7 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     extracted = [
         {"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}
     ]
-    # Verify that on_prefill_checkpoint delegates to _segment (not inner.split_cache_arrays)
+    # Verify that on_prefill_checkpoint delegates to _segment_fn (not inner.split_cache_arrays)
     import mlx.core as mx
 
     qa = QuantizedArray(
@@ -733,14 +738,14 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
         scales=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
         biases=mx.zeros((1, 1, 1, 1), dtype=mx.bfloat16),
     )
-    kv_placeholder = KVLayerSegment(keys=qa, values=qa, metadata={"layer_index": 0})
-    with patch.object(
-        TurnCacheManager, "_segment", return_value=([kv_placeholder], [None])
+    kv_placeholder = KVConcatSegment(keys=qa, values=qa, layer_index=0, n_tokens=1, bits=8)
+    with _patch(
+        "vllm_mlx.prefix_cache_adapters._segment_fn", return_value=([kv_placeholder], [None])
     ) as mock_seg:
         adapter.on_prefill_checkpoint(
             req, total_tokens_prefilled=10, extracted_cache=extracted
         )
-    # _segment should have been called with extracted_cache plus policy and group_size
+    # _segment_fn should have been called with extracted_cache plus policy and group_size
     mock_seg.assert_called_once_with(
         extracted, policy=adapter._policy, group_size=adapter._kv_group_size
     )
@@ -787,7 +792,7 @@ def test_segment_rotating_kvcache_quantized_arrays_are_evaluated():
     import mlx.core as mx
 
     state = _rotating_state()
-    kv_list, _ = TurnCacheManager._segment([state], policy=KVQuantPolicy(sliding_bits=8, full_bits=8), group_size=32)
+    kv_list, _ = segment([state], policy=KVQuantPolicy(sliding_bits=8, full_bits=8), group_size=32)
     seg = kv_list[0]
     assert seg is not None
 
@@ -811,7 +816,7 @@ def test_segment_kvcache_quantized_arrays_are_evaluated():
     import mlx.core as mx
 
     state = _kvcache_state()
-    kv_list, _ = TurnCacheManager._segment([state], policy=KVQuantPolicy(full_bits=8), group_size=32)
+    kv_list, _ = segment([state], policy=KVQuantPolicy(full_bits=8), group_size=32)
     seg = kv_list[0]
     assert seg is not None
 
@@ -930,7 +935,7 @@ def test_segment_does_not_retain_source_float16_in_active_memory():
         "meta_state": ("0", str(T), str(T), str(T)),
     }
 
-    kv_list, _ = TurnCacheManager._segment([state], policy=KVQuantPolicy(sliding_bits=8, full_bits=8), group_size=32)
+    kv_list, _ = segment([state], policy=KVQuantPolicy(sliding_bits=8, full_bits=8), group_size=32)
     seg = kv_list[0]
 
     # Release all source references.

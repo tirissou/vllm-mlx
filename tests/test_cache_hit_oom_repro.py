@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression test for OOM at decode-from-cache-hit on large prefixes.
 
-TurnCacheManager._assemble used to construct an mlx_lm KVCache (or
-QuantizedKVCache) sized exactly to n_tokens. The next update_and_fetch
-then entered the `(prev + 1) > self.keys.shape[-2]` branch, which trims
-and concatenates a fresh buffer — doubling Metal-memory transiently. At
-60k cached tokens on a Gemma 4 26B-A4B-class model that doubling is
-GB-scale and OOMs the server.
+assemble() used to construct an mlx_lm KVCache (or QuantizedKVCache) sized
+exactly to n_tokens. The next update_and_fetch then entered the
+`(prev + 1) > self.keys.shape[-2]` branch, which trims and concatenates a
+fresh buffer — doubling Metal-memory transiently. At 60k cached tokens on a
+Gemma 4 26B-A4B-class model that doubling is GB-scale and OOMs the server.
 
 The fix (see ADR-0005): emit a cache pre-padded to the next `step` boundary
 so the first update_and_fetch lands on the in-place assignment branch.
@@ -22,9 +21,9 @@ import gc
 import mlx.core as mx
 import pytest
 
-from vllm_mlx.cache_types import KVLayerSegment
+from vllm_mlx.cache_types import KVConcatSegment
 from vllm_mlx.kv_cache import QuantizedArray
-from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+from vllm_mlx.cache_translator import assemble
 
 
 # Realistic shape for the full-attention slice of a Gemma 4 26B-A4B-class model.
@@ -42,7 +41,7 @@ N_TOKENS_UNALIGNED = 60_000   # 60000 % 256 = 96
 N_TOKENS_ALIGNED = 60_160     # 235 * 256
 
 
-def _make_quantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
+def _make_quantized_segment(layer_index: int, n_tokens: int) -> KVConcatSegment:
     packed_shape = (1, N_KV_HEADS, n_tokens, HEAD_DIM // EL_PER_INT)
     scale_shape = (1, N_KV_HEADS, n_tokens, HEAD_DIM // GROUP_SIZE)
     keys = QuantizedArray(
@@ -59,34 +58,28 @@ def _make_quantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
         keys.packed, keys.scales, keys.biases,
         values.packed, values.scales, values.biases,
     )
-    return KVLayerSegment(
+    return KVConcatSegment(
         keys=keys,
         values=values,
-        metadata={
-            "bits": BITS,
-            "class_name": "KVCache",
-            "layer_index": layer_index,
-            "merge_strategy": "concatenate",
-            "n_tokens": n_tokens,
-        },
+        layer_index=layer_index,
+        n_tokens=n_tokens,
+        bits=BITS,
+        class_name="KVCache",
     )
 
 
-def _make_unquantized_segment(layer_index: int, n_tokens: int) -> KVLayerSegment:
+def _make_unquantized_segment(layer_index: int, n_tokens: int) -> KVConcatSegment:
     shape = (1, N_KV_HEADS, n_tokens, HEAD_DIM)
     keys = mx.zeros(shape, dtype=mx.bfloat16)
     values = mx.zeros(shape, dtype=mx.bfloat16)
     mx.eval(keys, values)
-    return KVLayerSegment(
+    return KVConcatSegment(
         keys=keys,
         values=values,
-        metadata={
-            "bits": None,
-            "class_name": "KVCache",
-            "layer_index": layer_index,
-            "merge_strategy": "concatenate",
-            "n_tokens": n_tokens,
-        },
+        layer_index=layer_index,
+        n_tokens=n_tokens,
+        bits=None,
+        class_name="KVCache",
     )
 
 
@@ -133,7 +126,7 @@ def test_assemble_does_not_spike_on_first_decode_step(
 
     kv_layers = [make_segment(i, n_tokens) for i in range(N_FULL_LAYERS)]
 
-    caches = TurnCacheManager._assemble(
+    caches = assemble(
         kv_layers=kv_layers,
         recurrent_layers=[],
         group_size=GROUP_SIZE,

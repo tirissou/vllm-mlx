@@ -62,13 +62,12 @@ def _make_request(
 
 
 def _stub_assemble_and_validate(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bypass _assemble / validate so hit-path tests do not depend on real
+    """Bypass assemble / validate so hit-path tests do not depend on real
     KV reconstruction. We are testing lifecycle/pinning, not cache contents.
     """
     monkeypatch.setattr(
-        TurnCacheManager,
-        "_assemble",
-        staticmethod(lambda kv, rec, *a, **k: [object()]),
+        "vllm_mlx.prefix_cache_adapters.assemble",
+        lambda kv, rec, *a, **k: [object()],
     )
     monkeypatch.setattr(TurnCacheManager, "validate", lambda self, cache: True)
 
@@ -84,21 +83,19 @@ def _insert_two_segment_path(
     # A list with no items is truthy-ish? No — an empty list is falsy. We need
     # non-empty kv_data so find_checkpoint_ancestor accepts the node.
     # The kv_data items only have to look like KVLayerSegments for the
-    # collect_path_data walk; since we stub _assemble, the actual contents
+    # collect_path_data walk; since we stub assemble, the actual contents
     # do not matter.
-    from vllm_mlx.cache_types import KVLayerSegment
+    from vllm_mlx.cache_types import KVConcatSegment
     import mlx.core as mx
 
-    def _dummy_layer(idx: int) -> KVLayerSegment:
-        return KVLayerSegment(
+    def _dummy_layer(idx: int) -> KVConcatSegment:
+        return KVConcatSegment(
             keys=mx.zeros((1, 1, 1, 1)),
             values=mx.zeros((1, 1, 1, 1)),
-            metadata={
-                "class_name": "KVCache",
-                "layer_index": idx,
-                "merge_strategy": "concatenate",
-                "n_tokens": 1,
-            },
+            layer_index=idx,
+            n_tokens=1,
+            bits=None,
+            class_name="KVCache",
         )
 
     sys_node = trie.insert(
@@ -486,12 +483,11 @@ def test_fetch_failure_validate_returns_false_releases_pin(
 ) -> None:
     """When validate(reconstructed) returns False, fetch must release the
     leaf pin, drop _pinned_leaves[req], and set miss state."""
-    # Stub _assemble (so we don't depend on real reconstruction) but force
+    # Stub assemble (so we don't depend on real reconstruction) but force
     # validate False instead of True.
     monkeypatch.setattr(
-        TurnCacheManager,
-        "_assemble",
-        staticmethod(lambda kv, rec, *a, **k: [object()]),
+        "vllm_mlx.prefix_cache_adapters.assemble",
+        lambda kv, rec, *a, **k: [object()],
     )
     monkeypatch.setattr(TurnCacheManager, "validate", lambda self, cache: False)
 

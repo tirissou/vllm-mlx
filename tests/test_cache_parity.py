@@ -325,17 +325,13 @@ class TestCacheParity:
 async def test_invalid_cache_falls_back_to_miss(model_and_tokenizer):
     """A corrupt reconstructed cache must trigger a miss fallback, not a crash."""
     import unittest.mock
-    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.cache_translator import assemble as _orig_assemble
 
     model, tokenizer = model_and_tokenizer
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What is 2+2?"},
     ]
-
-    # In Python 3, accessing a staticmethod via the class returns a plain
-    # function, so we just reference it directly (no __func__ needed).
-    _orig_assemble = TurnCacheManager._assemble
 
     def _corrupt_assemble(kv_layers, rec_layers, group_size=64):
         result = _orig_assemble(kv_layers, rec_layers, group_size)
@@ -354,9 +350,10 @@ async def test_invalid_cache_falls_back_to_miss(model_and_tokenizer):
         await asyncio.sleep(0.05)
         # Populate cache on first request
         await _run_chat(engine, tokenizer, messages)
-        # Patch _assemble so the second request gets a corrupt cache
-        with unittest.mock.patch.object(
-            TurnCacheManager, "_assemble", staticmethod(_corrupt_assemble)
+        # Patch assemble (imported into prefix_cache_adapters) so the second
+        # request gets a corrupt cache
+        with unittest.mock.patch(
+            "vllm_mlx.prefix_cache_adapters.assemble", _corrupt_assemble
         ):
             # Should not crash; falls back to miss and produces valid output
             tokens = await _run_chat(engine, tokenizer, messages)

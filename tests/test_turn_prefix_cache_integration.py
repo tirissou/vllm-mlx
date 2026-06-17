@@ -1,7 +1,7 @@
-"""Integration tests: full segment → Trie → collect_path_data → _assemble round-trip.
+"""Integration tests: full segment → Trie → collect_path_data → assemble round-trip.
 
 Tests the spec's invariant:
-  TurnCacheManager._assemble(trie.collect_path_data(node)) ≈ reconstructed live cache objects
+  assemble(trie.collect_path_data(node)) ≈ reconstructed live cache objects
 (within quantization epsilon).
 """
 
@@ -11,7 +11,8 @@ import pytest
 
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
-from vllm_mlx.cache_types import KVLayerSegment, KVQuantPolicy, RecurrentLayerSegment
+from vllm_mlx.cache_types import KVLayerSegment, KVRotatingSegment, KVQuantPolicy, RecurrentLayerSegment
+from vllm_mlx.cache_translator import segment, assemble
 
 
 @pytest.fixture
@@ -57,7 +58,7 @@ def test_kvcache_round_trip(trie):
 
     live_states = _make_kvcache_states(n_tokens=4, n_layers=2)
 
-    kv_sparse, rec_sparse = TurnCacheManager._segment(live_states, policy=KVQuantPolicy(full_bits=8))
+    kv_sparse, rec_sparse = segment(live_states, policy=KVQuantPolicy(full_bits=8))
     kv_layers = [kv for kv in kv_sparse if kv is not None]
     rec_layers = [rec for rec in rec_sparse if rec is not None]
 
@@ -70,7 +71,7 @@ def test_kvcache_round_trip(trie):
     assert len(path) == 1 and path[0] is node
 
     kv_out, rec_out = trie.collect_path_data(node)
-    assembled = TurnCacheManager._assemble(kv_out, rec_out)
+    assembled = assemble(kv_out, rec_out)
 
     assert len(assembled) == 2  # 2 KV layers
     for cache in assembled:
@@ -85,8 +86,8 @@ def test_kvcache_concatenates_across_two_nodes(trie):
     states1 = _make_kvcache_states(n_tokens=3, n_layers=1)
     states2 = _make_kvcache_states(n_tokens=5, n_layers=1)
 
-    kv1, _ = TurnCacheManager._segment(states1)
-    kv2, _ = TurnCacheManager._segment(states2)
+    kv1, _ = segment(states1)
+    kv2, _ = segment(states2)
 
     seg1 = Segment(role="system", token_ids=[1, 2, 3])
     seg2 = Segment(role="conversation", token_ids=[4, 5, 6, 7, 8])
@@ -94,7 +95,7 @@ def test_kvcache_concatenates_across_two_nodes(trie):
     node2 = trie.insert(node1, seg2, kv_data=[kv for kv in kv2 if kv])
 
     kv_out, _ = trie.collect_path_data(node2)
-    assembled = TurnCacheManager._assemble(kv_out, [])
+    assembled = assemble(kv_out, [])
 
     # After concat: offset should be 3 + 5 = 8
     assert len(assembled) == 1
@@ -108,8 +109,8 @@ def test_rotating_kvcache_uses_last_node(trie):
     states1 = _make_rotating_states(n_tokens=4, max_size=4)
     states2 = _make_rotating_states(n_tokens=4, max_size=4)
 
-    kv1, _ = TurnCacheManager._segment(states1)
-    kv2, _ = TurnCacheManager._segment(states2)
+    kv1, _ = segment(states1)
+    kv2, _ = segment(states2)
 
     seg1 = Segment(role="system", token_ids=[1, 2, 3, 4])
     seg2 = Segment(role="conversation", token_ids=[5, 6, 7, 8])
@@ -117,12 +118,12 @@ def test_rotating_kvcache_uses_last_node(trie):
     node2 = trie.insert(node1, seg2, kv_data=[kv for kv in kv2 if kv])
 
     kv_out, _ = trie.collect_path_data(node2)
-    # merge_strategy='last' → only node2's data
-    assert kv_out[0].metadata["layer_index"] == 0
-    assert kv_out[0].metadata["merge_strategy"] == "last"
+    # KVRotatingSegment.merge_path uses last → only node2's data
+    assert kv_out[0].layer_index == 0
+    assert isinstance(kv_out[0], KVRotatingSegment)
 
     # Verify full round-trip: _assemble reconstructs a RotatingKVCache
-    assembled = TurnCacheManager._assemble(kv_out, [])
+    assembled = assemble(kv_out, [])
     assert len(assembled) == 1
     assert isinstance(assembled[0], RotatingKVCache)
     # RotatingKVCache is dequantized, max_size=4
@@ -136,7 +137,7 @@ def test_recurrent_comes_from_leaf(trie):
     rec_state = (mx.array([[[[1.0]]]], dtype=mx.bfloat16),)
     live_states = [{"class_name": "MambaLayer", "state": rec_state, "meta_state": ()}]
 
-    _, rec_sparse = TurnCacheManager._segment(live_states)
+    _, rec_sparse = segment(live_states)
     rec_layers = [rec for rec in rec_sparse if rec is not None]
 
     seg = Segment(role="system", token_ids=[1])
@@ -146,7 +147,7 @@ def test_recurrent_comes_from_leaf(trie):
     assert has_recurrent
 
     _, rec_out = trie.collect_path_data(node)
-    assembled = TurnCacheManager._assemble([], rec_out)
+    assembled = assemble([], rec_out)
 
     assert len(assembled) == 1
     assert isinstance(assembled[0], ArraysCache)
@@ -166,7 +167,7 @@ def test_collect_path_data_layer_ordering(trie):
         {"class_name": "Mamba", "state": rec_raw, "meta_state": ()},
     ]
 
-    kv_sparse, rec_sparse = TurnCacheManager._segment(live_states, policy=KVQuantPolicy(full_bits=8))
+    kv_sparse, rec_sparse = segment(live_states, policy=KVQuantPolicy(full_bits=8))
     kv_layers = [kv for kv in kv_sparse if kv is not None]
     rec_layers = [rec for rec in rec_sparse if rec is not None]
 
@@ -174,7 +175,7 @@ def test_collect_path_data_layer_ordering(trie):
     node = trie.insert(trie.root, seg, kv_data=kv_layers, recurrent_data=rec_layers)
 
     kv_out, rec_out = trie.collect_path_data(node)
-    assembled = TurnCacheManager._assemble(kv_out, rec_out)
+    assembled = assemble(kv_out, rec_out)
 
     assert len(assembled) == 2
     # layer 0 = KVCache → BatchQuantizedKVCache (ADR-0005), layer 1 = recurrent (ArraysCache)
