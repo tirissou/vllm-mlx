@@ -1771,8 +1771,8 @@ class Scheduler:
                     raise
             except Exception as e:
                 if self._is_stream_thread_error(e):
-                    # Release pinned leaves before re-raising so ref_counts
-                    # don't leak when the caller handles the stream-thread error.
+                    # Release pinned leaves here; engine_core's _reschedule_running_requests
+                    # will also call release(), but _pinned_leaves.pop(…) gates it to a no-op.
                     if self._prefix_cache is not None:
                         for _req in list(self.running.values()):
                             self._prefix_cache.release(_req)
