@@ -394,6 +394,16 @@ class EngineCore:
 
     def _cleanup_request(self, request_id: str) -> None:
         """Clean up request tracking."""
+        # Release any pinned cache leaf BEFORE removing the request from
+        # scheduler.requests.  _do_abort_request also calls release(), but it
+        # runs inside step() — after _cleanup_request has already popped the
+        # request from scheduler.requests, leaving it unable to find the object.
+        # Calling release() here guarantees the leaf is freed regardless of
+        # scheduling order, and the second call in _do_abort_request is a safe
+        # no-op (release() pops from _pinned_leaves; a missing key is ignored).
+        req = self.scheduler.requests.get(request_id)
+        if req is not None and self.scheduler._prefix_cache is not None:
+            self.scheduler._prefix_cache.release(req)
         collector = self._output_collectors.pop(request_id, None)
         if collector:
             collector.clear()
