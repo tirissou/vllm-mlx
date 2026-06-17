@@ -147,7 +147,9 @@ def test_turn_cache_adapter_release_unpins_recorded_leaf():
     assert adapter.pinned_leaf(req.request_id) is leaf
 
     adapter.release(req)
-    inner.release.assert_called()
+    # fetch() releases non-leaf ancestors (node), then release() releases the leaf
+    assert inner.release.call_count == 2
+    inner.release.assert_called_with([leaf])
     assert adapter.pinned_leaf(req.request_id) is None
     assert req._cache_state.turn_path == []
 
