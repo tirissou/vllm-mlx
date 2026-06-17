@@ -143,8 +143,8 @@ def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     assert req._cache_state.hit_type == "hit"
 
     # Active Leaf invariant: only the leaf is pinned.
-    assert user_leaf.ref_count == 1, (
-        f"leaf should have ref_count==1, got {user_leaf.ref_count}"
+    assert not user_leaf.is_evictable, (
+        f"leaf should be pinned (not evictable), got ref_count={user_leaf.ref_count}"
     )
     assert sys_node.ref_count == 0, (
         "non-leaf ancestors must not be pinned under the Active Leaf model; "
@@ -152,8 +152,8 @@ def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     # The manager must remember which leaf belongs to this request.
-    assert req.request_id in manager._pinned_leaves
-    assert manager._pinned_leaves[req.request_id] is user_leaf
+    assert manager.pinned_leaf(req.request_id) is not None
+    assert manager.pinned_leaf(req.request_id) is user_leaf
 
 
 def test_cache_fetch_miss_initialises_state() -> None:
@@ -174,7 +174,7 @@ def test_cache_fetch_miss_initialises_state() -> None:
     assert req._cache_state.remaining_tokens == req.prompt_token_ids
 
     # No leaf was pinned for this request.
-    assert req.request_id not in manager._pinned_leaves
+    assert manager.pinned_leaf(req.request_id) is None
 
 
 def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,13 +195,13 @@ def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert manager.fetch(req) is True
     # Sanity: hit pinned the leaf.
-    assert user_leaf.ref_count == 1
-    assert manager._pinned_leaves.get(req.request_id) is user_leaf
+    assert not user_leaf.is_evictable
+    assert manager.pinned_leaf(req.request_id) is user_leaf
 
     manager.release(req)
 
-    assert user_leaf.ref_count == 0, "release must unpin the leaf"
-    assert req.request_id not in manager._pinned_leaves, (
+    assert user_leaf.is_evictable, "release must unpin the leaf"
+    assert manager.pinned_leaf(req.request_id) is None, (
         "release must remove the request from _pinned_leaves"
     )
     assert req._cache_state.turn_path == [], (
@@ -228,8 +228,8 @@ def test_cache_store_advancement_unpins_old_pins_new(
     )
 
     assert manager.fetch(req) is True
-    assert leaf_a.ref_count == 1
-    assert manager._pinned_leaves[req.request_id] is leaf_a
+    assert not leaf_a.is_evictable
+    assert manager.pinned_leaf(req.request_id) is leaf_a
 
     # Simulate the model having produced output tokens; ``store`` requires
     # output_token_ids to be non-empty.
@@ -247,8 +247,8 @@ def test_cache_store_advancement_unpins_old_pins_new(
     leaf_b = new_children[0]
 
     assert leaf_a.ref_count == 0, "old leaf must be unpinned by store"
-    assert leaf_b.ref_count == 1, "new leaf must be pinned by store"
-    assert manager._pinned_leaves[req.request_id] is leaf_b
+    assert not leaf_b.is_evictable, "new leaf must be pinned by store"
+    assert manager.pinned_leaf(req.request_id) is leaf_b
     assert req._cache_state.turn_path[-1] is leaf_b, (
         "request.turn_path must end at the new pinned leaf"
     )
@@ -271,8 +271,8 @@ def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert manager.fetch(req) is True
-    assert leaf_a.ref_count == 1
-    assert manager._pinned_leaves[req.request_id] is leaf_a
+    assert not leaf_a.is_evictable
+    assert manager.pinned_leaf(req.request_id) is leaf_a
 
     req.output_token_ids = [42, 43]
 
@@ -288,11 +288,11 @@ def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
         manager.store(req, tokens=req.output_token_ids, cache=[])
 
     # Rollback invariant: leaf_a is still the pinned leaf for this request.
-    assert leaf_a.ref_count == 1, (
-        "old leaf ref_count must remain 1 after a failed store"
+    assert not leaf_a.is_evictable, (
+        "old leaf must remain pinned (not evictable) after a failed store"
     )
-    assert manager._pinned_leaves[req.request_id] is leaf_a, (
-        "_pinned_leaves must still map req -> leaf_a after a failed store"
+    assert manager.pinned_leaf(req.request_id) is leaf_a, (
+        "pinned_leaf must still map req -> leaf_a after a failed store"
     )
 
 
@@ -317,7 +317,7 @@ def test_checkpoint_from_miss_pins_new_leaf() -> None:
 
     # Miss populates cache_state.turn_path == [] and leaves _pinned_leaves empty.
     assert manager.fetch(req) is False
-    assert req.request_id not in manager._pinned_leaves
+    assert manager.pinned_leaf(req.request_id) is None
 
     # Drive the first checkpoint at the system-boundary (abs_idx=0).
     manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
@@ -327,10 +327,10 @@ def test_checkpoint_from_miss_pins_new_leaf() -> None:
     assert len(turn_path) == 1, "checkpoint should append exactly one node"
     new_leaf = turn_path[-1]
 
-    assert new_leaf.ref_count == 1, (
-        f"new checkpoint leaf must be pinned, got ref_count={new_leaf.ref_count}"
+    assert not new_leaf.is_evictable, (
+        f"new checkpoint leaf must be pinned (not evictable), got ref_count={new_leaf.ref_count}"
     )
-    assert manager._pinned_leaves[req.request_id] is new_leaf
+    assert manager.pinned_leaf(req.request_id) is new_leaf
 
 
 def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -367,8 +367,8 @@ def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     assert manager.fetch(req) is True
-    assert leaf_a.ref_count == 1
-    assert manager._pinned_leaves[req.request_id] is leaf_a
+    assert not leaf_a.is_evictable
+    assert manager.pinned_leaf(req.request_id) is leaf_a
 
     # Drive a checkpoint at abs_idx=2 (past the matched depth of 2).
     manager.on_prefill_checkpoint(
@@ -382,8 +382,8 @@ def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> Non
     leaf_b = new_children[0]
 
     assert leaf_a.ref_count == 0, "checkpoint must unpin the previous active leaf"
-    assert leaf_b.ref_count == 1, "checkpoint must pin the newly inserted leaf"
-    assert manager._pinned_leaves[req.request_id] is leaf_b
+    assert not leaf_b.is_evictable, "checkpoint must pin the newly inserted leaf"
+    assert manager.pinned_leaf(req.request_id) is leaf_b
     assert req._cache_state.turn_path[-1] is leaf_b
 
 
@@ -409,8 +409,8 @@ def test_consecutive_checkpoints_advance_leaf() -> None:
     node_sys = req._cache_state.turn_path[-1]
     # These two assertions are also part of the expected red state today
     # (first checkpoint does not pin): both will pass once Task 2 is done.
-    assert node_sys.ref_count == 1, "first checkpoint must pin the inserted node"
-    assert manager._pinned_leaves[req.request_id] is node_sys
+    assert not node_sys.is_evictable, "first checkpoint must pin the inserted node"
+    assert manager.pinned_leaf(req.request_id) is node_sys
 
     manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(prompt),
                                   extracted_cache=[])
@@ -418,8 +418,8 @@ def test_consecutive_checkpoints_advance_leaf() -> None:
 
     assert node_user is not node_sys, "second checkpoint must insert a new node"
     assert node_sys.ref_count == 0, "previous checkpoint leaf must be unpinned"
-    assert node_user.ref_count == 1, "newest checkpoint leaf must be pinned"
-    assert manager._pinned_leaves[req.request_id] is node_user
+    assert not node_user.is_evictable, "newest checkpoint leaf must be pinned"
+    assert manager.pinned_leaf(req.request_id) is node_user
 
 
 def test_release_after_checkpoint_unpins_latest_leaf() -> None:
@@ -443,12 +443,12 @@ def test_release_after_checkpoint_unpins_latest_leaf() -> None:
                                   extracted_cache=[])
     leaf = req._cache_state.turn_path[-1]
     # This assertion is also red today (checkpoint never pins): it passes once Task 2 is done.
-    assert leaf.ref_count == 1, "checkpoint must have pinned the leaf before release"
+    assert not leaf.is_evictable, "checkpoint must have pinned the leaf before release"
 
     manager.release(req)
 
-    assert leaf.ref_count == 0, "release must unpin the checkpoint leaf"
-    assert req.request_id not in manager._pinned_leaves
+    assert leaf.is_evictable, "release must unpin the checkpoint leaf"
+    assert manager.pinned_leaf(req.request_id) is None
     assert req._cache_state.turn_path == []
 
 
@@ -477,8 +477,8 @@ def test_fetch_failure_no_checkpoint_ancestor_releases_pin(
 
     assert manager.fetch(req) is False
     assert req._cache_state.hit_type == "miss"
-    assert user_leaf.ref_count == 0, "leaf pin must be released on this failure"
-    assert req.request_id not in manager._pinned_leaves
+    assert user_leaf.is_evictable, "leaf pin must be released on this failure"
+    assert manager.pinned_leaf(req.request_id) is None
 
 
 def test_fetch_failure_validate_returns_false_releases_pin(
@@ -509,5 +509,5 @@ def test_fetch_failure_validate_returns_false_releases_pin(
 
     assert manager.fetch(req) is False
     assert req._cache_state.hit_type == "miss"
-    assert user_leaf.ref_count == 0, "leaf pin must be released on validate failure"
-    assert req.request_id not in manager._pinned_leaves
+    assert user_leaf.is_evictable, "leaf pin must be released on validate failure"
+    assert manager.pinned_leaf(req.request_id) is None

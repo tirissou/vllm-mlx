@@ -109,7 +109,7 @@ class TestBatchQuantizedKVCacheQuantizedArray:
             assert e.offset == T
 
         merged = BatchQuantizedKVCache.merge(extracted)
-        assert merged._idx == T
+        assert int(merged.offset[0]) == T  # logical token count after merge
         assert isinstance(merged.keys, QuantizedArray)
         assert merged.keys.packed.shape[0] == B
 
@@ -206,7 +206,7 @@ class TestBatchQuantizedKVCacheAlignment:
         e0, e1 = cache.extract(0), cache.extract(1)
         merged = QuantizedKVCache.merge([e0, e1])
         assert isinstance(merged, BatchQuantizedKVCache)
-        assert merged._idx == 16
+        assert int(merged.offset[0]) == 16  # logical token count after merge
         assert merged.keys.packed.shape[0] == 2
 
     def test_polymorphic_merge_matches_engine_call_site(self):
@@ -246,7 +246,6 @@ class TestBatchQuantizedKVCacheAlignment:
         offset_before = cache.offset.tolist()
         result = cache.trim(4)
         assert result == 4
-        assert cache._idx == 12
         mx.eval(cache.offset)
         assert cache.offset.tolist() == [o - 4 for o in offset_before]
 
@@ -254,7 +253,8 @@ class TestBatchQuantizedKVCacheAlignment:
         cache = self._make_cache(B=1, T=8)
         result = cache.trim(100)
         assert result == 8
-        assert cache._idx == 0
+        mx.eval(cache.offset)
+        assert cache.offset.tolist() == [0]
 
     def test_right_padding_finalize_adjusts_offset_and_left_padding(self):
         """After right-padded prefill + finalize, offset and left_padding reflect real tokens only."""

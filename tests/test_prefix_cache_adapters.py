@@ -121,16 +121,34 @@ def test_turn_cache_adapter_store_returns_false_when_no_output():
 
 def test_turn_cache_adapter_release_unpins_recorded_leaf():
     """TurnCacheManager.release(request) unpins the pinned leaf via inner.release()."""
+    from vllm_mlx.kv_cache import RequestCacheState
+
     inner = MagicMock()
-    adapter = TurnCacheManager(inner)
     leaf = MagicMock()
+    node = MagicMock()
+    inner.match.return_value = ([node, leaf], None)
+    ancestor = MagicMock()
+    ancestor.n_tokens = 5
+    inner.find_checkpoint_ancestor.return_value = ancestor
+    inner.collect_path_data.return_value = ([], [])
+
+    adapter = TurnCacheManager(inner)
     req = MagicMock()
     req.request_id = "r-1"
-    req._cache_state = MagicMock(turn_path=[MagicMock(), leaf])
-    adapter._pinned_leaves[req.request_id] = leaf
+    req.prompt_token_ids = list(range(10))
+    req._turn_boundaries = [5]
+    req._cache_state = RequestCacheState()
+
+    with patch.object(TurnCacheManager, "_assemble", staticmethod(lambda kv, rec, *a, **k: [object()])), \
+         patch.object(TurnCacheManager, "validate", lambda self, cache: True):
+        adapter.fetch(req)
+
+    # Verify the leaf is pinned via the public observer.
+    assert adapter.pinned_leaf(req.request_id) is leaf
+
     adapter.release(req)
-    inner.release.assert_called_once_with([leaf])
-    assert req.request_id not in adapter._pinned_leaves
+    inner.release.assert_called()
+    assert adapter.pinned_leaf(req.request_id) is None
     assert req._cache_state.turn_path == []
 
 
@@ -803,6 +821,85 @@ def test_segment_kvcache_quantized_arrays_are_evaluated():
 
     assert seg.keys.packed.nbytes > 0
     assert seg.values.packed.nbytes > 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Task 1: pinned_leaf observer
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _make_turn_cache_manager():
+    """Return a TurnCacheManager with a mocked inner trie."""
+    inner = MagicMock()
+    inner.root = MagicMock(n_tokens=0)
+    return TurnCacheManager(inner)
+
+
+def _make_adapter_and_pinned_request():
+    """Return (adapter, req) where fetch() has produced a hit and pinned a leaf."""
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+    from vllm_mlx.kv_cache import RequestCacheState
+
+    trie = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0, kv_dtype="bf16"))
+    adapter = TurnCacheManager(trie, policy=None, kv_group_size=64)
+
+    # Build a two-segment path in the trie so fetch() gets a hit.
+    from vllm_mlx.turn_prefix_cache import Segment
+    from vllm_mlx.cache_types import KVLayerSegment
+
+    def _dummy_layer(idx: int) -> KVLayerSegment:
+        return KVLayerSegment(
+            keys=mx.zeros((1, 1, 1, 1)),
+            values=mx.zeros((1, 1, 1, 1)),
+            metadata={
+                "class_name": "KVCache",
+                "layer_index": idx,
+                "merge_strategy": "concatenate",
+                "n_tokens": 1,
+            },
+        )
+
+    sys_tokens = list(range(10))
+    user_tokens = list(range(10, 15))
+    trie.insert(trie.root, Segment(role="system", token_ids=sys_tokens),
+                kv_data=[_dummy_layer(0)], is_system_prompt=True)
+    leaf_node = trie.insert(
+        trie.root.children[list(trie.root.children.keys())[0]],
+        Segment(role="user", token_ids=user_tokens),
+        kv_data=[_dummy_layer(0)],
+    )
+
+    req = MagicMock()
+    req.request_id = "req-pinned-leaf-test"
+    req.prompt_token_ids = sys_tokens + user_tokens
+    req._turn_boundaries = [len(sys_tokens)]
+    req._cache_state = RequestCacheState()
+
+    # Stub _assemble and validate so fetch() doesn't need real MLX arrays.
+    with patch.object(TurnCacheManager, "_assemble", staticmethod(lambda kv, rec, *a, **k: [object()])), \
+         patch.object(TurnCacheManager, "validate", lambda self, cache: True):
+        hit = adapter.fetch(req)
+
+    assert hit, "test setup: fetch must return True to produce a pinned leaf"
+    return adapter, req
+
+
+def test_pinned_leaf_returns_none_when_no_pin():
+    adapter = _make_turn_cache_manager()
+    assert adapter.pinned_leaf("nonexistent-request-id") is None
+
+
+def test_pinned_leaf_returns_node_after_fetch_pin():
+    adapter, req = _make_adapter_and_pinned_request()
+    leaf = adapter.pinned_leaf(req.request_id)
+    assert leaf is not None
+    assert not leaf.is_evictable  # public predicate replacing ref_count check
+
+
+def test_pinned_leaf_returns_none_after_release():
+    adapter, req = _make_adapter_and_pinned_request()
+    adapter.release(req)
+    assert adapter.pinned_leaf(req.request_id) is None
 
 
 @pytest.mark.skipif(

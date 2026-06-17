@@ -245,6 +245,15 @@ class TurnCacheManager(CacheManager):
         # Populated by fetch() on hit, advanced by store(), cleared by release().
         self._pinned_leaves: dict[str, "TurnNode"] = {}
 
+    def pinned_leaf(self, request_id: str) -> "TurnNode | None":
+        """Return the currently pinned leaf for a request, or None.
+
+        Supported observer for the Active Leaf pinning invariant
+        (CONTEXT.md). Tests and diagnostics use this; the underlying
+        ``_pinned_leaves`` dict remains private.
+        """
+        return self._pinned_leaves.get(request_id)
+
     def boundaries(self, request) -> list[int]:
         cs = request._cache_state
         cached = cs.cached_tokens if cs is not None else 0
