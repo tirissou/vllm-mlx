@@ -16,6 +16,8 @@ logic, or the `_segment`/`_assemble` pipeline, check the relevant ADR:
 - **ADR-0004** — why the decode step stays synchronous
 - **ADR-0005** — why KV segments are stored in mlx-lm native group-quantized format and
   why `_assemble` must emit `BatchQuantizedKVCache.from_quantized_arrays`, not `QuantizedKVCache`
+- **ADR-0008** — why model-specific behavior lives behind one `Architecture` class per
+  `model_type` instead of scattered monkey-patches and `model_type` switches
 
 ## Developer notes (`docs/dev/`)
 
