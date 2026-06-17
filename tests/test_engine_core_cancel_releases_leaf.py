@@ -117,11 +117,13 @@ async def test_client_disconnect_releases_pinned_leaf(model_and_tokenizer):
         # ------------------------------------------------------------------ #
         await engine.abort_request(rid2)
 
-        # Poll up to 2 s for the abort to be processed by scheduler.step(),
-        # which calls _process_pending_aborts() → _do_abort_request() → release().
-        deadline = asyncio.get_event_loop().time() + 2.0
+        # Release should fire synchronously inside abort_request via _cleanup_request.
+        # Poll as a regression guard: if a future change moves the release back into
+        # the deferred _do_abort_request path (which runs inside step()), this loop
+        # still gives it up to 2s to drain.
+        deadline = asyncio.get_running_loop().time() + 2.0
         while adapter.pinned_leaf(rid2) is not None:
-            if asyncio.get_event_loop().time() > deadline:
+            if asyncio.get_running_loop().time() > deadline:
                 break
             await asyncio.sleep(0.05)
 
