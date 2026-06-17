@@ -508,7 +508,7 @@ class TurnCacheManager(CacheManager):
 
         new_node = self._inner.insert(
             parent,
-            segment,
+            turn_segment,
             kv_data=kv_layers or None,
             recurrent_data=rec_layers or None,
             is_system_prompt=is_sys,
