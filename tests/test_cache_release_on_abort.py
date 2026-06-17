@@ -144,11 +144,37 @@ def test_abort_request_releases_pinned_leaf():
 # Test 2: aborting an unknown id is a no-op
 # ------------------------------------------------------------------ #
 def test_abort_unknown_request_id_is_noop():
-    sched = _make_scheduler()  # no requests, no cache
-    # Must not raise, must not mutate anything.
-    sched.abort_request("never-submitted-id")
+    """Aborting an unknown request_id must not pollute scheduler state or crash.
+
+    Observable behavior: finished_req_ids is updated (audit trail), but
+    the unknown id is never added to self.requests.
+    """
+    unknown_id = "never-submitted-id"
+
+    # Case 1: no cache attached, no requests
+    sched = _make_scheduler()
+    assert unknown_id not in sched.requests, "test setup: unknown id must not be in requests"
+    assert unknown_id not in sched.finished_req_ids, "test setup: unknown id must not be pre-finished"
+
+    sched.abort_request(unknown_id)
     sched._process_pending_aborts()
-    # If we got here without an exception, the test passes.
+
+    # Assertions: no phantom entry, but audit trail is recorded
+    assert unknown_id not in sched.requests, "abort of unknown id must not create phantom entry"
+    assert unknown_id in sched.finished_req_ids, "abort must record unknown id in finished_req_ids"
+
+    # Case 2: with cache attached, should still not crash or pollute scheduler
+    sched2 = _make_scheduler()
+    adapter, sys_tokens, user_tokens = _make_turn_cache_manager_with_hit()
+    sched2._prefix_cache = adapter
+
+    unknown_id_2 = "never-submitted-either"
+    sched2.abort_request(unknown_id_2)
+    sched2._process_pending_aborts()
+
+    # Even with cache, no phantom entry and audit trail recorded
+    assert unknown_id_2 not in sched2.requests, "abort with cache must not create phantom entry"
+    assert unknown_id_2 in sched2.finished_req_ids, "abort with cache must record in finished_req_ids"
 
 
 # ------------------------------------------------------------------ #
