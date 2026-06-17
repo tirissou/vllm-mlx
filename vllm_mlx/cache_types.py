@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 import mlx.core as mx
 
@@ -104,31 +104,31 @@ class KVConcatSegment(KVLayerSegment):
         from vllm_mlx.kv_cache import QuantizedArray
 
         first_bits = layers[0].bits
-        for l in layers[1:]:
-            assert l.bits == first_bits, (
+        for seg in layers[1:]:
+            assert seg.bits == first_bits, (
                 f"KVConcatSegment.concat: mismatched bits "
-                f"{first_bits!r} vs {l.bits!r}"
+                f"{first_bits!r} vs {seg.bits!r}"
             )
 
         if isinstance(layers[0].keys, QuantizedArray):
             merged_keys = QuantizedArray(
-                packed=mx.concatenate([l.keys.packed for l in layers], axis=-2),
-                scales=mx.concatenate([l.keys.scales for l in layers], axis=-2),
-                biases=mx.concatenate([l.keys.biases for l in layers], axis=-2),
+                packed=mx.concatenate([seg.keys.packed for seg in layers], axis=-2),
+                scales=mx.concatenate([seg.keys.scales for seg in layers], axis=-2),
+                biases=mx.concatenate([seg.keys.biases for seg in layers], axis=-2),
             )
             merged_values = QuantizedArray(
-                packed=mx.concatenate([l.values.packed for l in layers], axis=-2),
-                scales=mx.concatenate([l.values.scales for l in layers], axis=-2),
-                biases=mx.concatenate([l.values.biases for l in layers], axis=-2),
+                packed=mx.concatenate([seg.values.packed for seg in layers], axis=-2),
+                scales=mx.concatenate([seg.values.scales for seg in layers], axis=-2),
+                biases=mx.concatenate([seg.values.biases for seg in layers], axis=-2),
             )
         else:
-            merged_keys = mx.concatenate([l.keys for l in layers], axis=-2)
-            merged_values = mx.concatenate([l.values for l in layers], axis=-2)
+            merged_keys = mx.concatenate([seg.keys for seg in layers], axis=-2)
+            merged_values = mx.concatenate([seg.values for seg in layers], axis=-2)
         return cls(
             keys=merged_keys,
             values=merged_values,
             layer_index=layers[-1].layer_index,
-            n_tokens=sum(l.n_tokens for l in layers),
+            n_tokens=sum(seg.n_tokens for seg in layers),
             bits=first_bits,
             class_name=layers[-1].class_name,
         )

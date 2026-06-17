@@ -6,7 +6,7 @@ Replaces the old CacheTranslator tests now that linearize/quantize_kv are gone.
 import mlx.core as mx
 import pytest
 
-from vllm_mlx.cache_types import KVLayerSegment, KVConcatSegment, KVRotatingSegment, KVQuantPolicy
+from vllm_mlx.cache_types import KVConcatSegment, KVRotatingSegment, KVQuantPolicy
 from vllm_mlx.kv_cache import QuantizedArray
 from vllm_mlx.cache_translator import segment, assemble, _linearize
 
@@ -76,7 +76,7 @@ def test_concat_n_tokens_metadata_sum():
     assert merged.n_tokens == 10
 
 
-def test_concat_preserves_last_metadata():
+def test_concat_preserves_last_class_name():
     """Non-n_tokens metadata comes from the last segment."""
     seg1 = _make_kv_segment(n_tokens=2, layer_index=0)
     seg2 = KVConcatSegment(

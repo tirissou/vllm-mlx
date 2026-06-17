@@ -11,7 +11,7 @@ import pytest
 
 from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager
-from vllm_mlx.cache_types import KVLayerSegment, KVRotatingSegment, KVQuantPolicy, RecurrentLayerSegment
+from vllm_mlx.cache_types import KVRotatingSegment, KVQuantPolicy, RecurrentLayerSegment
 from vllm_mlx.cache_translator import segment, assemble
 
 

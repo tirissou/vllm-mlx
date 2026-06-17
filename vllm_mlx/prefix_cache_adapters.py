@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from vllm_mlx.turn_prefix_cache import TurnNode
 
 from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
-from .cache_types import KVLayerSegment, KVQuantPolicy, RecurrentLayerSegment
+from .cache_types import KVQuantPolicy
 from vllm_mlx.cache_translator import segment, assemble, slice_kv_to_delta
 
 logger = logging.getLogger(__name__)
