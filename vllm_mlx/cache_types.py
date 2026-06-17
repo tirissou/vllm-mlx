@@ -72,8 +72,31 @@ class KVConcatSegment(KVLayerSegment):
                 group_size=group_size,
                 bits=self.bits,
             )
-        # Float path: TODO mirror the existing float reconstruction in _assemble.
-        raise NotImplementedError("Float KVConcatSegment.reconstruct not yet wired")
+        # Float path: mirror prefix_cache_adapters.py:_assemble float branch (lines 593-626).
+        from mlx_lm.models.cache import KVCache
+
+        n_tokens = self.n_tokens
+        step = KVCache.step
+        padded_len = ((n_tokens // step) + 1) * step
+        pad = padded_len - n_tokens
+
+        k = self.keys[..., :n_tokens, :]
+        v = self.values[..., :n_tokens, :]
+        if pad > 0:
+            k = mx.concatenate(
+                [k, mx.zeros((*k.shape[:-2], pad, k.shape[-1]), dtype=k.dtype)],
+                axis=-2,
+            )
+            v = mx.concatenate(
+                [v, mx.zeros((*v.shape[:-2], pad, v.shape[-1]), dtype=v.dtype)],
+                axis=-2,
+            )
+
+        cache = KVCache()
+        cache.keys = k
+        cache.values = v
+        cache.offset = n_tokens
+        return cache
 
     @classmethod
     def concat(cls, layers: list["KVConcatSegment"]) -> "KVConcatSegment":

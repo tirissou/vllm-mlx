@@ -9,7 +9,7 @@ the seam that ADR-0005 governs.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import mlx.core as mx
 
@@ -20,10 +20,6 @@ from vllm_mlx.cache_types import (
     KVQuantPolicy,
     RecurrentLayerSegment,
 )
-
-if TYPE_CHECKING:
-    pass
-
 
 def _linearize(tensor: mx.array, offset: int, max_size: int) -> mx.array:
     if offset == max_size:
@@ -54,8 +50,6 @@ def segment(
     (mx.eval then mx.stop_gradient). Callers may delete live_states and
     call mx.clear_cache(); segment arrays survive.
     """
-    from vllm_mlx.kv_cache import QuantizedArray
-
     kv_list: list[KVLayerSegment | None] = [None] * len(live_states)
     rec_list: list[RecurrentLayerSegment | None] = [None] * len(live_states)
 
