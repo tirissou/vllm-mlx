@@ -198,7 +198,7 @@ def test_turn_cache_adapter_on_prefill_checkpoint_eagerly_inserts_turn():
     )
     kv_placeholder = KVConcatSegment(keys=qa, values=qa, layer_index=0, n_tokens=1, bits=8)
     with _patch(
-        "vllm_mlx.prefix_cache_adapters._segment_fn", return_value=([kv_placeholder], [None])
+        "vllm_mlx.prefix_cache_adapters.segment", return_value=([kv_placeholder], [None])
     ):
         extracted = [{"state": (None, None), "class_name": "KVCache"}]
         adapter.on_prefill_checkpoint(request, 5, extracted)
@@ -688,7 +688,7 @@ def test_on_prefill_checkpoint_at_boundary_inserts_node():
     )
     kv_placeholder = KVConcatSegment(keys=qa, values=qa, layer_index=0, n_tokens=1, bits=8)
     with _patch(
-        "vllm_mlx.prefix_cache_adapters._segment_fn", return_value=([kv_placeholder], [None])
+        "vllm_mlx.prefix_cache_adapters.segment", return_value=([kv_placeholder], [None])
     ):
         adapter.on_prefill_checkpoint(
             req, total_tokens_prefilled=10, extracted_cache=extracted
@@ -730,7 +730,7 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     extracted = [
         {"class_name": "BatchKVCache", "state": (None, None), "meta_state": ("10",)}
     ]
-    # Verify that on_prefill_checkpoint delegates to _segment_fn (not inner.split_cache_arrays)
+    # Verify that on_prefill_checkpoint delegates to segment (not inner.split_cache_arrays)
     import mlx.core as mx
 
     qa = QuantizedArray(
@@ -740,12 +740,12 @@ def test_on_prefill_checkpoint_does_not_read_n_minus_one_for_prefill():
     )
     kv_placeholder = KVConcatSegment(keys=qa, values=qa, layer_index=0, n_tokens=1, bits=8)
     with _patch(
-        "vllm_mlx.prefix_cache_adapters._segment_fn", return_value=([kv_placeholder], [None])
+        "vllm_mlx.prefix_cache_adapters.segment", return_value=([kv_placeholder], [None])
     ) as mock_seg:
         adapter.on_prefill_checkpoint(
             req, total_tokens_prefilled=10, extracted_cache=extracted
         )
-    # _segment_fn should have been called with extracted_cache plus policy and group_size
+    # segment should have been called with extracted_cache plus policy and group_size
     mock_seg.assert_called_once_with(
         extracted, policy=adapter._policy, group_size=adapter._kv_group_size
     )

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
 from .cache_types import KVLayerSegment, KVQuantPolicy, RecurrentLayerSegment
-from vllm_mlx.cache_translator import segment as _segment_fn, assemble, slice_kv_to_delta
+from vllm_mlx.cache_translator import segment, assemble, slice_kv_to_delta
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -397,7 +397,7 @@ class TurnCacheManager(CacheManager):
         if cache:
             prev_end = path[-1].n_tokens if path else 0
             cache = slice_kv_to_delta(cache, prev_end)
-            kv_sparse, rec_sparse = _segment_fn(
+            kv_sparse, rec_sparse = segment(
                 cache, policy=self._policy, group_size=self._kv_group_size
             )
             kv_layers = [kv for kv in kv_sparse if kv is not None]
@@ -472,8 +472,8 @@ class TurnCacheManager(CacheManager):
             return
 
         parent = turn_path[-1] if turn_path else self._inner.root
-        segment = segments[abs_idx]
-        is_sys = segment.role == "system" and abs_idx == 0
+        turn_segment = segments[abs_idx]
+        is_sys = turn_segment.role == "system" and abs_idx == 0
 
         if extracted_cache:
             if not isinstance(extracted_cache[0], dict):
@@ -486,14 +486,14 @@ class TurnCacheManager(CacheManager):
                 ]
             prev_end = _turn_boundaries[abs_idx - 1] if abs_idx > 0 else 0
             extracted_cache = slice_kv_to_delta(extracted_cache, prev_end)
-            kv_sparse, rec_sparse = _segment_fn(
+            kv_sparse, rec_sparse = segment(
                 extracted_cache, policy=self._policy, group_size=self._kv_group_size
             )
             kv_layers = [kv for kv in kv_sparse if kv is not None]
             rec_layers = [rec for rec in rec_sparse if rec is not None]
             _log_segment_breakdown(
                 f"checkpoint rid={getattr(request, 'request_id', '?')} "
-                f"abs_idx={abs_idx} tok_seg={len(segment.token_ids)} "
+                f"abs_idx={abs_idx} tok_seg={len(turn_segment.token_ids)} "
                 f"prev_end={prev_end} total={total_tokens_prefilled}",
                 kv_layers,
                 rec_layers,
