@@ -431,3 +431,86 @@ def test_turncachemanager_accepts_none_policy():
     inner = TurnPrefixCache(TurnPrefixCacheConfig())
     mgr = TurnCacheManager(inner, policy=None)
     assert mgr._policy is None
+
+
+# ── Translator module round-trip ──────────────────────────────────────────────
+
+from vllm_mlx.cache_translator import (
+    assemble,
+    segment,
+    slice_kv_to_delta,
+)
+
+
+def _live_kvcache_state(B=1, H=2, T=16, D=64):
+    keys = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    values = mx.random.normal((B, H, T, D)).astype(mx.float16)
+    mx.eval(keys, values)
+    return {"class_name": "KVCache", "state": (keys, values), "meta_state": (T,)}
+
+
+def test_segment_returns_kv_concat_segment_for_kvcache():
+    from vllm_mlx.cache_types import KVConcatSegment
+    states = [_live_kvcache_state()]
+    policy = KVQuantPolicy(full_bits=8)
+    kv_list, _ = segment(states, policy=policy, group_size=64)
+    assert isinstance(kv_list[0], KVConcatSegment)
+
+
+def test_segment_returns_kv_rotating_segment_for_rotating_kvcache():
+    from vllm_mlx.cache_types import KVRotatingSegment
+    keys = mx.random.normal((1, 2, 16, 64)).astype(mx.float16)
+    values = mx.random.normal((1, 2, 16, 64)).astype(mx.float16)
+    mx.eval(keys, values)
+    states = [{
+        "class_name": "RotatingKVCache",
+        "state": (keys, values),
+        "meta_state": (0, 16, 16, 16),
+    }]
+    policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
+    kv_list, _ = segment(states, policy=policy, group_size=64)
+    assert isinstance(kv_list[0], KVRotatingSegment)
+
+
+def test_segment_arrays_survive_source_deletion():
+    """Segment contract: emitted arrays are graph-detached from source."""
+    states = [_live_kvcache_state()]
+    policy = KVQuantPolicy(full_bits=8)
+    kv_list, _ = segment(states, policy=policy, group_size=64)
+    seg = kv_list[0]
+    del states
+    mx.clear_cache()
+    dequant_keys = mx.dequantize(
+        seg.keys.packed, seg.keys.scales, seg.keys.biases,
+        group_size=64, bits=8,
+    )
+    mx.eval(dequant_keys)
+    assert dequant_keys.shape == (1, 2, 16, 64)
+
+
+def test_assemble_inverse_of_segment_for_kvcache():
+    states = [_live_kvcache_state()]
+    policy = KVQuantPolicy(full_bits=8)
+    kv_list, _ = segment(states, policy=policy, group_size=64)
+    caches = assemble(kv_list, [], group_size=64)
+    assert len(caches) == 1
+    # Round-trip n_tokens preserved.
+    assert kv_list[0].n_tokens == 16
+
+
+def test_slice_kv_to_delta_slices_kvcache():
+    states = [_live_kvcache_state(T=32)]
+    sliced = slice_kv_to_delta(states, prev_end=16)
+    assert sliced[0]["state"][0].shape[2] == 16
+
+
+def test_slice_kv_to_delta_leaves_rotating_untouched():
+    keys = mx.random.normal((1, 2, 16, 64)).astype(mx.float16)
+    values = mx.random.normal((1, 2, 16, 64)).astype(mx.float16)
+    states = [{
+        "class_name": "RotatingKVCache",
+        "state": (keys, values),
+        "meta_state": (0, 16, 16, 16),
+    }]
+    sliced = slice_kv_to_delta(states, prev_end=8)
+    assert sliced[0]["state"][0].shape == (1, 2, 16, 64)  # untouched
