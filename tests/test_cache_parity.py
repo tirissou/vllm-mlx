@@ -53,7 +53,7 @@ def _turn_cache_quantized_config():
 
 
 def _compute_turn_boundaries(tokenizer, messages):
-    """Compute turn boundaries by scanning for <|im_end|> in the full prompt.
+    """Compute turn boundaries by scanning for common turn-end tokens in the full prompt.
 
     Mirrors BatchedEngine._compute_turn_boundaries without the server-side
     multimodal plumbing.
@@ -69,13 +69,16 @@ def _compute_turn_boundaries(tokenizer, messages):
     full_tokens = tok.encode(full_prompt)
     if not full_tokens:
         return []
-    im_end_id = (
-        tok.convert_tokens_to_ids("<|im_end|>")
-        if hasattr(tok, "convert_tokens_to_ids")
-        else None
-    )
+
     unk_id = getattr(tok, "unk_token_id", None)
-    if im_end_id is None or im_end_id == unk_id:
+    im_end_id = None
+    for token in ["<|im_end|>", "<end_of_turn>", "<|end_of_turn>"]:
+        id = tok.convert_tokens_to_ids(token) if hasattr(tok, "convert_tokens_to_ids") else None
+        if id is not None and id != unk_id:
+            im_end_id = id
+            break
+
+    if im_end_id is None:
         return []
     return [i + 1 for i, t in enumerate(full_tokens) if t == im_end_id]
 
@@ -99,14 +102,24 @@ async def _run_chat(engine, tokenizer, messages, max_tokens=20):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def model_and_tokenizer():
+@pytest.fixture(params=["mlx-community/Qwen3-0.6B-8bit", "mlx-community/gemma-4-e4b-it-4bit"], scope="module")
+def model_and_tokenizer(request):
+    # Bypass mlx_lm.load to pass strict=False: Gemma 4 multimodal checkpoints
+    # ship k_proj/v_proj/k_norm weights for KV-shared layers that the text-only
+    # gemma4_text class doesn't allocate. Those entries are unused at inference
+    # (shared layers take the shared_kv branch), so dropping them is safe.
+    from pathlib import Path
     try:
-        from mlx_lm import load
+        from mlx_lm.utils import hf_repo_to_path, load_model, load_tokenizer
 
-        return load("mlx-community/Qwen3-0.6B-8bit")
+        model_path = Path(hf_repo_to_path(request.param))
+        model, config = load_model(model_path, strict=False)
+        tokenizer = load_tokenizer(
+            model_path, eos_token_ids=config.get("eos_token_id")
+        )
+        return model, tokenizer
     except Exception as e:
-        pytest.skip(f"Model not available: {e}")
+        pytest.skip(f"Model {request.param} not available: {e}")
 
 
 # ---------------------------------------------------------------------------
