@@ -1639,6 +1639,10 @@ class Scheduler:
             request = self.running.get(request_id)
             if request is not None:
                 request.set_finished(RequestStatus.FINISHED_ABORTED)
+                # Release any pinned leaf so ref_counts return to zero and
+                # the node becomes evictable.  Mirrors _reschedule_running_requests.
+                if self._prefix_cache is not None:
+                    self._prefix_cache.release(request)
             aborted_ids.add(request_id)
             self.finished_req_ids.add(request_id)
         self.running.clear()
@@ -1767,6 +1771,11 @@ class Scheduler:
                     raise
             except Exception as e:
                 if self._is_stream_thread_error(e):
+                    # Release pinned leaves before re-raising so ref_counts
+                    # don't leak when the caller handles the stream-thread error.
+                    if self._prefix_cache is not None:
+                        for _req in list(self.running.values()):
+                            self._prefix_cache.release(_req)
                     raise
                 import traceback
 
