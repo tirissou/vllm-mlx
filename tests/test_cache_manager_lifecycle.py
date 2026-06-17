@@ -202,7 +202,7 @@ def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert user_leaf.is_evictable, "release must unpin the leaf"
     assert manager.pinned_leaf(req.request_id) is None, (
-        "release must remove the request from _pinned_leaves"
+        "release must clear the pin (pinned_leaf returns None)"
     )
     assert req._cache_state.turn_path == [], (
         "release must clear request._cache_state.turn_path"

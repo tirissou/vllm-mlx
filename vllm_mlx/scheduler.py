@@ -1771,8 +1771,12 @@ class Scheduler:
                     raise
             except Exception as e:
                 if self._is_stream_thread_error(e):
-                    # Release pinned leaves here; engine_core's _reschedule_running_requests
-                    # will also call release(), but _pinned_leaves.pop(…) gates it to a no-op.
+                    # Release pinned leaves before re-raising. The engine_core stream-thread
+                    # fallback then invokes the scheduler's _reschedule_running_requests, which
+                    # also calls release() — that second call is a safe no-op (release() pops
+                    # from _pinned_leaves; missing key is ignored). Keeping the release here
+                    # is defense in depth: if a future change short-circuits the fallback path,
+                    # leaves are already freed.
                     if self._prefix_cache is not None:
                         for _req in list(self.running.values()):
                             self._prefix_cache.release(_req)

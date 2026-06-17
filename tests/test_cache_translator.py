@@ -188,7 +188,7 @@ def test_assemble_kvcache_returns_batch_quantized_kv_cache():
 
 def test_assemble_kvcache_offset_matches_n_tokens():
     """Reconstructed cache _idx (logical length) equals original n_tokens."""
-    # TODO(task-1): migrate _idx read to public API once cache-translator PR Task 4 lands.
+    # Reads ._idx directly; refactor to use a public attribute when one is exposed.
     n_tokens = 6
     states = [_make_kvcache_state(n_tokens=n_tokens)]
     policy = KVQuantPolicy(sliding_bits=8, full_bits=8)
@@ -239,7 +239,7 @@ def test_kvcache_round_trip_shape():
     result = TurnCacheManager._assemble([merged], [], group_size=64)
     assert len(result) == 1
     # logical length should be 3 + 5 = 8
-    # TODO(task-1): migrate _idx read to public API once cache-translator PR Task 4 lands.
+    # Reads ._idx directly; refactor to use a public attribute when one is exposed.
     assert result[0]._idx == 8
 
 

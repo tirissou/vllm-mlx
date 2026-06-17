@@ -38,11 +38,11 @@ class _FakeModel:
         self.layers = []
 
 
-def _make_scheduler(config=None):
+def _make_scheduler():
     """Create a Scheduler with mocked model and tokenizer (no prefix cache)."""
     model = _FakeModel()
     tokenizer = _FakeTokenizer()
-    cfg = config or SchedulerConfig()
+    cfg = SchedulerConfig()
     scheduler = Scheduler(model, tokenizer, cfg)
     scheduler.batch_generator = None
     return scheduler
