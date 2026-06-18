@@ -628,6 +628,56 @@ def main() -> int:
         _cmp_logits("A'(prod-hit)  vs A (single-rt)", la_prod, la)
         _cmp_logits("B (fresh)     vs C (chunked)",   lb,      lc)
 
+    # ---- G: decode-vs-prefill K/V asymmetry microbenchmark ----
+    # Tests whether the SAME logical tokens produce different K/V when
+    # computed via decode (one-token-at-a-time) vs prefill (multi-token
+    # forward). Both paths end with caches over identical tokens
+    # [prompt + response]; we diff only the response-position slice.
+    #
+    #   Path P1 (decode pattern, = production trie storage for assistant turns):
+    #     prefill(prompt) -> for tok in response: model([tok], cache)
+    #     Mirrors the original session's generation phase. The K/V the trie
+    #     stores for assistant turns are produced by this code path.
+    #
+    #   Path P2 (prefill pattern, = production cache-miss fresh prefill):
+    #     model(prompt + response, cache=empty) in one chunk.
+    #     Mirrors a new session re-prefilling the same conversation as one
+    #     prompt — the assistant tokens get processed as prompt, not decode.
+    #
+    # If the response-position slice differs at bf16, decode-mode and
+    # prefill-mode produce non-bit-equal K/V for the same logical tokens.
+    # That asymmetry makes every cache hit semantically different from a
+    # cache miss even when chunking shapes are otherwise identical.
+    #
+    # Loops only over assistant deltas (odd indices in our user/assistant
+    # alternation starting at delta[0] = system+user_1).
+    print("\n---- G: decode-vs-prefill K/V asymmetry ----")
+    for turn_i in range(1, len(turn_prompts), 2):
+        prompt_tokens = turn_prompts[turn_i - 1]
+        response_tokens = deltas[turn_i]
+        n_prompt = int(prompt_tokens.shape[0])
+
+        cache_p1 = make_prompt_cache(model)
+        _prefill(model, prompt_tokens, cache_p1)
+        for k in range(int(response_tokens.shape[0])):
+            tok = response_tokens[k : k + 1]
+            out = model(tok[None], cache=cache_p1)
+            eval_args = [out]
+            for layer in cache_p1:
+                for arr in _flatten_arrays(getattr(layer, "state", ())):
+                    eval_args.append(arr)
+            mx.eval(*eval_args)
+
+        cache_p2 = make_prompt_cache(model)
+        _prefill(model, turn_prompts[turn_i], cache_p2)
+
+        diffs = _diff_caches(
+            f"G:decode-vs-prefill turn={turn_i}",
+            cache_p2, cache_p1,
+            split_at=n_prompt,
+        )
+        _print_diff_table("G:decode-vs-prefill", turn_i, diffs)
+
     print("\ndone.")
     return 0
 
