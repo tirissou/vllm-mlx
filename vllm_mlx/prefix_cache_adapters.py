@@ -216,10 +216,15 @@ class TurnCacheManager(CacheManager):
         inner: TurnPrefixCache,
         policy: KVQuantPolicy | None = None,
         kv_group_size: int = 64,
+        verify_model: Any = None,
     ):
         self._inner = inner
         self._policy = policy
         self._kv_group_size = kv_group_size
+        # Optional model reference used by the VLLM_MLX_VERIFY_FETCH_KV diagnostic.
+        # Holding the model here keeps fetch()'s signature stable while letting us
+        # run a reference forward pass on demand.
+        self._verify_model = verify_model
         # request_id -> currently pinned leaf node (Active Leaf invariant).
         # Populated by fetch() on hit, advanced by store(), cleared by release().
         self._pinned_leaves: dict[str, "TurnNode"] = {}
@@ -351,7 +356,436 @@ class TurnCacheManager(CacheManager):
             cs.prefill_boundaries = self.boundaries(request)
         # Record the pinned leaf so release() can find it.
         self._pinned_leaves[request.request_id] = path[-1]
+
+        if os.environ.get("VLLM_MLX_VERIFY_FETCH_KV") == "1":
+            try:
+                self._verify_fetched_kv(request, reconstructed, cached_tokens)
+            except Exception as e:
+                logger.warning("[verify_kv] failed: %s", e)
+
         return True
+
+    def _verify_fetched_kv(self, request, reconstructed, cached_tokens: int) -> None:
+        """Diff the just-reconstructed cache against a fresh prefill of the same prefix.
+
+        Gated by VLLM_MLX_VERIFY_FETCH_KV=1. Expensive — runs an extra forward pass
+        over `cached_tokens` tokens at every cache hit. Logs per-layer-class max/mean
+        absolute diffs on K and V. If diffs are ~0, the segment/assemble/merge round
+        trip is exonerated at this turn; any quality drift comes from elsewhere.
+        """
+        if self._verify_model is None:
+            logger.warning("[verify_kv] no model registered; skipping verification")
+            return
+        if cached_tokens <= 0:
+            return
+
+        from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+
+        tokens = list(request.prompt_token_ids[:cached_tokens])
+        tokens_arr = mx.array(tokens)
+
+        fresh = make_prompt_cache(self._verify_model)
+        out = self._verify_model(tokens_arr[None], cache=fresh)
+        eval_args: list = [out]
+        for layer in fresh:
+            k = getattr(layer, "keys", None)
+            v = getattr(layer, "values", None)
+            if isinstance(k, mx.array):
+                eval_args.append(k)
+            if isinstance(v, mx.array):
+                eval_args.append(v)
+        mx.eval(*eval_args)
+
+        # Determinism control: run a SECOND identical one-shot prefill and diff
+        # fresh-vs-fresh2. If non-zero, MLX itself has run-to-run nondeterminism
+        # on this batch shape; if zero, the prefill function is deterministic at
+        # batch=1 shape and any rec-vs-fresh diff must be coming from elsewhere
+        # (chunked prefill kernels, batch-dim kernels, etc.). Gated by a separate
+        # env var so it's opt-in (doubles the verify cost again).
+        do_determinism_check = os.environ.get("VLLM_MLX_VERIFY_DETERMINISM") == "1"
+        fresh2 = None
+        if do_determinism_check:
+            fresh2 = make_prompt_cache(self._verify_model)
+            out2 = self._verify_model(tokens_arr[None], cache=fresh2)
+            eval2: list = [out2]
+            for layer in fresh2:
+                k = getattr(layer, "keys", None)
+                v = getattr(layer, "values", None)
+                if isinstance(k, mx.array):
+                    eval2.append(k)
+                if isinstance(v, mx.array):
+                    eval2.append(v)
+            mx.eval(*eval2)
+            # Diff fresh vs fresh2 with the same KVCache/RotatingKVCache logic
+            # we use below, but inline since it's a self-contained sanity probe.
+            self_max_k = 0.0
+            self_max_v = 0.0
+            for f1, f2 in zip(fresh, fresh2):
+                k1 = getattr(f1, "keys", None)
+                k2 = getattr(f2, "keys", None)
+                v1 = getattr(f1, "values", None)
+                v2 = getattr(f2, "values", None)
+                if not (isinstance(k1, mx.array) and isinstance(k2, mx.array)):
+                    continue
+                n1 = int(getattr(f1, "offset", k1.shape[-2]))
+                n2 = int(getattr(f2, "offset", k2.shape[-2]))
+                n = min(n1, n2)
+                if n <= 0:
+                    continue
+                dk = mx.abs(k1[..., :n, :].astype(mx.float32)
+                            - k2[..., :n, :].astype(mx.float32))
+                dv = mx.abs(v1[..., :n, :].astype(mx.float32)
+                            - v2[..., :n, :].astype(mx.float32))
+                mx.eval(dk, dv)
+                self_max_k = max(self_max_k, float(dk.max().item()))
+                self_max_v = max(self_max_v, float(dv.max().item()))
+            del out2, eval2
+            logger.warning(
+                "[verify_kv:determinism] fresh-vs-fresh max_K=%.3e max_V=%.3e %s",
+                self_max_k, self_max_v,
+                "(DETERMINISTIC at batch=1)" if (self_max_k == 0.0 and self_max_v == 0.0)
+                else "(NONDETERMINISTIC — diff source includes MLX itself)",
+            )
+
+        if len(fresh) != len(reconstructed):
+            logger.warning(
+                "[verify_kv] layer-count mismatch: fresh=%d reconstructed=%d (skipping)",
+                len(fresh), len(reconstructed),
+            )
+            return
+
+        # Per-class aggregation. Beyond abs/mean diffs we track:
+        # - relative diff (= abs / max(|rec|, |fresh|) + eps): distinguishes bf16 noise
+        #   on large-magnitude attention-sink K values from real round-trip bugs.
+        # - worst layer index + position + |K|/|V| magnitudes at that position: lets us
+        #   see whether the worst element sits on a known-outlier slot (BOS/sinks) or
+        #   on an arbitrary token.
+        from collections import defaultdict
+        agg: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "n": 0, "n_tok": 0,
+                "max_k": 0.0, "max_v": 0.0,
+                "sum_mean_k": 0.0, "sum_mean_v": 0.0,
+                "max_rel_k": 0.0, "max_rel_v": 0.0,
+                "worst_k_layer": -1, "worst_k_pos": -1,
+                "worst_k_rec_mag": 0.0, "worst_k_fresh_mag": 0.0,
+                "worst_v_layer": -1, "worst_v_pos": -1,
+                "worst_v_rec_mag": 0.0, "worst_v_fresh_mag": 0.0,
+            }
+        )
+
+        for layer_idx, (rec_layer, fresh_layer) in enumerate(zip(reconstructed, fresh)):
+            cname = type(fresh_layer).__name__
+            try:
+                if isinstance(fresh_layer, RotatingKVCache):
+                    # Rotating layer: compare last `rec._idx` of fresh against the
+                    # whole reconstructed buffer (which already holds the most-recent
+                    # sliding-window-sized slice in temporal order).
+                    n = int(rec_layer._idx)
+                    if n <= 0:
+                        continue
+                    rec_k = rec_layer.keys[..., :n, :]
+                    rec_v = rec_layer.values[..., :n, :]
+                    fresh_k = fresh_layer.keys[..., -n:, :]
+                    fresh_v = fresh_layer.values[..., -n:, :]
+                elif isinstance(fresh_layer, KVCache):
+                    # Concat layer: compare the first `offset` tokens of both buffers
+                    # (both are stored in absolute order).
+                    n = int(rec_layer.offset)
+                    if n <= 0:
+                        continue
+                    rec_k = rec_layer.keys[..., :n, :]
+                    rec_v = rec_layer.values[..., :n, :]
+                    fresh_k = fresh_layer.keys[..., :n, :]
+                    fresh_v = fresh_layer.values[..., :n, :]
+                else:
+                    continue
+            except Exception as e:
+                logger.warning("[verify_kv] layer %s skipped: %s", cname, e)
+                continue
+
+            rk = rec_k.astype(mx.float32)
+            fk = fresh_k.astype(mx.float32)
+            rv = rec_v.astype(mx.float32)
+            fv = fresh_v.astype(mx.float32)
+
+            dk = mx.abs(rk - fk)
+            dv = mx.abs(rv - fv)
+            denom_k = mx.maximum(mx.abs(rk), mx.abs(fk)) + 1e-6
+            denom_v = mx.maximum(mx.abs(rv), mx.abs(fv)) + 1e-6
+            rdk = dk / denom_k
+            rdv = dv / denom_v
+
+            # Per-position projections: max over all axes except the sequence axis.
+            # Tensor shape is (1, H, n, D) — sequence axis is index -2.
+            collapse = tuple(i for i in range(dk.ndim) if i != dk.ndim - 2)
+            pos_dk = dk.max(axis=collapse)
+            pos_dv = dv.max(axis=collapse)
+            pos_rk = mx.abs(rk).max(axis=collapse)
+            pos_fk = mx.abs(fk).max(axis=collapse)
+            pos_rv = mx.abs(rv).max(axis=collapse)
+            pos_fv = mx.abs(fv).max(axis=collapse)
+
+            mx.eval(dk, dv, rdk, rdv, pos_dk, pos_dv, pos_rk, pos_fk, pos_rv, pos_fv)
+
+            max_k = float(dk.max().item())
+            max_v = float(dv.max().item())
+            worst_pos_k = int(pos_dk.argmax().item())
+            worst_pos_v = int(pos_dv.argmax().item())
+
+            g = agg[cname]
+            g["n"] += 1
+            g["n_tok"] = n
+            if max_k > g["max_k"]:
+                g["max_k"] = max_k
+                g["worst_k_layer"] = layer_idx
+                g["worst_k_pos"] = worst_pos_k
+                g["worst_k_rec_mag"] = float(pos_rk.flatten()[worst_pos_k].item())
+                g["worst_k_fresh_mag"] = float(pos_fk.flatten()[worst_pos_k].item())
+            if max_v > g["max_v"]:
+                g["max_v"] = max_v
+                g["worst_v_layer"] = layer_idx
+                g["worst_v_pos"] = worst_pos_v
+                g["worst_v_rec_mag"] = float(pos_rv.flatten()[worst_pos_v].item())
+                g["worst_v_fresh_mag"] = float(pos_fv.flatten()[worst_pos_v].item())
+            g["max_rel_k"] = max(g["max_rel_k"], float(rdk.max().item()))
+            g["max_rel_v"] = max(g["max_rel_v"], float(rdv.max().item()))
+            g["sum_mean_k"] += float(dk.mean().item())
+            g["sum_mean_v"] += float(dv.mean().item())
+
+        # Free the reference prefill ASAP — it doubled (or tripled, with the
+        # determinism control) active memory for this call.
+        del fresh, out, eval_args
+        if fresh2 is not None:
+            del fresh2
+        mx.clear_cache()
+
+        parts = []
+        for cname, g in sorted(agg.items()):
+            n = g["n"]
+            parts.append(
+                f"{cname} layers={n} tok={g['n_tok']} | "
+                f"abs max_K={g['max_k']:.3e} max_V={g['max_v']:.3e} "
+                f"mean_K={g['sum_mean_k']/n:.3e} mean_V={g['sum_mean_v']/n:.3e} | "
+                f"rel max_K={g['max_rel_k']:.3e} max_V={g['max_rel_v']:.3e} | "
+                f"worst_K L={g['worst_k_layer']} pos={g['worst_k_pos']} "
+                f"|rec|={g['worst_k_rec_mag']:.2f} |fresh|={g['worst_k_fresh_mag']:.2f} | "
+                f"worst_V L={g['worst_v_layer']} pos={g['worst_v_pos']} "
+                f"|rec|={g['worst_v_rec_mag']:.2f} |fresh|={g['worst_v_fresh_mag']:.2f}"
+            )
+        rid = getattr(request, "request_id", "?")
+        logger.warning(
+            "[verify_kv] req=%s cached_tokens=%d | %s",
+            rid[:12] if isinstance(rid, str) else rid,
+            cached_tokens,
+            " | ".join(parts) if parts else "(no comparable layers)",
+        )
+
+        if os.environ.get("VLLM_MLX_VERIFY_SCAN") == "1":
+            try:
+                self._scan_M_regimes(tokens_arr, cached_tokens)
+            except Exception as e:
+                logger.warning("[verify_kv:scan] failed: %s", e)
+
+        if os.environ.get("VLLM_MLX_VERIFY_CHUNK_SCAN") == "1":
+            try:
+                self._scan_chunking(tokens_arr, cached_tokens)
+            except Exception as e:
+                logger.warning("[verify_kv:chunk_scan] failed: %s", e)
+
+    def _scan_M_regimes(self, tokens_arr: mx.array, cached_tokens: int) -> None:
+        """Scan matmul kernel-shape regimes by varying input length M.
+
+        Takes the first 64 real tokens of the cached prefix and runs the model
+        with input lengths M ∈ {64, 128, 256, 512, 1024, 2048, 4096}, padding
+        with zeros. Diffs layer-0 K and V at [..., :64, :] pairwise across M
+        values: two M values whose results are bit-identical share a matmul
+        kernel regime; differing values straddle a regime boundary.
+
+        Layer-0 K, V = W_{K,V} @ RMSNorm(embed[t]) are purely per-position, so
+        the attention mask is irrelevant for this measurement (dummy pad tokens
+        contaminate higher-layer K, V via attention, but not L=0).
+
+        Gated by VLLM_MLX_VERIFY_SCAN=1.
+        """
+        if cached_tokens < 64:
+            logger.warning(
+                "[verify_kv:scan] cached_tokens=%d < 64, skipping", cached_tokens
+            )
+            return
+
+        from mlx_lm.models.cache import make_prompt_cache
+
+        n_real = 64
+        candidates = [64, 128, 256, 512, 1024, 2048, 4096]
+        scan_lengths = sorted({M for M in candidates if M >= n_real})
+        real_tokens = tokens_arr[:n_real]
+
+        scan_KV: list[tuple[int, mx.array, mx.array]] = []
+        layer0_type: str | None = None
+        for M in scan_lengths:
+            pad = M - n_real
+            if pad > 0:
+                padded = mx.concatenate(
+                    [real_tokens, mx.zeros((pad,), dtype=real_tokens.dtype)]
+                )
+            else:
+                padded = real_tokens
+            c = make_prompt_cache(self._verify_model)
+            _out = self._verify_model(padded[None], cache=c)
+            layer0 = c[0] if len(c) > 0 else None
+            if layer0_type is None and layer0 is not None:
+                layer0_type = type(layer0).__name__
+            keys = getattr(layer0, "keys", None) if layer0 is not None else None
+            values = getattr(layer0, "values", None) if layer0 is not None else None
+            if isinstance(keys, mx.array) and isinstance(values, mx.array):
+                k0 = mx.contiguous(keys[..., :n_real, :].astype(mx.float32))
+                v0 = mx.contiguous(values[..., :n_real, :].astype(mx.float32))
+                mx.eval(k0, v0)
+                scan_KV.append((M, k0, v0))
+            del c, _out
+            mx.clear_cache()
+
+        if len(scan_KV) < 2:
+            logger.warning(
+                "[verify_kv:scan] only %d valid M values collected, skipping",
+                len(scan_KV),
+            )
+            return
+
+        for kind_idx, kind in enumerate(("K", "V"), start=1):
+            header = "        " + "  ".join(f"M={M:>5}" for M, *_ in scan_KV)
+            rows = [header]
+            for i in range(len(scan_KV)):
+                Mi = scan_KV[i][0]
+                Ai = scan_KV[i][kind_idx]
+                cells = []
+                for j in range(len(scan_KV)):
+                    if i == j:
+                        cells.append("    .   ")
+                        continue
+                    Aj = scan_KV[j][kind_idx]
+                    d = float(mx.abs(Ai - Aj).max().item())
+                    cells.append(f"{d:7.2e}")
+                rows.append(f"M={Mi:>5} " + "  ".join(cells))
+            logger.warning(
+                "[verify_kv:scan] layer-0 %s[0..%d) (%s) pairwise diff (fp32):\n%s",
+                kind, n_real, layer0_type or "?", "\n".join(rows),
+            )
+        del scan_KV
+        mx.clear_cache()
+
+    def _scan_chunking(self, tokens_arr: mx.array, cached_tokens: int) -> None:
+        """Compare prefill K, V from different chunking schedules at same positions.
+
+        Prefills the same physical token range under different chunking
+        schedules and diffs the resulting K, V at matching positions across
+        several probe layers.
+
+        Layer 0 K, V depend only on input embedding — invariant to chunking
+        unless the M-regime cliff hits W_{K,V}. Layer 1+ K, V depend on
+        attention output, which sees different T_kv shapes under different
+        schedules — diff here measures chunking-induced drift in production.
+
+        N is set via VLLM_MLX_VERIFY_CHUNK_SCAN_N (default 1024). Lower N
+        works on models with sliding-window max_size < 2048 (e.g. Gemma 4 MoE,
+        max_size=1024). Schedules are auto-derived: 1xN, 2x(N/2), 4x(N/4),
+        8x(N/8) — skipping any chunk size below 64.
+
+        Gated by VLLM_MLX_VERIFY_CHUNK_SCAN=1.
+        """
+        from mlx_lm.models.cache import make_prompt_cache
+
+        try:
+            N = int(os.environ.get("VLLM_MLX_VERIFY_CHUNK_SCAN_N", "1024"))
+        except (TypeError, ValueError):
+            N = 1024
+        if cached_tokens < N:
+            logger.warning(
+                "[verify_kv:chunk_scan] cached_tokens=%d < %d, skipping",
+                cached_tokens, N,
+            )
+            return
+
+        real_tokens = tokens_arr[:N]
+        schedules: list[tuple[str, list[int]]] = []
+        for divisor in (1, 2, 4, 8):
+            chunk_size = N // divisor
+            if chunk_size < 64 or N % divisor != 0:
+                continue
+            schedules.append((f"{divisor}x{chunk_size}", [chunk_size] * divisor))
+
+        # Probe a small set of representative layers.
+        sample_cache = make_prompt_cache(self._verify_model)
+        n_layers = len(sample_cache)
+        probe_layers = sorted({0, 1, max(1, n_layers // 2), n_layers - 1})
+        layer_types: dict[int, str] = {L: type(sample_cache[L]).__name__ for L in probe_layers}
+        del sample_cache
+        mx.clear_cache()
+
+        # results[i] = (schedule_name, {layer_idx: (K_fp32, V_fp32)})
+        results: list[tuple[str, dict[int, tuple[mx.array, mx.array]]]] = []
+        for name, chunks in schedules:
+            c = make_prompt_cache(self._verify_model)
+            cursor = 0
+            for chunk_size in chunks:
+                chunk = real_tokens[cursor : cursor + chunk_size]
+                _ = self._verify_model(chunk[None], cache=c)
+                cursor += chunk_size
+            layer_dump: dict[int, tuple[mx.array, mx.array]] = {}
+            for L in probe_layers:
+                if L >= len(c):
+                    continue
+                layer = c[L]
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                if isinstance(keys, mx.array) and isinstance(values, mx.array):
+                    # Take only positions in [0, N). For RotatingKVCache the
+                    # buffer may be smaller than N when max_size < N — skip
+                    # those layers since cross-schedule comparison is undefined.
+                    if keys.shape[-2] < N or values.shape[-2] < N:
+                        continue
+                    k = mx.contiguous(keys[..., :N, :].astype(mx.float32))
+                    v = mx.contiguous(values[..., :N, :].astype(mx.float32))
+                    mx.eval(k, v)
+                    layer_dump[L] = (k, v)
+            results.append((name, layer_dump))
+            del c
+            mx.clear_cache()
+
+        # Emit a pairwise matrix per (layer, K/V).
+        for L in probe_layers:
+            lt = layer_types.get(L, "?")
+            for kind_pos, kind in enumerate(("K", "V")):
+                header = "             " + "  ".join(f"{n:>10}" for n, _ in results)
+                rows = [header]
+                any_missing = False
+                for i, (ni, di) in enumerate(results):
+                    if L not in di:
+                        rows.append(f"{ni:>10} (missing — buffer < {N})")
+                        any_missing = True
+                        continue
+                    cells = []
+                    for j, (nj, dj) in enumerate(results):
+                        if i == j:
+                            cells.append("    .     ")
+                            continue
+                        if L not in dj:
+                            cells.append("    ?     ")
+                            continue
+                        ai = di[L][kind_pos]
+                        aj = dj[L][kind_pos]
+                        d = float(mx.abs(ai - aj).max().item())
+                        cells.append(f"{d:9.2e}")
+                    rows.append(f"{ni:>10}    " + "  ".join(cells))
+                if any_missing and all(L not in di for _, di in results):
+                    continue
+                logger.warning(
+                    "[verify_kv:chunk_scan] L=%d (%s) %s @ [0..%d) pairwise diff (fp32):\n%s",
+                    L, lt, kind, N, "\n".join(rows),
+                )
+        del results
+        mx.clear_cache()
 
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:
         from .turn_prefix_cache import Segment

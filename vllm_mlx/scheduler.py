@@ -715,6 +715,7 @@ def _build_prefix_cache(config: "SchedulerConfig", model: Any) -> _PrefixCacheBu
             turn_cache,
             policy=policy,
             kv_group_size=config.kv_cache_quantization_group_size,
+            verify_model=model,
         )
         logger.info(
             f"TurnPrefixCache enabled: stride={config.turn_cache_stride} "
