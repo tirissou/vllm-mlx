@@ -312,6 +312,11 @@ def main() -> int:
                          "mask + precise fp32 softmax + matmul). Tests whether the "
                          "fused Metal kernel's shape-dependent behaviour is the cause "
                          "of chunked-prefill drift.")
+    ap.add_argument("--fp32", action="store_true",
+                    help="Cast model parameters to fp32 after load. Tests whether bf16 "
+                         "matmul shape-dependence is the cause: if C collapses to ~0 "
+                         "under fp32, bf16 precision is the culprit. Use a non-quantized "
+                         "model for a clean test (e.g. mlx-community/Qwen3-0.6B).")
     args = ap.parse_args()
 
     if args.unfused_sdpa:
@@ -320,6 +325,18 @@ def main() -> int:
 
     print(f"loading model: {args.model}")
     model, tokenizer = load(args.model)
+    if args.fp32:
+        from mlx.utils import tree_map
+        _float_dtypes = {mx.float16, mx.bfloat16}
+        def _cast(x):
+            if not isinstance(x, mx.array):
+                return x
+            if x.dtype in _float_dtypes:
+                return x.astype(mx.float32)
+            return x  # leave packed uint32 weights, int indices, etc. alone
+        model.update(tree_map(_cast, model.parameters()))
+        mx.eval(model.parameters())
+        print("model parameters cast to fp32 (scales/biases for quantized layers)")
     policy = KVQuantPolicy(
         sliding_bits=args.sliding_bits,
         full_bits=args.full_bits,
