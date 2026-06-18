@@ -481,6 +481,29 @@ def main() -> int:
         )
         _print_diff_table("D:padded-vs-stock", turn_i, diffs)
 
+    # ---- Round-trip E: causality test — fresh prefill at two lengths ----
+    # Two single-shot prefills, no continuation, no cache_translator. If the
+    # model is causal at fp32, K[0:N] from a length-N prefill must equal K[0:N]
+    # from a length-M prefill (M > N), because token p only attends to 0..p
+    # regardless of total length.
+    print("\n---- E: fresh-vs-fresh at two prefill lengths (causality test) ----")
+    for turn_i in range(1, len(turn_prompts)):
+        short_tokens = turn_prompts[turn_i - 1]
+        long_tokens = turn_prompts[turn_i]
+        short_len = int(short_tokens.shape[0])
+
+        cache_short = make_prompt_cache(model)
+        _prefill(model, short_tokens, cache_short)
+
+        cache_long = make_prompt_cache(model)
+        _prefill(model, long_tokens, cache_long)
+
+        diffs = _diff_caches(
+            f"E:fresh-vs-fresh short={short_len} long={int(long_tokens.shape[0])}",
+            cache_short, cache_long,
+        )
+        _print_diff_table(f"E:fresh-{short_len}-vs-{int(long_tokens.shape[0])}", turn_i, diffs)
+
     print("\ndone.")
     return 0
 
