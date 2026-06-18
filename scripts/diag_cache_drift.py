@@ -504,29 +504,35 @@ def main() -> int:
         )
         _print_diff_table(f"E:fresh-{short_len}-vs-{int(long_tokens.shape[0])}", turn_i, diffs)
 
-    # ---- F: three-way next-token logits comparison ----
-    # Builds cache state up to each turn boundary three ways and diffs the
+    # ---- F: next-token logits comparison across cache-build paths ----
+    # Builds cache state up to each turn boundary several ways and diffs the
     # logits that would be sampled for the next assistant token. Runs at the
-    # script's current precision (bf16 by default, fp32 with --fp32) — the
-    # delta between the two runs is what tells us whether bf16 alone explains
-    # the production-observed quality drift.
+    # script's current precision (bf16 by default, fp32 with --fp32).
     #
-    #   Path A (cache-hit): chunked prefill of deltas[0..i-1]
-    #                       -> segment -> assemble (mimics trie deserialise)
-    #   Path B (single-shot fresh): one _prefill of turn_prompts[i-1]
-    #   Path C (chunked from scratch): chunked prefill of deltas[0..i-1] on a
-    #                                  stock cache, no segment/assemble
+    #   Path A (single round-trip):
+    #     one chunked prefill of deltas[0..i-1] -> one segment -> assemble.
+    #     Tests the segment/assemble pair in isolation.
+    #
+    #   Path A' (production cache-hit):
+    #     per-turn: chunked-prefill delta -> slice_kv_to_delta -> segment, store
+    #     separately per turn. On hit: walk trie, collect per-layer segments,
+    #     KVConcatSegment.merge_path(items) -> assemble. Mirrors what
+    #     TurnPrefixCache.collect_path_data does (turn_prefix_cache.py:357-386).
+    #
+    #   Path B  (single-shot fresh): one _prefill of turn_prompts[i-1].
+    #   Path C  (chunked from scratch, = production cache-miss):
+    #     chunked prefill of deltas[0..i-1] on a stock cache, no translator.
     #
     # Probe: forward deltas[i] (next turn's user tokens) on each cache; read
-    # last-position logits. All three caches receive the identical probe, so
-    # any logit difference comes from pre-existing cache state.
+    # last-position logits. All caches receive the identical probe, so any
+    # logit difference comes from pre-existing cache state.
     #
     # Reading the output:
-    #   - A vs C ~= 0  ->  cache layer (segment/assemble) is innocent in bf16
-    #   - B vs C >> 0  ->  bf16 chunked-vs-single-shot prefill alone diverges
-    #   - A vs B ~ B vs C  ->  cache hit ~= "single-shot fresh", both differ
-    #                          from production no-cache chunked path
-    print("\n---- F: three-way next-token logits comparison ----")
+    #   - A  vs C ~ 0    -> single segment/assemble round-trip is lossless
+    #   - A' vs C >> 0   -> per-turn path-merge introduces error production sees
+    #   - A' vs A  >> 0  -> the path-merge step is the source of that error
+    #   - B  vs C >> 0   -> bf16 single-shot vs chunked diverges (precision)
+    print("\n---- F: next-token logits comparison across cache-build paths ----")
 
     def _chunked_build(deltas_subset: list) -> list:
         c = make_prompt_cache(model)
@@ -564,29 +570,63 @@ def main() -> int:
               f"top{top_k}_overlap={overlap}/{top_k}  "
               f"KL={kl:>9.3e}")
 
+    # Build Path A' segments incrementally across turns, mirroring how production
+    # stores each turn's delta as its own trie node.
+    per_layer_kv_segs: dict[int, list] = {}
+    per_layer_rec_segs: dict[int, list] = {}
+    cache_prod_running = make_prompt_cache(model)
+    prev_end = 0
+
     for turn_i in range(1, len(turn_prompts)):
         probe_delta = deltas[turn_i]
 
+        # Path A: single round-trip — one chunked build, one segment+assemble.
         cache_src = _chunked_build(deltas[:turn_i])
-        states = _clone_cache_state(cache_src)
-        kv_segs, rec_segs = segment(states, policy=policy)
-        cache_a = assemble(kv_segs, rec_segs)
+        states_full = _clone_cache_state(cache_src)
+        kv_segs_full, rec_segs_full = segment(states_full, policy=policy)
+        cache_a = assemble(kv_segs_full, rec_segs_full)
 
+        # Path A': production cache-hit — extend running cache with this turn's
+        # delta, slice to delta, segment, accumulate; then merge_path + assemble.
+        delta_this_turn = deltas[turn_i - 1]
+        _prefill(model, delta_this_turn, cache_prod_running)
+        states_running = _clone_cache_state(cache_prod_running)
+        sliced = slice_kv_to_delta(states_running, prev_end)
+        kv_segs_turn, rec_segs_turn = segment(sliced, policy=policy)
+        for s in kv_segs_turn:
+            if s is not None:
+                per_layer_kv_segs.setdefault(s.layer_index, []).append(s)
+        for r in rec_segs_turn:
+            if r is not None:
+                li = r.metadata["layer_index"]
+                per_layer_rec_segs.setdefault(li, []).append(r)
+        merged_kv = [
+            per_layer_kv_segs[li][-1].merge_path(per_layer_kv_segs[li])
+            for li in sorted(per_layer_kv_segs)
+        ]
+        merged_rec = [v[-1] for _, v in sorted(per_layer_rec_segs.items())]
+        cache_a_prod = assemble(merged_kv, merged_rec)
+        prev_end = int(turn_prompts[turn_i - 1].shape[0])
+
+        # Path B: single-shot fresh prefill of the whole prefix.
         cache_b = make_prompt_cache(model)
         _prefill(model, turn_prompts[turn_i - 1], cache_b)
 
+        # Path C: chunked prefill from scratch (no segment/assemble).
         cache_c = _chunked_build(deltas[:turn_i])
 
-        la = _next_logits(cache_a, probe_delta)
-        lb = _next_logits(cache_b, probe_delta)
-        lc = _next_logits(cache_c, probe_delta)
+        la       = _next_logits(cache_a,      probe_delta)
+        la_prod  = _next_logits(cache_a_prod, probe_delta)
+        lb       = _next_logits(cache_b,      probe_delta)
+        lc       = _next_logits(cache_c,      probe_delta)
 
         print(f"\n[F:logits turn={turn_i} "
               f"prefix_len={int(turn_prompts[turn_i - 1].shape[0])} "
               f"probe_len={int(probe_delta.shape[0])}]")
-        _cmp_logits("A(cache-hit) vs B(fresh)",   la, lb)
-        _cmp_logits("A(cache-hit) vs C(chunked)", la, lc)
-        _cmp_logits("B(fresh)     vs C(chunked)", lb, lc)
+        _cmp_logits("A (single-rt) vs C (chunked)",   la,      lc)
+        _cmp_logits("A'(prod-hit)  vs C (chunked)",   la_prod, lc)
+        _cmp_logits("A'(prod-hit)  vs A (single-rt)", la_prod, la)
+        _cmp_logits("B (fresh)     vs C (chunked)",   lb,      lc)
 
     print("\ndone.")
     return 0
