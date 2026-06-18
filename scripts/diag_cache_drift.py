@@ -92,6 +92,74 @@ class LayerDiff:
     new_mean_v: float | None = None
 
 
+def _install_unfused_sdpa() -> None:
+    """Replace mx.fast.scaled_dot_product_attention with an explicit Python impl.
+
+    Mirrors the pattern in vllm_mlx/patches/mlx_lm_quantized_sdpa.py:
+        scores = Q @ K^T * scale
+        scores += additive mask (lower-right causal)
+        scores = softmax(precise=True)
+        out = scores @ V
+
+    Lower-right alignment matches `mask="causal"`: for shapes (T_q, T_kv) with
+    T_q <= T_kv, query i (in 0..T_q-1) attends to keys [0..(T_kv - T_q + i)].
+
+    Also walks sys.modules and overwrites mlx_lm.models.*'s already-bound
+    `scaled_dot_product_attention` so models that did
+    `from .base import scaled_dot_product_attention` pick up the new impl.
+    """
+    import sys
+    import mlx_lm.models.base as _base
+
+    def _unfused(queries, keys, values, *, scale, mask=None, sinks=None):
+        # GQA: keys / values may have fewer heads than queries.
+        n_q = queries.shape[1]
+        n_kv = keys.shape[1]
+        if n_q != n_kv:
+            repeats = n_q // n_kv
+            keys = mx.repeat(keys, repeats, axis=1)
+            values = mx.repeat(values, repeats, axis=1)
+
+        scores = mx.matmul(queries * scale, keys.swapaxes(-1, -2))
+        qL, kL = scores.shape[-2], scores.shape[-1]
+
+        if mask is None or (isinstance(mask, str) and mask == "causal"):
+            q_idx = mx.arange(kL - qL, kL)
+            k_idx = mx.arange(kL)
+            causal = q_idx[:, None] >= k_idx[None]
+            scores = mx.where(causal, scores, mx.finfo(scores.dtype).min)
+        elif isinstance(mask, mx.array):
+            if mask.dtype == mx.bool_:
+                scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+            else:
+                scores = scores + mask
+        # Else: unrecognised mask type — leave scores alone (will likely error in softmax).
+
+        if sinks is not None:
+            raise NotImplementedError("unfused SDPA does not implement attention sinks")
+
+        scores = mx.softmax(scores, axis=-1, precise=True)
+        return mx.matmul(scores, values)
+
+    mx.fast.scaled_dot_product_attention = _unfused
+
+    # mlx-lm wraps mx.fast.scaled_dot_product_attention in its own dispatcher
+    # function and many model modules did `from .base import scaled_dot_product_attention`
+    # at import time. Patch the base wrapper too, and any already-imported model
+    # module that has a rebound name.
+    def _patched_wrapper(queries, keys, values, cache, scale, mask, sinks=None):
+        return _unfused(queries, keys, values, scale=scale, mask=mask, sinks=sinks)
+
+    _base.scaled_dot_product_attention = _patched_wrapper
+    for mod_name, module in list(sys.modules.items()):
+        if (
+            mod_name.startswith("mlx_lm.models.")
+            and mod_name != "mlx_lm.models.base"
+            and hasattr(module, "scaled_dot_product_attention")
+        ):
+            module.scaled_dot_product_attention = _patched_wrapper
+
+
 def _flatten_arrays(x):
     """Yield every mx.array reachable through tuples/lists/QuantizedArray."""
     if isinstance(x, mx.array):
@@ -238,7 +306,17 @@ def main() -> int:
                          "kv_cache_quantization=False).")
     ap.add_argument("--sliding-bits", type=int, default=None,
                     help="Override KVQuantPolicy.sliding_bits (None = bf16, default).")
+    ap.add_argument("--unfused-sdpa", action="store_true",
+                    help="Monkey-patch mx.fast.scaled_dot_product_attention with an "
+                         "explicit Python implementation (matmul + lower-right causal "
+                         "mask + precise fp32 softmax + matmul). Tests whether the "
+                         "fused Metal kernel's shape-dependent behaviour is the cause "
+                         "of chunked-prefill drift.")
     args = ap.parse_args()
+
+    if args.unfused_sdpa:
+        _install_unfused_sdpa()
+        print("unfused SDPA installed (matmul + explicit causal mask + precise softmax)")
 
     print(f"loading model: {args.model}")
     model, tokenizer = load(args.model)
