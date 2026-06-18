@@ -504,6 +504,90 @@ def main() -> int:
         )
         _print_diff_table(f"E:fresh-{short_len}-vs-{int(long_tokens.shape[0])}", turn_i, diffs)
 
+    # ---- F: three-way next-token logits comparison ----
+    # Builds cache state up to each turn boundary three ways and diffs the
+    # logits that would be sampled for the next assistant token. Runs at the
+    # script's current precision (bf16 by default, fp32 with --fp32) — the
+    # delta between the two runs is what tells us whether bf16 alone explains
+    # the production-observed quality drift.
+    #
+    #   Path A (cache-hit): chunked prefill of deltas[0..i-1]
+    #                       -> segment -> assemble (mimics trie deserialise)
+    #   Path B (single-shot fresh): one _prefill of turn_prompts[i-1]
+    #   Path C (chunked from scratch): chunked prefill of deltas[0..i-1] on a
+    #                                  stock cache, no segment/assemble
+    #
+    # Probe: forward deltas[i] (next turn's user tokens) on each cache; read
+    # last-position logits. All three caches receive the identical probe, so
+    # any logit difference comes from pre-existing cache state.
+    #
+    # Reading the output:
+    #   - A vs C ~= 0  ->  cache layer (segment/assemble) is innocent in bf16
+    #   - B vs C >> 0  ->  bf16 chunked-vs-single-shot prefill alone diverges
+    #   - A vs B ~ B vs C  ->  cache hit ~= "single-shot fresh", both differ
+    #                          from production no-cache chunked path
+    print("\n---- F: three-way next-token logits comparison ----")
+
+    def _chunked_build(deltas_subset: list) -> list:
+        c = make_prompt_cache(model)
+        for d in deltas_subset:
+            out = model(d[None], cache=c)
+            eval_args = [out]
+            for layer in c:
+                for arr in _flatten_arrays(getattr(layer, "state", ())):
+                    eval_args.append(arr)
+            mx.eval(*eval_args)
+        return c
+
+    def _next_logits(cache, probe: mx.array) -> mx.array:
+        out = model(probe[None], cache=cache)
+        last = out[0, -1, :].astype(mx.float32)
+        mx.eval(last)
+        return last
+
+    def _cmp_logits(label: str, x: mx.array, y: mx.array, top_k: int = 5) -> None:
+        d = mx.abs(x - y)
+        mx.eval(d)
+        max_abs = float(d.max().item())
+        top_x = mx.argsort(-x)[:top_k]
+        top_y = mx.argsort(-y)[:top_k]
+        mx.eval(top_x, top_y)
+        tx = top_x.tolist()
+        ty = top_y.tolist()
+        top1 = tx[0] == ty[0]
+        overlap = len(set(tx) & set(ty))
+        px = mx.softmax(x, axis=-1)
+        py = mx.softmax(y, axis=-1)
+        kl = float((px * (mx.log(px + 1e-12) - mx.log(py + 1e-12))).sum().item())
+        print(f"  {label:<28} max_abs={max_abs:>9.3e}  "
+              f"top1={'Y' if top1 else 'N'}  "
+              f"top{top_k}_overlap={overlap}/{top_k}  "
+              f"KL={kl:>9.3e}")
+
+    for turn_i in range(1, len(turn_prompts)):
+        probe_delta = deltas[turn_i]
+
+        cache_src = _chunked_build(deltas[:turn_i])
+        states = _clone_cache_state(cache_src)
+        kv_segs, rec_segs = segment(states, policy=policy)
+        cache_a = assemble(kv_segs, rec_segs)
+
+        cache_b = make_prompt_cache(model)
+        _prefill(model, turn_prompts[turn_i - 1], cache_b)
+
+        cache_c = _chunked_build(deltas[:turn_i])
+
+        la = _next_logits(cache_a, probe_delta)
+        lb = _next_logits(cache_b, probe_delta)
+        lc = _next_logits(cache_c, probe_delta)
+
+        print(f"\n[F:logits turn={turn_i} "
+              f"prefix_len={int(turn_prompts[turn_i - 1].shape[0])} "
+              f"probe_len={int(probe_delta.shape[0])}]")
+        _cmp_logits("A(cache-hit) vs B(fresh)",   la, lb)
+        _cmp_logits("A(cache-hit) vs C(chunked)", la, lc)
+        _cmp_logits("B(fresh)     vs C(chunked)", lb, lc)
+
     print("\ndone.")
     return 0
 
