@@ -1310,8 +1310,13 @@ Examples:
         "--prefill-step-size",
         type=int,
         default=2048,
-        help="Chunk size for prompt prefill processing. Larger values use more memory "
-        "but can improve prefill throughput. (default: 2048)",
+        help=(
+            "Tokens per prefill forward pass. This is also the canonical M: "
+            "every sub-canonical chunk is right-padded to this size and trimmed "
+            "post-forward, so all prefill K,V land in the same matmul kernel "
+            "regime. Use scripts/find_canonical_m.py to pick a value verified "
+            "canonical for your model and batch sizes."
+        ),
     )
     # SpecPrefill (attention-based sparse prefill using draft model)
     serve_parser.add_argument(
