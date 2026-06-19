@@ -286,6 +286,80 @@ class _InstrumentedBatchGenerator(BatchGenerator):
         return prompt_responses, gen_responses
 
 
+def _make_padding_shim(model, canonical_M: int):
+    """Wrap a model so every prefill forward pass runs at S == canonical_M.
+
+    Behavior:
+      - S == 1 (decode): pass-through, no padding.
+      - S >= canonical_M: pass-through, already canonical.
+      - else: right-pad input to canonical_M, run model, trim cache by pad,
+        then physically slice pad rows off any RotatingKVCache /
+        BatchRotatingKVCache buffer (otherwise _update_in_place later would
+        keep the pad rows instead of real K, V).
+      - Returned logits are sliced back to the real token count.
+
+    Uniform-pad across the batch is sufficient: mlx-lm chunks at a uniform
+    tokens.shape[1] per model call (mlx_lm/generate.py:1158-1163), so pad =
+    canonical_M - S applies to every row identically. The cache's per-row
+    right-padding for mixed prompt lengths is handled by mlx-lm's existing
+    prepare()/finalize() envelope around the chunk loop.
+    """
+    from mlx_lm.models.cache import (
+        BatchRotatingKVCache,
+        RotatingKVCache,
+    )
+
+    def shim(inputs, cache=None, **kwargs):
+        S = inputs.shape[-1]
+        if S == 1 or S >= canonical_M:
+            return model(inputs, cache=cache, **kwargs)
+
+        pad = canonical_M - S
+        pad_shape = list(inputs.shape)
+        pad_shape[-1] = pad
+        padded_input = mx.concatenate(
+            [inputs, mx.zeros(pad_shape, dtype=inputs.dtype)],
+            axis=-1,
+        )
+        out = model(padded_input, cache=cache, **kwargs)
+
+        if cache is not None:
+            for layer in cache:
+                if hasattr(layer, "trim"):
+                    layer.trim(pad)
+                if isinstance(layer, (RotatingKVCache, BatchRotatingKVCache)):
+                    if layer.keys is not None and layer.keys.shape[-2] > pad:
+                        layer.keys = layer.keys[..., :-pad, :]
+                        layer.values = layer.values[..., :-pad, :]
+
+        return out[..., :S, :]
+
+    return shim
+
+
+class CanonicalPrefillBatchGenerator(_InstrumentedBatchGenerator):
+    """BatchGenerator that pins every prefill forward pass at prefill_step_size.
+
+    Wraps the model with _make_padding_shim. Sub-canonical chunks (small
+    follow-up turns, boundary-aligned splits) are right-padded to canonical
+    M before the forward pass, then the cache is rewound and pad rows are
+    physically sliced off so they never enter the durable cache state.
+
+    Why: on Gemma 4 MoE and similar models, small-M forward passes fall into
+    a different MLX matmul kernel regime than the canonical [512, 1024] band.
+    K, V computed there differ measurably from canonical-regime values and
+    pollute the cache, causing slow quality drift across multi-turn cache hits.
+
+    See docs/superpowers/specs/2026-06-18-canonical-prefill-padding-design.md.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._canonical_M = self.prefill_step_size
+        self._unwrapped_model = self.model
+        self.model = _make_padding_shim(self.model, self._canonical_M)
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
