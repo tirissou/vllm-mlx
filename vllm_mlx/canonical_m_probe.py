@@ -112,8 +112,11 @@ def run_chunking_probe(
 def compute_canonical_band(probe_result: dict) -> list[int]:
     """Return the largest contiguous set of chunk sizes M whose pairwise diffs
     are exactly zero across every probed (layer, K|V) pair."""
-    name_to_M = {name: M for name, M in probe_result["schedules"]}
-    all_M = sorted(set(name_to_M.values()))
+    # Enumerate maximal contiguous subarrays whose pairs are all zero-diff.
+    # The brief's zero_set walk misclassifies an M as canonical solo when it
+    # only needs to compare zero-diff against itself, which can include an M
+    # that diverges from neighbors. Enumerating all contiguous bands is correct.
+    all_M = sorted({M for _, M in probe_result["schedules"]})
 
     # For each chunk size M, gather names that produce it.
     M_to_names: dict[int, list[str]] = {}
