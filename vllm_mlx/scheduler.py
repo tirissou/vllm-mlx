@@ -248,9 +248,10 @@ class _InstrumentedBatchGenerator(BatchGenerator):
 
                 _cb_pre = mx.get_active_memory()
                 per_uid_cache = self._prompt_batch.extract_cache(idx)
-                mx.eval(*[c.keys for c in per_uid_cache if hasattr(c, "keys") and c.keys is not None],
-                        *[c.values for c in per_uid_cache if hasattr(c, "values") and c.values is not None])
-                _cb_post_extract = mx.get_active_memory()
+                # No mx.eval here: segment() inside the callback materialises
+                # its own output buffers via stop_gradient+eval, so an eager
+                # eval of per_uid_cache would only create a transient full copy
+                # that spikes peak memory without benefit.
 
                 self._mid_prefill_callback(resp.uid, processed, per_uid_cache)
                 _cb_post_callback = mx.get_active_memory()
@@ -263,14 +264,11 @@ class _InstrumentedBatchGenerator(BatchGenerator):
 
                 logger.warning(
                     "[memprobe:callback] processed=%d pre=%.2fGB "
-                    "post_extract=%.2fGB(+%.2f) post_callback=%.2fGB(+%.2f) "
-                    "post_gc=%.2fGB(net+%.2f)",
+                    "post_callback=%.2fGB(+%.2f) post_gc=%.2fGB(net+%.2f)",
                     processed,
                     _cb_pre / 1e9,
-                    _cb_post_extract / 1e9,
-                    (_cb_post_extract - _cb_pre) / 1e9,
                     _cb_post_callback / 1e9,
-                    (_cb_post_callback - _cb_post_extract) / 1e9,
+                    (_cb_post_callback - _cb_pre) / 1e9,
                     _cb_post_gc / 1e9,
                     (_cb_post_gc - _cb_pre) / 1e9,
                 )
@@ -2177,12 +2175,12 @@ class Scheduler:
 
             _cb_pre = mx.get_active_memory()
             per_uid_cache = pb.extract_cache(idx)
-            mx.eval(*[c.keys for c in per_uid_cache if hasattr(c, "keys") and c.keys is not None],
-                    *[c.values for c in per_uid_cache if hasattr(c, "values") and c.values is not None])
-            _cb_post_extract = mx.get_active_memory()
+            # No mx.eval here: segment() inside on_prefill_checkpoint
+            # materialises its output via stop_gradient+eval, so eagerly
+            # evaluating per_uid_cache would only create a transient full copy
+            # that spikes peak memory to ~3x without benefit.
 
             extracted = self._prefix_cache.extract_cache(per_uid_cache)
-            _cb_post_extract_states = mx.get_active_memory()
 
             if extracted:
                 total = (request._cache_state.cached_tokens or 0) + processed
@@ -2197,16 +2195,11 @@ class Scheduler:
 
             logger.warning(
                 "[memprobe:segend] processed=%d pre=%.2fGB "
-                "post_extract=%.2fGB(+%.2f) post_states=%.2fGB(+%.2f) "
                 "post_checkpoint=%.2fGB(+%.2f) post_gc=%.2fGB(net+%.2f)",
                 processed,
                 _cb_pre / 1e9,
-                _cb_post_extract / 1e9,
-                (_cb_post_extract - _cb_pre) / 1e9,
-                _cb_post_extract_states / 1e9,
-                (_cb_post_extract_states - _cb_post_extract) / 1e9,
                 _cb_post_checkpoint / 1e9,
-                (_cb_post_checkpoint - _cb_post_extract_states) / 1e9,
+                (_cb_post_checkpoint - _cb_pre) / 1e9,
                 _cb_post_gc / 1e9,
                 (_cb_post_gc - _cb_pre) / 1e9,
             )
