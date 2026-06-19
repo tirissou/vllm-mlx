@@ -19,7 +19,7 @@ def test_multi_turn_cache_hit_quality_matches_no_cache():
     Token-for-token equality is the acceptance criterion: identical K,V
     geometry means identical greedy decode (sampler temp=0).
     """
-    from vllm_mlx.scheduler import MLXEngineConfig, MLXScheduler  # noqa: F401
+    from vllm_mlx.scheduler import SchedulerConfig, Scheduler  # noqa: F401
 
     pytest.importorskip("mlx_lm")
     # NOTE: This test is intentionally lightweight — it asserts the
