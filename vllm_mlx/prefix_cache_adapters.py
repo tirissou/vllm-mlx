@@ -354,85 +354,18 @@ class TurnCacheManager(CacheManager):
         return True
 
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:
-        from .turn_prefix_cache import Segment
+        """No-op: decoded K,V never enter the trie.
 
-        if (
-            cache is None
-            and isinstance(tokens, list)
-            and (not tokens or not isinstance(tokens[0], int))
-        ):
-            cache = tokens
-            tokens = None
-        if cache is None:
-            cache = []
+        Cache promotion now happens exclusively through on_prefill_checkpoint()
+        at turn boundaries during prefill (in canonical kernel regime, thanks
+        to CanonicalPrefillBatchGenerator). Decoded K,V are computed at M=1 —
+        the worst possible kernel regime — and would pollute the cache; this
+        method returning False keeps them out.
 
-        segments = self.messages_to_segments(request)
-        if not segments or not getattr(request, "output_token_ids", None):
-            return False
-
-        cs = getattr(request, "_cache_state", None)
-        path = cs.turn_path if cs is not None else []
-        matched_depth = len(path)
-        parent = path[-1] if path else self._inner.root
-        new_segments = segments[matched_depth:]
-
-        if new_segments:
-            # Combine the last unmatched prompt segment with the generated output
-            # into a single response node.
-            response_tokens = list(segments[-1].token_ids) + list(
-                request.output_token_ids
-            )
-        else:
-            # Full prompt was already in the trie; record only the new output as
-            # a child of the deepest matched node.
-            response_tokens = list(request.output_token_ids)
-
-        if cache and not isinstance(cache[0], dict):
-            from .kv_cache import extract_layer_state
-
-            cache = [
-                d for layer in cache if (d := extract_layer_state(layer)) is not None
-            ]
-
-        if cache:
-            prev_end = path[-1].n_tokens if path else 0
-            cache = slice_kv_to_delta(cache, prev_end)
-            kv_sparse, rec_sparse = segment(
-                cache, policy=self._policy, group_size=self._kv_group_size
-            )
-            kv_layers = [kv for kv in kv_sparse if kv is not None]
-            rec_layers = [rec for rec in rec_sparse if rec is not None]
-            _log_segment_breakdown(
-                f"store rid={getattr(request, 'request_id', '?')} "
-                f"tok_seg={len(response_tokens)} prev_end={prev_end}",
-                kv_layers,
-                rec_layers,
-            )
-        else:
-            kv_layers, rec_layers = [], []
-
-        # Snapshot current pinned leaf BEFORE any mutation so we can roll back
-        # cleanly on insert failure.
-        old_leaf = self._pinned_leaves.get(request.request_id)
-
-        # Insert first; only touch ref_counts / _pinned_leaves after success so
-        # that an exception leaves the previous leaf pin intact.
-        new_leaf = self._inner.insert(
-            parent,
-            Segment(role="conversation", token_ids=response_tokens),
-            kv_data=kv_layers or None,
-            recurrent_data=rec_layers or None,
-        )
-
-        # Success path: advance the active leaf — unpin the old, pin the new.
-        if old_leaf is not None:
-            self._inner.release([old_leaf])
-        with self._inner._lock:
-            new_leaf.ref_count += 1
-        self._pinned_leaves[request.request_id] = new_leaf
-        if cs is not None:
-            cs.turn_path = self._inner._inorder_path(new_leaf)
-        return True
+        The signature and return type match the previous behavior's cache-miss
+        path, so existing callers handle False without change.
+        """
+        return False
 
     def release(self, request) -> None:
         leaf = self._pinned_leaves.pop(request.request_id, None)

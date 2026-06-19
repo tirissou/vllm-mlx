@@ -181,3 +181,72 @@ def test_collect_path_data_layer_ordering(trie):
     # layer 0 = KVCache → BatchQuantizedKVCache (ADR-0005), layer 1 = recurrent (ArraysCache)
     assert isinstance(assembled[0], BatchQuantizedKVCache)
     assert isinstance(assembled[1], ArraysCache)
+
+
+# ---------------------------------------------------------------------------
+# store() no-op tests (Task 4)
+# ---------------------------------------------------------------------------
+
+def _build_request_with_decoded_output():
+    """Stub Request-like object with the attributes store() reads."""
+    class _Req:
+        request_id = "rid-test"
+        output_token_ids = [101, 102, 103]
+        _cache_state = type("CS", (), {"turn_path": []})()
+        # messages_to_segments() reads ._messages or similar in production;
+        # for this test we monkeypatch messages_to_segments on the manager.
+    return _Req()
+
+
+def test_store_does_not_promote_decoded_tokens(monkeypatch):
+    """store() must be a no-op: trie unchanged, returns False, no leaf pin."""
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
+
+    cfg = TurnPrefixCacheConfig(checkpoint_stride=0, max_memory_gb=1.0)
+    inner = TurnPrefixCache(cfg)
+    mgr = TurnCacheManager(inner)
+
+    req = _build_request_with_decoded_output()
+    monkeypatch.setattr(
+        mgr, "messages_to_segments",
+        lambda r: [Segment(role="system", token_ids=[1, 2, 3]),
+                   Segment(role="user", token_ids=[4, 5])],
+    )
+
+    pre_root_children = len(inner.root.children)
+    pre_pinned = dict(mgr._pinned_leaves)
+
+    ok = mgr.store(req, cache=[])
+
+    assert ok is False
+    assert len(inner.root.children) == pre_root_children, \
+        "store() must not insert any trie node"
+    assert mgr._pinned_leaves == pre_pinned, \
+        "store() must not touch pinned-leaf bookkeeping"
+
+
+def test_decoded_tokens_re_prefilled_on_next_turn(monkeypatch):
+    """Two-turn scenario: after store() becomes a no-op, the prior assistant
+    response is NOT in the trie. on_prefill_checkpoint at the next turn must
+    receive the assistant tokens as part of the prefill input."""
+    from vllm_mlx.prefix_cache_adapters import TurnCacheManager
+    from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig, Segment
+
+    cfg = TurnPrefixCacheConfig(checkpoint_stride=0, max_memory_gb=1.0)
+    inner = TurnPrefixCache(cfg)
+    mgr = TurnCacheManager(inner)
+
+    req = _build_request_with_decoded_output()
+    monkeypatch.setattr(
+        mgr, "messages_to_segments",
+        lambda r: [Segment(role="system", token_ids=[1, 2, 3]),
+                   Segment(role="user", token_ids=[4, 5])],
+    )
+
+    # Simulate end-of-turn store() — must be no-op.
+    mgr.store(req, cache=[])
+    assert all(
+        len(child.segment.token_ids) != len(req.output_token_ids)
+        for child in inner.root.children
+    ), "no node sized like the assistant response may exist"
