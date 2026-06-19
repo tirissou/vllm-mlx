@@ -994,7 +994,7 @@ class Scheduler:
             if self.config.use_turn_cache and self.config.kv_cache_quantization
             else None
         )
-        bg = _InstrumentedBatchGenerator(
+        bg = CanonicalPrefillBatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
             stop_tokens=stop_tokens,
@@ -1011,8 +1011,8 @@ class Scheduler:
         # decode — chunked_prefill_tokens now only controls mid-prefill save
         # frequency (wired via _InstrumentedBatchGenerator in Task 2).
         logger.info(
-            f"[batch_generator] prefill_step_size={self.config.prefill_step_size} "
-            f"(native interleaving)"
+            f"[batch_generator] canonical_prefill_step_size={self.config.prefill_step_size} "
+            f"(sub-canonical chunks right-padded and trimmed)"
         )
 
         # Install MTP if the model supports it
