@@ -1219,9 +1219,14 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         from .engine.batched import BatchedEngine
 
         logger.info(f"Preparing BatchedEngine for residency: {spec.model_name}")
+        sched_cfg = spec.scheduler_config
+        if sched_cfg is None:
+            sched_cfg = SchedulerConfig(prefill_step_size=spec.prefill_step_size)
+        else:
+            sched_cfg.prefill_step_size = spec.prefill_step_size
         return BatchedEngine(
             model_name=spec.model_name,
-            scheduler_config=spec.scheduler_config,
+            scheduler_config=sched_cfg,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
         )
@@ -3114,6 +3119,13 @@ def load_model(
 
     if use_batching:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
+        # BatchedEngine reads prefill_step_size from scheduler_config, not as a
+        # direct constructor arg — propagate it here so the top-level parameter
+        # is honoured regardless of whether the caller supplied a scheduler_config.
+        if scheduler_config is None:
+            scheduler_config = SchedulerConfig(prefill_step_size=prefill_step_size)
+        else:
+            scheduler_config.prefill_step_size = prefill_step_size
         _engine = BatchedEngine(
             model_name=model_name,
             trust_remote_code=trust_remote_code,

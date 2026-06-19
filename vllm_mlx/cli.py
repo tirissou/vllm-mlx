@@ -303,6 +303,8 @@ def serve_command(args):
             turn_cache_stride=getattr(args, "turn_cache_stride", 512),
             turn_cache_memory_gb=getattr(args, "turn_cache_memory_gb", 20.0),
             turn_cache_ssd_gb=getattr(args, "turn_cache_ssd_gb", 50.0),
+            # Canonical prefill chunk size
+            prefill_step_size=args.prefill_step_size,
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
             # MTP
