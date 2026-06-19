@@ -286,16 +286,21 @@ class _InstrumentedBatchGenerator(BatchGenerator):
         return prompt_responses, gen_responses
 
 
-def _make_padding_shim(model, canonical_M: int):
-    """Wrap a model so every prefill forward pass runs at S == canonical_M.
+class _PaddingShim:
+    """Callable wrapper that pads sub-canonical prefill chunks to canonical_M.
+
+    Delegates non-call attribute access to the underlying model so that
+    downstream code accessing model attributes (e.g., MTP heads, custom
+    forward methods) does not need to know the shim exists.
 
     Behavior:
+      - S == 0: pass-through (empty input edge case).
       - S == 1 (decode): pass-through, no padding.
       - S >= canonical_M: pass-through, already canonical.
       - else: right-pad input to canonical_M, run model, trim cache by pad,
-        then physically slice pad rows off any RotatingKVCache /
-        BatchRotatingKVCache buffer (otherwise _update_in_place later would
-        keep the pad rows instead of real K, V).
+        then physically slice pad rows off any RotatingKVCache buffer
+        (otherwise _update_in_place later would keep the pad rows instead of
+        real K, V).
       - Returned logits are sliced back to the real token count.
 
     Uniform-pad across the batch is sufficient: mlx-lm chunks at a uniform
@@ -303,38 +308,85 @@ def _make_padding_shim(model, canonical_M: int):
     canonical_M - S applies to every row identically. The cache's per-row
     right-padding for mixed prompt lengths is handled by mlx-lm's existing
     prepare()/finalize() envelope around the chunk loop.
+
+    For KVCache (full-attention), the buffer keeps pad rows beyond offset until
+    eviction; update_and_fetch and state gate on offset so reads are correct.
+
+    For BatchRotatingKVCache with _lengths active (mixed-length batch), the
+    dynamic_roll per-row means pad rows are not at the tail of the per-row
+    buffer after roll, so the naive [..., :-pad, :] tail-slice is unsafe.
+    In that case the shim skips the physical slice and relies on offset-gated
+    reads (update_and_fetch / state) which are already correct.
     """
-    from mlx_lm.models.cache import (
-        BatchRotatingKVCache,
-        RotatingKVCache,
-    )
 
-    def shim(inputs, cache=None, **kwargs):
+    def __init__(self, model, canonical_M: int):
+        # IMPORTANT: assign via object.__setattr__ since __setattr__ delegation
+        # is not implemented; we only need __getattr__ for read-side transparency.
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_canonical_M", canonical_M)
+
+    def __call__(self, inputs, cache=None, **kwargs):
+        from mlx_lm.models.cache import (
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
         S = inputs.shape[-1]
-        if S == 1 or S >= canonical_M:
-            return model(inputs, cache=cache, **kwargs)
 
-        pad = canonical_M - S
+        # S == 0: defensive guard for empty inputs.
+        if S == 0:
+            return self._model(inputs, cache=cache, **kwargs)
+
+        if S == 1 or S >= self._canonical_M:
+            return self._model(inputs, cache=cache, **kwargs)
+
+        pad = self._canonical_M - S
         pad_shape = list(inputs.shape)
         pad_shape[-1] = pad
         padded_input = mx.concatenate(
             [inputs, mx.zeros(pad_shape, dtype=inputs.dtype)],
             axis=-1,
         )
-        out = model(padded_input, cache=cache, **kwargs)
+        out = self._model(padded_input, cache=cache, **kwargs)
 
         if cache is not None:
             for layer in cache:
                 if hasattr(layer, "trim"):
                     layer.trim(pad)
-                if isinstance(layer, (RotatingKVCache, BatchRotatingKVCache)):
+                if isinstance(layer, BatchRotatingKVCache):
+                    # mlx-lm's mixed-length path uses dynamic_roll per row;
+                    # the shim's uniform pad rows are not at the buffer tail
+                    # after roll, so the naive [..., :-pad, :] slice is unsafe.
+                    # Rely on offset-gated reads in this case; pad rows are
+                    # invisible to update_and_fetch/state.
+                    lengths = getattr(layer, "_lengths", None)
+                    if lengths is not None:
+                        continue  # skip physical slice for this layer
+                    # Equal-length batch (no active _lengths): safe to slice.
+                    if layer.keys is not None and layer.keys.shape[-2] > pad:
+                        layer.keys = layer.keys[..., :-pad, :]
+                        layer.values = layer.values[..., :-pad, :]
+                elif isinstance(layer, RotatingKVCache):
+                    # Single-sequence rotating cache: pad rows are always at
+                    # the tail after _update_concat, so the tail slice is safe.
                     if layer.keys is not None and layer.keys.shape[-2] > pad:
                         layer.keys = layer.keys[..., :-pad, :]
                         layer.values = layer.values[..., :-pad, :]
 
         return out[..., :S, :]
 
-    return shim
+    def __getattr__(self, name):
+        # __getattr__ is only called when normal attribute lookup fails,
+        # so this delegates only the attributes _PaddingShim does not own.
+        return getattr(object.__getattribute__(self, "_model"), name)
+
+
+def _make_padding_shim(model, canonical_M: int) -> "_PaddingShim":
+    """Factory returning a _PaddingShim that forces prefill at canonical_M.
+
+    Public signature is preserved; callers do not need to change.
+    """
+    return _PaddingShim(model, canonical_M)
 
 
 class CanonicalPrefillBatchGenerator(_InstrumentedBatchGenerator):

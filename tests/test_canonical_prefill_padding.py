@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache, BatchRotatingKVCache
 
 from vllm_mlx.scheduler import _make_padding_shim
 
@@ -112,7 +112,6 @@ def test_rotating_buffer_geometry_after_pad_trim_slice():
     assert cache[0].offset >= sliding_max
 
     pre_keys_shape = cache[0].keys.shape
-    pre_idx = cache[0]._idx
     pre_offset = cache[0].offset
 
     # Sub-canonical prefill: N_real = 8 (pad = 24).
@@ -166,3 +165,63 @@ def test_shim_returns_unpadded_logits():
     inputs = mx.zeros((1, N_real), dtype=mx.int32)
     out = shim(inputs, cache=cache)
     assert out.shape[-2] == N_real
+
+
+def test_shim_delegates_unknown_attributes_to_model():
+    """The shim must expose model attributes so downstream paths
+    (MTP heads, custom forward methods) keep working."""
+    model = _ToyModel()
+    model.some_arbitrary_method = lambda: "ok"
+    shim = _make_padding_shim(model, canonical_M=32)
+    assert shim.some_arbitrary_method() == "ok"
+    # Cache attributes too
+    assert shim.embed is model.embed
+
+
+def test_shim_skips_physical_slice_for_batch_rotating_with_lengths():
+    """When BatchRotatingKVCache._lengths is not None (mixed-length batch),
+    the shim must NOT apply the tail-slice: after dynamic_roll the pad rows
+    are not at the buffer tail so slicing would corrupt real K/V entries.
+
+    We verify by running the same sub-canonical call twice — once with
+    _lengths=None (tail-slice path) and once with _lengths active (skip-slice
+    path) — and asserting the buffer is larger in the latter case by exactly
+    the pad amount."""
+    import copy
+
+    model = _ToyModel()
+    canonical_M = 32
+    N_real = canonical_M - 8  # pad = 8
+    pad = canonical_M - N_real
+    shim = _make_padding_shim(model, canonical_M)
+
+    # Construct two identical BatchRotatingKVCache instances.
+    def make_warmed_layer():
+        layer = BatchRotatingKVCache(max_size=16, left_padding=[0, 0])
+        warm_input = mx.zeros((2, canonical_M), dtype=mx.int32)
+        shim(warm_input, cache=[layer])
+        mx.eval(layer.keys)
+        return layer
+
+    layer_no_len = make_warmed_layer()
+    layer_with_len = make_warmed_layer()
+
+    # Activate _lengths on one layer to simulate mixed-length batch state.
+    layer_with_len._lengths = mx.array([canonical_M, canonical_M - 4])
+
+    sub_input = mx.zeros((2, N_real), dtype=mx.int32)
+
+    # Run shim on both layers.
+    shim(sub_input, cache=[layer_no_len])
+    shim(sub_input, cache=[layer_with_len])
+    mx.eval(layer_no_len.keys, layer_with_len.keys)
+
+    seq_len_no_len = layer_no_len.keys.shape[-2]
+    seq_len_with_len = layer_with_len.keys.shape[-2]
+
+    # The _lengths path skips the physical tail-slice, so the buffer is
+    # exactly `pad` rows larger than the sliced version.
+    assert seq_len_with_len == seq_len_no_len + pad, (
+        f"With _lengths active, buffer should be {pad} rows larger than sliced "
+        f"path (expected {seq_len_no_len + pad}, got {seq_len_with_len})"
+    )

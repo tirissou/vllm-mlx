@@ -190,9 +190,13 @@ def test_collect_path_data_layer_ordering(trie):
 def _build_request_with_decoded_output():
     """Stub Request-like object with the attributes store() reads."""
     class _Req:
+        # request_id is never mutated so it can stay class-level.
         request_id = "rid-test"
-        output_token_ids = [101, 102, 103]
-        _cache_state = type("CS", (), {"turn_path": []})()
+
+        def __init__(self):
+            # Per-instance state so multiple callers don't share mutable defaults.
+            self.output_token_ids = [101, 102, 103]
+            self._cache_state = type("CS", (), {"turn_path": []})()
         # messages_to_segments() reads ._messages or similar in production;
         # for this test we monkeypatch messages_to_segments on the manager.
     return _Req()
@@ -237,6 +241,15 @@ def test_decoded_tokens_re_prefilled_on_next_turn(monkeypatch):
     inner = TurnPrefixCache(cfg)
     mgr = TurnCacheManager(inner)
 
+    # Pre-populate the trie with a real segment so root.children is non-empty.
+    # This ensures the assertion below is non-vacuous.
+    # Use a token count different from len(req.output_token_ids)=3 to avoid
+    # false negatives in the "no node sized like assistant response" check.
+    pre_seg = Segment(role="system", token_ids=[10, 20])
+    inner.insert(inner.root, pre_seg)
+    assert len(inner.root.children) > 0, "pre-condition: trie has at least one node"
+    pre_count = len(inner.root.children)
+
     req = _build_request_with_decoded_output()
     monkeypatch.setattr(
         mgr, "messages_to_segments",
@@ -246,7 +259,13 @@ def test_decoded_tokens_re_prefilled_on_next_turn(monkeypatch):
 
     # Simulate end-of-turn store() — must be no-op.
     mgr.store(req, cache=[])
+
+    # The trie must be structurally unchanged at the root level.
+    assert len(inner.root.children) == pre_count, \
+        "store() must not insert any new root-level trie node"
+    # No node anywhere in root.children may have a segment sized like the
+    # assistant response — the decoded tokens must not be cached.
     assert all(
-        len(child.segment.token_ids) != len(req.output_token_ids)
-        for child in inner.root.children
+        len(child.token_ids) != len(req.output_token_ids)
+        for child in inner.root.children.values()
     ), "no node sized like the assistant response may exist"
