@@ -31,7 +31,7 @@ def test_cli_human_report_has_sections(tmp_path):
     )
     assert result.returncode in (0, 1), result.stderr
     assert "Per-batch-size canonical bands:" in result.stdout
-    assert "Recommended:" in result.stdout or "no canonical M" in result.stdout.lower()
+    assert "Recommended:" in result.stdout or "FAILURE:" in result.stdout
 
 
 @requires_model

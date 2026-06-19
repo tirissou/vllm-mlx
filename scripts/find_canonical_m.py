@@ -29,12 +29,6 @@ def _parse_csv_ints(raw: str) -> list[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
 
 
-def _sliding_max_size(model) -> int | None:
-    cache = make_prompt_cache(model)
-    sizes = [c.max_size for c in cache if isinstance(c, RotatingKVCache)]
-    return min(sizes) if sizes else None
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Probe an mlx-lm model and recommend prefill_step_size."
@@ -54,8 +48,9 @@ def main() -> int:
     print(f"Loading model: {args.model} ...", flush=True)
     model, _ = load(args.model)
 
-    sliding_max = _sliding_max_size(model)
     cache = make_prompt_cache(model)
+    sliding_sizes = [c.max_size for c in cache if isinstance(c, RotatingKVCache)]
+    sliding_max = min(sliding_sizes) if sliding_sizes else None
     n_layers = len(cache)
     n_sliding = sum(1 for c in cache if isinstance(c, RotatingKVCache))
     n_full = n_layers - n_sliding
