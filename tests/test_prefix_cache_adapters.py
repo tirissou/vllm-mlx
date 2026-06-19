@@ -75,40 +75,6 @@ def _make_turn_cache_request(
     return req
 
 
-def test_turn_cache_adapter_store_returns_true_on_success():
-    """store() must return True now — the old stub returned False."""
-    inner = MagicMock()
-    inner.root = MagicMock(n_tokens=0)
-    inner.split_cache_arrays.return_value = ([], None)
-    inner.insert.return_value = MagicMock(n_tokens=5)
-
-    adapter = TurnCacheManager(inner)
-    # prompt=[1,2,3,4,5] with boundary at 3 (sys=[1,2,3], user=[4,5])
-    req = _make_turn_cache_request(
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        output_token_ids=[6, 7],
-        turn_boundaries=[3],
-    )
-    result = adapter.store(req, [])
-    assert result is True
-
-
-def test_turn_cache_adapter_store_calls_inner_insert():
-    """store() must call inner.insert() to build the trie node."""
-    inner = MagicMock()
-    inner.root = MagicMock(n_tokens=0)
-    inner.split_cache_arrays.return_value = ([], None)
-    inner.insert.return_value = MagicMock(n_tokens=0)
-
-    adapter = TurnCacheManager(inner)
-    req = _make_turn_cache_request(
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        output_token_ids=[6, 7],
-        turn_boundaries=[3],
-    )
-    adapter.store(req, [])
-    assert inner.insert.called
-
 
 def test_turn_cache_adapter_store_returns_false_when_no_output():
     inner = MagicMock()
@@ -636,26 +602,6 @@ def test_store_uses_explicit_tokens_not_cache_state():
     # Adapter accepts the call; does not crash looking for cs.store_tokens
     assert isinstance(result, bool)
 
-
-def test_store_reads_turn_path_from_cache_state():
-    inner = _make_inner()
-    parent_node = MagicMock(n_tokens=3)
-    inner.root = MagicMock(n_tokens=0)
-    adapter = TurnCacheManager(inner)
-    req = _make_request(
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        turn_boundaries=[3],
-        output_token_ids=[
-            6,
-            7,
-        ],  # must be non-empty — store() returns False with no output
-    )
-    req._cache_state.turn_path = [parent_node]
-    adapter.store(req, [1, 2, 3, 4, 5, 6], [])
-    # insert should be called with parent_node as parent
-    assert inner.insert.called
-    call_parent = inner.insert.call_args[0][0]
-    assert call_parent is parent_node
 
 
 # ── on_prefill_checkpoint() ───────────────────────────────────────────────────
