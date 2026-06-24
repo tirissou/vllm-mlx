@@ -330,6 +330,12 @@ class SSDIndex:
             )
             self._conn.commit()
 
+    def delete_by_file_path(self, file_path: str) -> None:
+        """Delete an entry by its file path."""
+        with self._db_lock:
+            self._conn.execute("DELETE FROM entries WHERE file_path = ?", (file_path,))
+            self._conn.commit()
+
     def get_lru(self, limit: int = 10) -> list[dict]:
         """Get the least recently used entries, ordered oldest first."""
         with self._db_lock:
@@ -778,113 +784,14 @@ class SSDCacheTier:
             return results[0]  # Already sorted by num_tokens DESC
         return None
 
-    async def async_promote(
-        self,
-        tokens: tuple[int, ...],
-        reserve_budget_fn,
-        release_budget_fn,
-    ) -> list | None:
-        """Promote an entry from SSD to RAM asynchronously.
-
-        CRITICAL: Reserves RAM budget BEFORE the disk read, to avoid
-        thrash when multiple promotions race.
-
-        Args:
-            tokens: Token sequence to promote.
-            reserve_budget_fn: Callable(nbytes) -> bool. Must return True
-                if budget is available and reserved, False otherwise.
-            release_budget_fn: Callable(nbytes) -> None. Called to release
-                budget on failure.
-
-        Returns:
-            List of deserialized cache layers, or None if promotion failed.
-        """
+    async def async_promote(self, ref: SSDRef, tokens: tuple[int, ...]) -> list | None:
+        """Promote an entry from SSD to RAM asynchronously."""
         import asyncio
 
-        # Step 1: Look up metadata (fast, SQLite)
-        meta = self._index.lookup_exact(tokens)
-        if meta is None:
-            with self._lock:
-                self._stats.ssd_misses += 1
-            return None
-
-        memory_bytes = meta["memory_bytes"]
-
-        # Step 2: Reserve RAM budget BEFORE disk read
-        if not reserve_budget_fn(memory_bytes):
-            with self._lock:
-                self._stats.promotion_failures += 1
-            logger.warning(
-                f"[ssd_cache] promotion denied: cannot reserve "
-                f"{memory_bytes} bytes RAM budget"
-            )
-            return None
-
-        # Step 3: Read from disk (in thread pool to avoid blocking event loop)
-        # Use shield-and-await-on-cancel per CLAUDE.md Golden Rule #4:
-        # budget must be released even if the calling task is cancelled.
-        t0 = time.time()
-        worker = asyncio.ensure_future(
-            asyncio.to_thread(self._read_entry, tokens, meta["file_path"])
-        )
         try:
-            cache_layers = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            # Caller cancelled — still need to wait for the disk read
-            # to finish, then release the budget
-            try:
-                await worker
-            except Exception:
-                pass
-            release_budget_fn(memory_bytes)
-            raise
+            return await asyncio.to_thread(self._read_entry, tokens, ref.file_path)
         except Exception:
-            # Release budget on read failure
-            release_budget_fn(memory_bytes)
-            with self._lock:
-                self._stats.promotion_failures += 1
-            logger.exception(
-                f"[ssd_cache] failed to read entry from disk "
-                f"({meta['num_tokens']} tokens)"
-            )
             return None
-
-        if cache_layers is None:
-            # Corrupted entry — release budget, quarantine entry
-            release_budget_fn(memory_bytes)
-            with self._lock:
-                self._stats.promotion_failures += 1
-            return None
-
-        dt = time.time() - t0
-        total_read_bytes = sum(
-            os.path.getsize(
-                os.path.join(
-                    self._data_dir, meta["file_path"], f"layer_{i}.safetensors"
-                )
-            )
-            for i in range(len(cache_layers))
-            if os.path.exists(
-                os.path.join(
-                    self._data_dir, meta["file_path"], f"layer_{i}.safetensors"
-                )
-            )
-        )
-
-        with self._lock:
-            self._stats.ssd_hits += 1
-            self._stats.reload_latency_sum += dt
-            self._stats.reload_bytes += total_read_bytes
-
-        # Update access time in index
-        self._index.touch(tokens)
-
-        logger.info(
-            f"[ssd_cache] promoted entry: {meta['num_tokens']} tokens, "
-            f"{total_read_bytes} bytes, {dt*1000:.1f}ms"
-        )
-
-        return cache_layers
 
     def _read_entry(self, tokens: tuple[int, ...], relative_path: str) -> list | None:
         """Read a cache entry from disk. Called from thread pool.
