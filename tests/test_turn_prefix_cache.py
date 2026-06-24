@@ -12,6 +12,7 @@ from vllm_mlx.turn_prefix_cache import (
     _context_hash,
     _node_data_bytes,
 )
+from vllm_mlx.cache_types import KVConcatSegment, KVRotatingSegment
 from vllm_mlx.prefix_cache_adapters import TurnCacheManager as TurnCacheAdapter
 
 
@@ -1996,3 +1997,42 @@ def test_save_load_multi_node_parent_child(tmp_path):
     assert len(path) == 2
     assert path[1].parent is path[0]
     assert path[0].parent is cache2.root
+
+
+def _concat_seg(layer_index=0, n=4):
+    k = mx.zeros((1, 2, n, 8), dtype=mx.bfloat16)
+    return KVConcatSegment(keys=k, values=k, layer_index=layer_index,
+                           n_tokens=n, bits=None, class_name="KVCache")
+
+
+def _rot_seg(layer_index=1, n=4):
+    k = mx.zeros((1, 2, n, 8), dtype=mx.bfloat16)
+    return KVRotatingSegment(keys=k, values=k, layer_index=layer_index,
+                             n_tokens=n, bits=None, class_name="RotatingKVCache",
+                             max_size=n, keep=0, offset=n, idx=n)
+
+
+def test_insert_stores_sliding_kv_data_separately():
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+    node = cache.insert(
+        cache.root,
+        Segment(role="user", token_ids=[1, 2, 3, 4]),
+        kv_data=[_concat_seg()],
+        sliding_kv_data=[_rot_seg()],
+    )
+    assert node.sliding_kv_data is not None
+    assert len(node.sliding_kv_data) == 1
+    assert node.kv_data is not None and len(node.kv_data) == 1
+    assert cache.has_sliding_state is True
+
+
+def test_node_data_bytes_counts_sliding():
+    node_kv_only = _make_node(kv=[_concat_seg()], sliding=None)
+    node_with_sliding = _make_node(kv=[_concat_seg()], sliding=[_rot_seg()])
+    assert _node_data_bytes(node_with_sliding) > _node_data_bytes(node_kv_only)
+
+
+def _make_node(kv, sliding):
+    from vllm_mlx.turn_prefix_cache import TurnNode
+    return TurnNode(token_ids=[1], context_hash=1, kv_data=kv,
+                    recurrent_data=None, sliding_kv_data=sliding)

@@ -94,8 +94,9 @@ class SSDRef:
 class TurnNode:
     token_ids: list[int]
     context_hash: int
-    kv_data: list[KVLayerSegment] | SSDRef | None  # None for root sentinel
+    kv_data: list[KVLayerSegment] | SSDRef | None  # None for root sentinel; full-attention layers only
     recurrent_data: list[RecurrentLayerSegment] | SSDRef | None
+    sliding_kv_data: list[KVLayerSegment] | SSDRef | None = None  # sliding-window (rotating); non-cumulative
     parent: Optional[TurnNode] = field(default=None, repr=False)
     children: dict[int, TurnNode] = field(default_factory=dict)
     ref_count: int = 0
@@ -159,6 +160,9 @@ def _node_data_bytes(node: TurnNode) -> int:
     if isinstance(node.kv_data, list):
         for kv in node.kv_data:
             total += kv.keys.nbytes + kv.values.nbytes
+    if isinstance(node.sliding_kv_data, list):
+        for kv in node.sliding_kv_data:
+            total += kv.keys.nbytes + kv.values.nbytes
     if isinstance(node.recurrent_data, list):
         for rec in node.recurrent_data:
             arrays = rec.arrays
@@ -192,6 +196,7 @@ class TurnPrefixCache:
         self._eviction_heap: list[tuple[float, int, TurnNode]] = []
         self._memory_bytes: int = 0
         self.has_recurrent_state: bool = False
+        self.has_sliding_state: bool = False
 
     # ── SpillableCache / PrefixCache protocol stubs ─────────────────────────
     # TurnPrefixCache is a low-level trie; the PrefixCache protocol is
@@ -231,6 +236,7 @@ class TurnPrefixCache:
         parent: TurnNode,
         segment: Segment,
         kv_data: list[KVLayerSegment] | None = None,
+        sliding_kv_data: list[KVLayerSegment] | None = None,
         recurrent_data: list[RecurrentLayerSegment] | None = None,
         is_system_prompt: bool = False,
         acquire_lock: bool = True,
@@ -239,6 +245,7 @@ class TurnPrefixCache:
             parent,
             segment,
             kv_data,
+            sliding_kv_data,
             recurrent_data,
             is_system_prompt,
             acquire_lock,
@@ -251,6 +258,7 @@ class TurnPrefixCache:
         parent: TurnNode,
         segment: Segment,
         kv_data: list[KVLayerSegment] | None,
+        sliding_kv_data: list[KVLayerSegment] | None,
         recurrent_data: list[RecurrentLayerSegment] | None,
         is_system_prompt: bool = False,
         acquire_lock: bool = True,
@@ -258,6 +266,8 @@ class TurnPrefixCache:
         with self._lock if acquire_lock else nullcontext():
             if recurrent_data:
                 self.has_recurrent_state = True
+            if sliding_kv_data:
+                self.has_sliding_state = True
             h = _context_hash(parent.context_hash, segment.token_ids)
 
             if h in parent.children:
@@ -278,6 +288,7 @@ class TurnPrefixCache:
                 context_hash=h,
                 kv_data=kv_data,
                 recurrent_data=recurrent_data,
+                sliding_kv_data=sliding_kv_data,
                 parent=parent,
                 is_permanent_checkpoint=is_permanent,
                 tokens_since_checkpoint=node_tsc,
