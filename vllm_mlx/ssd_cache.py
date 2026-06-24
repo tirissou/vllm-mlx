@@ -121,6 +121,12 @@ class SSDCacheStats:
         }
 
 
+@dataclass
+class SSDRef:
+    file_path: str
+    size_bytes: int
+
+
 def _tokens_to_blob(tokens: tuple[int, ...]) -> bytes:
     """Serialize token tuple to a compact binary blob for SQLite storage.
 
@@ -259,6 +265,17 @@ class SSDIndex:
                 ),
             )
             self._conn.commit()
+
+    def lookup_tokens_by_file_path(self, file_path: str) -> tuple[int, ...] | None:
+        """Look up tokens by file path. Returns tokens or None."""
+        with self._db_lock:
+            cur = self._conn.execute(
+                "SELECT tokens_blob FROM entries WHERE file_path = ?", (file_path,)
+            )
+            row = cur.fetchone()
+            if row:
+                return _blob_to_tokens(row["tokens_blob"])
+            return None
 
     def lookup_exact(self, tokens_key: tuple[int, ...]) -> dict | None:
         """Look up an exact token sequence. Returns dict or None."""
@@ -784,16 +801,16 @@ class SSDCacheTier:
             return results[0]  # Already sorted by num_tokens DESC
         return None
 
-    async def async_promote(self, ref: SSDRef, tokens: tuple[int, ...]) -> list | None:
+    async def async_promote(self, ref: SSDRef) -> list | None:
         """Promote an entry from SSD to RAM asynchronously."""
         import asyncio
 
         try:
-            return await asyncio.to_thread(self._read_entry, tokens, ref.file_path)
+            return await asyncio.to_thread(self._read_entry, ref.file_path)
         except Exception:
             return None
 
-    def _read_entry(self, tokens: tuple[int, ...], relative_path: str) -> list | None:
+    def _read_entry(self, relative_path: str) -> list | None:
         """Read a cache entry from disk. Called from thread pool.
 
         Returns list of deserialized layer dicts, or None on corruption.
@@ -806,7 +823,7 @@ class SSDCacheTier:
                 manifest = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[ssd_cache] corrupt manifest for {relative_path}: {e}")
-            self._quarantine_entry(tokens, relative_path)
+            self._quarantine_entry(relative_path)
             return None
 
         cache_layers = []
@@ -824,7 +841,7 @@ class SSDCacheTier:
                     logger.warning(
                         f"[ssd_cache] unknown layer type {layer_type}, skipping"
                     )
-                    self._quarantine_entry(tokens, relative_path)
+                    self._quarantine_entry(relative_path)
                     return None
 
                 layer_data = serializer.deserialize_layer(layer_path, layer_meta)
@@ -833,12 +850,12 @@ class SSDCacheTier:
                 logger.warning(
                     f"[ssd_cache] corrupt layer {layer_idx} in {relative_path}: {e}"
                 )
-                self._quarantine_entry(tokens, relative_path)
+                self._quarantine_entry(relative_path)
                 return None
 
         return cache_layers
 
-    def _quarantine_entry(self, tokens: tuple[int, ...], relative_path: str) -> None:
+    def _quarantine_entry(self, relative_path: str) -> None:
         """Move a corrupt entry to quarantine and remove from index."""
         entry_dir = os.path.join(self._data_dir, relative_path)
         quarantine_dir = os.path.join(self._cache_dir, "quarantine", relative_path)
@@ -857,7 +874,9 @@ class SSDCacheTier:
         except OSError as e:
             logger.warning(f"[ssd_cache] failed to quarantine {relative_path}: {e}")
 
-        self._index.delete_entry(tokens)
+        tokens = self._index.lookup_tokens_by_file_path(relative_path)
+        if tokens is not None:
+            self._index.delete_entry(tokens)
 
     def _enforce_capacity(self) -> None:
         """Evict oldest SSD entries until within capacity limits.

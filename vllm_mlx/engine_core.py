@@ -173,7 +173,10 @@ class EngineCore:
 
         def _step_on_worker():
             _bind_worker_streams_once()
-            output = self.scheduler.step()
+            # Run the async scheduler step in the worker's event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            output = loop.run_until_complete(self.scheduler.step())
             self._steps_executed += 1
 
             if self._steps_executed % _memory_check_interval == 0:
@@ -191,9 +194,9 @@ class EngineCore:
 
             return output
 
-        def _step_on_model_thread():
+        async def _step_on_model_thread():
             _bind_model_streams_once()
-            output = self.scheduler.step()
+            output = await self.scheduler.step()
             self._steps_executed += 1
 
             if self._steps_executed % _memory_check_interval == 0:
@@ -266,7 +269,7 @@ class EngineCore:
                                     continue
                                 raise
                         else:
-                            output = _step_on_model_thread()
+                            output = await _step_on_model_thread()
                         # Yield to event loop after each step.
                         await asyncio.sleep(0)
 

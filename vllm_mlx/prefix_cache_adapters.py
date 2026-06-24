@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -11,7 +12,7 @@ from typing import Any, TYPE_CHECKING
 import mlx.core as mx
 
 from vllm_mlx.request import Request
-from vllm_mlx.turn_prefix_cache import TurnPrefixCache
+from vllm_mlx.turn_prefix_cache import TurnPrefixCache, SSDRef
 
 if TYPE_CHECKING:
     from vllm_mlx.turn_prefix_cache import TurnNode
@@ -111,7 +112,7 @@ class CacheManager(ABC):
         ...
 
     @abstractmethod
-    def fetch(self, request) -> bool:
+    async def fetch(self, request) -> bool:
         """Look up a cached prefix for this request.
 
         On a hit, populates request._cache_state.turn_path and returns True.
@@ -275,14 +276,24 @@ class TurnCacheManager(CacheManager):
             cs.remaining_tokens = request.prompt_token_ids
             cs.prefill_boundaries = self.boundaries(request)
 
-    def fetch(self, request) -> bool:
+    async def _perform_promotion(self, request, leaf: "TurnNode", ref: SSDRef) -> None:
+        """Promote a node from SSD to memory."""
+        # TODO: Implement budget reservation.
+        new_data = await self._inner.ssd_cache.async_promote(ref)
+        leaf.recurrent_data = new_data
+
+    async def fetch(self, request) -> bool:
+        print(f"DEBUG: fetch called with request={request}")
         segments = self.messages_to_segments(request)
         if not segments:
+            print("DEBUG: no segments")
             self._set_miss_state(request)
             return False
 
         path, _ = self._inner.match(segments)
+        print(f"DEBUG: path={path}, is_hit={_}")
         if not path:
+            print("DEBUG: no path")
             self._set_miss_state(request)
             return False
 
@@ -295,18 +306,32 @@ class TurnCacheManager(CacheManager):
         if cs is not None:
             cs.turn_path = path
 
+        # SSD promotion: if the matched leaf is in SSD, promote it.
+        leaf = path[-1]
+        print(f"DEBUG: leaf={leaf}, recurrent_data={leaf.recurrent_data}")
+        if isinstance(leaf.recurrent_data, SSDRef):
+            ref = leaf.recurrent_data
+            print(f"DEBUG: SSD hit! ref={ref}")
+            await asyncio.shield(self._perform_promotion(request, leaf, ref))
+            return True
+
         ancestor = self._inner.find_checkpoint_ancestor(path)
+        print(f"DEBUG: ancestor={ancestor}")
         if ancestor is None:
+            print("DEBUG: ancestor is None")
             # Release the remaining leaf pin; this is a miss after all.
             self._inner.release([path[-1]])
             self._pinned_leaves.pop(request.request_id, None)
             self._set_miss_state(request)
             return False
 
+        print("DEBUG: passed ancestor check")
         _probe_req_id = getattr(request, "request_id", None) or getattr(request, "uid", "?")
         _probe_pre_active = mx.get_active_memory()
         kv_data, rec_data = self._inner.collect_path_data(ancestor)
+        print(f"DEBUG: kv_data={kv_data}, rec_data={rec_data}")
         reconstructed = assemble(kv_data, rec_data, self._kv_group_size)
+        print(f"DEBUG: reconstructed={reconstructed}")
         _probe_n_tokens = sum(l.n_tokens for l in (kv_data or []) if l is not None)
         del kv_data, rec_data
         # Materialize the KVCache arrays now so the lazy computation graph
@@ -337,12 +362,15 @@ class TurnCacheManager(CacheManager):
             mx.get_peak_memory() / 1e9,
         )
         if not self.validate(reconstructed):
+            print("DEBUG: validate failed")
             # Release the remaining leaf pin; this is a miss after all.
             self._inner.release([path[-1]])
             self._pinned_leaves.pop(request.request_id, None)
             self._set_miss_state(request)
             return False
+        print("DEBUG: validate passed")
         cached_tokens = ancestor.n_tokens
+        print(f"DEBUG: cached_tokens={cached_tokens}")
         if cs is not None:
             cs.hit_type = "hit"
             cs.cache = reconstructed
@@ -351,6 +379,7 @@ class TurnCacheManager(CacheManager):
             cs.prefill_boundaries = self.boundaries(request)
         # Record the pinned leaf so release() can find it.
         self._pinned_leaves[request.request_id] = path[-1]
+        print("DEBUG: returning True")
         return True
 
     def store(self, request, tokens: list[int] = None, cache: list = None) -> bool:

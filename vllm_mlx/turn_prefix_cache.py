@@ -21,6 +21,7 @@ from mlx.nn.utils import checkpoint
 import numpy as np
 
 from vllm_mlx.cache_types import KVLayerSegment, KVConcatSegment, KVRotatingSegment, RecurrentLayerSegment
+from .ssd_cache import SSDRef
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -82,12 +83,6 @@ def _meta_to_kv_segment(keys, values, meta: dict) -> KVLayerSegment:
 class Segment:
     role: str
     token_ids: list[int]
-
-
-@dataclass
-class SSDRef:
-    file_path: str
-    size_bytes: int
 
 
 @dataclass
