@@ -204,7 +204,7 @@ def _arr_bytes(arr) -> int:
 
 
 def _node_data_bytes(node: TurnNode) -> int:
-    """Estimate bytes used by a node's kv_data and recurrent_data."""
+    """Estimate bytes used by a node's kv_data, sliding_kv_data, and recurrent_data."""
     total = 0
     if isinstance(node.kv_data, list):
         for kv in node.kv_data:
@@ -472,6 +472,7 @@ class TurnPrefixCache:
             current = to_evict.pop()
             self._memory_bytes -= _node_data_bytes(current)
             current.kv_data = None
+            current.sliding_kv_data = None
             current.recurrent_data = None
 
             parent = current.parent
