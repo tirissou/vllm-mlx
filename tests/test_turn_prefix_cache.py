@@ -2053,6 +2053,7 @@ def test_collect_path_data_returns_full_and_sliding():
     # Sliding (layer 1) comes from the anchor b only — exactly one segment.
     sliding = [s for s in kv_layers if s.layer_index == 1]
     assert len(sliding) == 1
+    assert rec_layers == []
 
 
 def test_interior_node_drops_sliding_keeps_full():
