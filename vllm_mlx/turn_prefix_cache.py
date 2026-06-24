@@ -52,11 +52,10 @@ def _kv_segment_to_meta(seg: KVLayerSegment) -> dict:
     }
 
 
-def _write_sliding_arrays(tensors: dict, j: int, kv_item) -> None:
-    """Serialize one sliding KV segment's arrays into `tensors`.
-
-    Handles both quantized (QuantizedArray) and float (mx.array) keys/values,
-    because sliding layers default to bf16 (KVQuantPolicy.sliding_bits=None).
+def _write_kv_segment_arrays(tensors: dict, j: int, kv_item) -> None:
+    """Serialize one KV segment's arrays into `tensors`. Dispatches on array type:
+    QuantizedArray -> packed/scales/biases tensors; plain mx.array (float, e.g. bf16
+    sliding layers with bits=None) -> float tensors.
     """
     from vllm_mlx.kv_cache import QuantizedArray
 
@@ -75,8 +74,11 @@ def _write_sliding_arrays(tensors: dict, j: int, kv_item) -> None:
         tensors[f"layer_{j}_values_float"] = np.array(v)
 
 
-def _read_sliding_arrays(tensors: dict, j: int, item_meta: dict):
-    """Reconstruct one sliding KVLayerSegment from saved tensors + metadata."""
+def _read_kv_segment_arrays(tensors: dict, j: int, item_meta: dict):
+    """Reconstruct one KVLayerSegment from saved tensors + metadata. Inverse of
+    _write_kv_segment_arrays; picks the quantized or float branch by inspecting
+    which tensors are present.
+    """
     from vllm_mlx.kv_cache import QuantizedArray
 
     if f"layer_{j}_keys_packed" in tensors:
@@ -551,7 +553,7 @@ class TurnPrefixCache:
                     tensors: dict[str, np.ndarray] = {}
                     all_meta: list[dict] = []
                     for j, kv_item in enumerate(node.kv_data):
-                        _write_sliding_arrays(tensors, j, kv_item)
+                        _write_kv_segment_arrays(tensors, j, kv_item)
                         all_meta.append(_kv_segment_to_meta(kv_item))
                     tmp = kv_path + ".tmp"
                     st_save(tensors, tmp)
@@ -596,7 +598,7 @@ class TurnPrefixCache:
                     s_tensors: dict[str, np.ndarray] = {}
                     s_meta: list[dict] = []
                     for j, kv_item in enumerate(node.sliding_kv_data):
-                        _write_sliding_arrays(s_tensors, j, kv_item)
+                        _write_kv_segment_arrays(s_tensors, j, kv_item)
                         s_meta.append(_kv_segment_to_meta(kv_item))
                     tmp = sliding_path + ".tmp"
                     st_save(s_tensors, tmp)
@@ -676,7 +678,7 @@ class TurnPrefixCache:
                         with open(meta_path_kv) as mf:
                             all_meta = json.load(mf)
                         kv_items: list[KVLayerSegment] = [
-                            _read_sliding_arrays(tensors, j, item_meta)
+                            _read_kv_segment_arrays(tensors, j, item_meta)
                             for j, item_meta in enumerate(all_meta)
                         ]
                         kv_data = kv_items if kv_items else None
@@ -726,7 +728,7 @@ class TurnPrefixCache:
                         with open(s_meta_path) as mf:
                             s_meta_list = json.load(mf)
                         s_items: list[KVLayerSegment] = [
-                            _read_sliding_arrays(s_tensors, j, item_meta)
+                            _read_kv_segment_arrays(s_tensors, j, item_meta)
                             for j, item_meta in enumerate(s_meta_list)
                         ]
                         sliding_kv_data = s_items if s_items else None
