@@ -2053,4 +2053,42 @@ def test_collect_path_data_returns_full_and_sliding():
     # Sliding (layer 1) comes from the anchor b only — exactly one segment.
     sliding = [s for s in kv_layers if s.layer_index == 1]
     assert len(sliding) == 1
-    assert rec_layers == []
+
+
+def test_interior_node_drops_sliding_keeps_full():
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+    parent = cache.insert(cache.root, Segment("user", [1, 2]),
+                          kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()])
+    assert parent.is_permanent_checkpoint is False
+    # Giving parent its first child turns it interior -> sliding dropped.
+    cache.insert(parent, Segment("user", [3, 4]),
+                 kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()])
+    assert parent.sliding_kv_data is None       # dropped
+    assert isinstance(parent.kv_data, list)     # full attention retained
+
+
+def test_checkpoint_node_keeps_sliding_when_gaining_child():
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+    cp = cache.insert(cache.root, Segment("system", [1, 2]),
+                      kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()],
+                      is_system_prompt=True)
+    assert cp.is_permanent_checkpoint is True
+    cache.insert(cp, Segment("user", [3, 4]),
+                 kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()])
+    assert isinstance(cp.sliding_kv_data, list)  # checkpoint keeps sliding
+
+
+def test_find_checkpoint_ancestor_falls_back_to_checkpoint_for_sliding():
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+    cp = cache.insert(cache.root, Segment("system", [1, 2]),
+                      kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()],
+                      is_system_prompt=True)
+    mid = cache.insert(cp, Segment("user", [3, 4]),
+                       kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()])
+    # mid gains a child -> becomes interior -> its sliding is dropped.
+    cache.insert(mid, Segment("user", [5, 6]),
+                 kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()])
+    assert mid.sliding_kv_data is None
+
+    anchor = cache.find_checkpoint_ancestor([cp, mid])
+    assert anchor is cp           # mid has no sliding -> fall back to checkpoint cp

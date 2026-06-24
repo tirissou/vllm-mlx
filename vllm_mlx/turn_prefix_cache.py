@@ -303,6 +303,7 @@ class TurnPrefixCache:
             ):
                 freed = _node_data_bytes(parent)
                 parent.recurrent_data = None
+                parent.sliding_kv_data = None
                 freed -= _node_data_bytes(parent)
                 self._memory_bytes -= freed
 
@@ -352,16 +353,23 @@ class TurnPrefixCache:
         """Return the deepest node in path that can serve as a prefill resume point.
 
         Hybrid models: deepest node with real recurrent data.
+        Sliding-window models: deepest node with in-memory sliding KV data.
         KV-only models: deepest node with non-empty, in-memory kv_data.
         """
-        if not self.has_recurrent_state:
+        if self.has_recurrent_state:
             for node in reversed(path):
-                if isinstance(node.kv_data, list) and node.kv_data:
+                if isinstance(node.recurrent_data, list) and node.recurrent_data:
+                    return node
+            return None
+
+        if self.has_sliding_state:
+            for node in reversed(path):
+                if isinstance(node.sliding_kv_data, list) and node.sliding_kv_data:
                     return node
             return None
 
         for node in reversed(path):
-            if isinstance(node.recurrent_data, list) and node.recurrent_data:
+            if isinstance(node.kv_data, list) and node.kv_data:
                 return node
         return None
 
