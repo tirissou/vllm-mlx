@@ -36,3 +36,13 @@ Concrete changes:
 The `scales=[1.0, 1.0]` sentinel is eliminated. `CacheTranslator` is deleted. `reconstruct_cache_from_states` is deleted. `VllmQuantizedKVCache` is deleted. The hit path emits `QuantizedKVCache` objects directly — no bfloat16 intermediate, no double-quantize. Rotating KV layers still dequantize at reconstruction (unavoidable: no quantized rotating cache type in mlx-lm).
 
 Do not re-introduce per-tensor int8 storage (Option A). The double-quantize compounds rounding error and the bfloat16 intermediate negates the memory benefit during the reconstruction window.
+
+---
+
+## Addendum (2026-06-23) — `sliding_kv_data` field and cache format v6
+
+`TurnNode` now stores sliding-window (rotating) KV segments in a dedicated `sliding_kv_data: list[KVLayerSegment] | SSDRef | None` field, separate from `kv_data` (full-attention layers only). The partition happens at the trie-write boundary in `TurnCacheManager.on_prefill_checkpoint`: `KVRotatingSegment` entries go to `sliding_kv_data`, all other `KVLayerSegment` entries go to `kv_data`. `assemble()` is unchanged — it reconstructs by `layer_index` regardless of which field the segments originated in.
+
+**Persistence (format version 6):** the `nodes` SQLite table gains a `sliding_file_path TEXT` column. Each node with non-empty `sliding_kv_data` gets its own `sliding_{i}.safetensors` file and a matching `_meta.json`. The KV serialization helpers `_write_kv_segment_arrays` / `_read_kv_segment_arrays` are **type-driven**: they dispatch on the runtime type of `keys` — `QuantizedArray` → packed/scales/biases tensors; plain `mx.array` → float tensors. This means both `kv_data` (production default: q8, byte-identical wire format to v5) and `sliding_kv_data` (production default: bf16 float, `sliding_bits=None`) use the same helpers. Format v5 files are rejected at load.
+
+**Eviction:** `sliding_kv_data` is treated identically to `recurrent_data` for interior-node cleanup — dropped from non-checkpoint nodes when they gain their first child, retained at permanent checkpoints and active leaves.

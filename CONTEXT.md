@@ -24,7 +24,7 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 
 **`pinned_leaf(request_id)`** — public observer on `TurnCacheManager` returning the currently pinned `TurnNode` or `None`. The supported way for tests and diagnostics to read pin state; direct access to `_pinned_leaves` is private. Tests verifying eviction-protection should prefer `TurnNode.is_evictable` (already public) over reading `ref_count` directly.
 
-**Leaf-only eviction** — invariant enforced by `TurnPrefixCache`. A node is evictable iff `len(children) == 0` AND `ref_count == 0`. Interior nodes are never evicted. This is what makes Active Leaf safe with O(1) per-request bookkeeping: pinning just the leaf is sufficient because everything above it is protected structurally.
+**Leaf-only eviction** — invariant enforced by `TurnPrefixCache`. A node is evictable iff `len(children) == 0` AND `ref_count == 0`. Interior nodes are never evicted. This is what makes Active Leaf safe with O(1) per-request bookkeeping: pinning just the leaf is sufficient because everything above it is protected structurally. Non-cumulative state — `recurrent_data` **and** `sliding_kv_data` — is dropped from interior non-checkpoint nodes when they gain their first child; only permanent checkpoints and active leaves retain it.
 
 ---
 
@@ -40,6 +40,8 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 ---
 
 ## Trie storage types
+
+**TurnNode storage fields** — `kv_data` holds full-attention (`KVConcatSegment`) layers only; `sliding_kv_data` holds sliding-window (`KVRotatingSegment`) layers; `recurrent_data` holds recurrent state. The latter two are non-cumulative and are retained only at permanent checkpoints + active leaves (see "Leaf-only eviction" and the checkpoint-stride invariant). Each field may independently be a `list`, an `SSDRef`, or `None`.
 
 **KVLayerSegment** — abstract base class in `cache_types.py` for immutable per-layer KV snapshots stored in a `TurnNode`. Two concrete subclasses (`KVConcatSegment`, `KVRotatingSegment`) dispatch path-merge and reconstruction polymorphically. Common fields: `keys` / `values` (either `QuantizedArray` in mlx-lm's native group-quantized format — `packed: uint32`, `scales: bfloat16`, `biases: bfloat16` — or `mx.array` for float precision), `layer_index: int`, `n_tokens: int`, `bits: int | None` (the precision used to store this layer; `None` = bf16). Frozen dataclass. Not a decode buffer — callers must not treat it as one. Compare with `BatchQuantizedKVCache` (live, mutable) and `QuantizedKVCache` (live, single-sequence).
 
@@ -59,7 +61,7 @@ Terms used in architecture discussions and code. See ADRs for decisions that con
 
 ## Cache translator (`vllm_mlx/cache_translator.py`)
 
-**`segment(live_states, policy, group_size) -> (kv_list, rec_list)`** — translates a list of live mlx-lm cache states into `KVLayerSegment` / `RecurrentLayerSegment` lists for trie storage. Producers: `TurnCacheManager.fetch` (during reconstruction-validate), `store`, `on_prefill_checkpoint`. Constructs the right `KVLayerSegment` subclass based on the live cache's `class_name`.
+**`segment(live_states, policy, group_size) -> (kv_list, rec_list)`** — translates a list of live mlx-lm cache states into `KVLayerSegment` / `RecurrentLayerSegment` lists for trie storage. Producers: `TurnCacheManager.fetch` (during reconstruction-validate), `store`, `on_prefill_checkpoint`. Constructs the right `KVLayerSegment` subclass based on the live cache's `class_name`. Note: `segment()` / `assemble()` signatures are unchanged regardless of full vs sliding; the **full/sliding partition happens at the trie-write boundary** (`TurnCacheManager.on_prefill_checkpoint`), which separates `KVRotatingSegment` entries into `sliding_kv_data` and all others into `kv_data`. `collect_path_data` sources full KV by concat-merge across the path and sliding KV from the anchor node's `sliding_kv_data` only (non-cumulative). `assemble` reconstructs by `layer_index` regardless of which field the segments came from.
 
 **Segment contract** — emitted segments hold **evaluated, graph-detached** arrays (`mx.eval` then `mx.stop_gradient` on every output). The trie node never retains a reference to the source MLX computation graph or the source float16 Metal buffers via the lazy quantize dependency chain. Callers may delete the source live state and call `mx.clear_cache()`; segment arrays survive. See `prefix_cache_adapters.py:369-371` for the original motivation. ADR-0005 records why this seam exists.
 

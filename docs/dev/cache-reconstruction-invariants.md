@@ -84,7 +84,15 @@ will time out or produce empty output (0 decoded tokens) if this guard is remove
 
 ---
 
-## 3. ADR-0005 type contract: always `BatchQuantizedKVCache`, never `QuantizedKVCache`
+## 3. Sliding vs full KV sourcing in `collect_path_data`
+
+**Rule:** full-attention layers are concat-merged across the entire path from `kv_data`; sliding-window layers are taken from the **anchor node's `sliding_kv_data` only** (non-cumulative — the deepest copy is authoritative).
+
+**Why it matters:** a `collect_path_data` call that reads `sliding_kv_data` from every path node would re-apply non-cumulative state, producing an incorrect ring-buffer offset. Only the anchor node (the deepest path node with in-memory `sliding_kv_data`, found by `find_checkpoint_ancestor`) is authoritative.
+
+---
+
+## 4. ADR-0005 type contract: always `BatchQuantizedKVCache`, never `QuantizedKVCache`
 
 **Rule:** Cache reconstruction must never emit plain `QuantizedKVCache` for standard
 (non-rotating) KV layers. ADR-0005 mandates `BatchQuantizedKVCache.from_quantized_arrays`.
