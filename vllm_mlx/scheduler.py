@@ -1303,7 +1303,7 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _schedule_waiting(self) -> List[Request]:
+    async def _schedule_waiting(self) -> List[Request]:
         """
         Move requests from waiting queue to running.
 
@@ -1321,7 +1321,7 @@ class Scheduler:
             if request._cache_state.remaining_tokens is None:
                 hit_occurred = False
                 if self._prefix_cache is not None:
-                    hit_occurred = self._prefix_cache.fetch(request)
+                    hit_occurred = await self._prefix_cache.fetch(request)
                     if hit_occurred:
                         self._log_cache_key(
                             "get", request.request_id, list(request.prompt_token_ids)
@@ -1807,7 +1807,7 @@ class Scheduler:
         if count > 0:
             logger.info(f"Rescheduled {count} requests for retry")
 
-    def step(self, max_retries: int = 1) -> SchedulerOutput:
+    async def step(self, max_retries: int = 1) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
 
@@ -1831,7 +1831,7 @@ class Scheduler:
         for attempt in range(max_retries + 1):
             try:
                 # Schedule waiting requests
-                scheduled = self._schedule_waiting()
+                scheduled = await self._schedule_waiting()
                 output.scheduled_request_ids = [r.request_id for r in scheduled]
                 output.num_scheduled_tokens = sum(
                     r.num_prompt_tokens for r in scheduled
