@@ -649,6 +649,54 @@ class TestRotatingCacheSecondWrapRoundtrip:
         assert float(mx.max(mx.abs(logits_cached - logits_fresh))) < ATOL
 
 
+class TestSlidingKVPersistence:
+    """Task 4: sliding_kv_data survives save/load roundtrip."""
+
+    def test_sliding_kv_survives_save_load(self, tmp_path):
+        import os
+        import mlx.core as mx
+        from vllm_mlx.cache_types import KVConcatSegment, KVRotatingSegment
+        from vllm_mlx.turn_prefix_cache import Segment, TurnPrefixCache, TurnPrefixCacheConfig
+
+        def _concat_seg(layer_index=0, n=4):
+            k = mx.zeros((1, 2, n, 8), dtype=mx.bfloat16)
+            return KVConcatSegment(keys=k, values=k, layer_index=layer_index,
+                                   n_tokens=n, bits=None, class_name="KVCache")
+
+        def _rot_seg(layer_index=1, n=4):
+            k = mx.ones((1, 2, n, 8), dtype=mx.bfloat16)
+            return KVRotatingSegment(keys=k, values=k, layer_index=layer_index,
+                                     n_tokens=n, bits=None, class_name="RotatingKVCache",
+                                     max_size=n, keep=0, offset=n, idx=n)
+
+        cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+        cache.insert(cache.root, Segment("user", [1, 2, 3, 4]),
+                     kv_data=[_concat_seg()], sliding_kv_data=[_rot_seg()])
+        cache.save(str(tmp_path))
+
+        restored = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+        restored.load(str(tmp_path))
+
+        node = next(iter(restored.root.children.values()))
+        assert isinstance(node.sliding_kv_data, list)
+        assert len(node.sliding_kv_data) == 1
+        seg = node.sliding_kv_data[0]
+        assert seg.layer_index == 1
+        assert seg.max_size == 4
+        assert restored.has_sliding_state is True
+
+    def test_format_version_five_cache_is_rejected(self, tmp_path):
+        import os
+        import json
+        from vllm_mlx.turn_prefix_cache import TurnPrefixCache, TurnPrefixCacheConfig
+
+        with open(os.path.join(tmp_path, "meta.json"), "w") as f:
+            json.dump({"version": 5, "model_fingerprint": ""}, f)
+        cache = TurnPrefixCache(TurnPrefixCacheConfig())
+        cache.load(str(tmp_path))   # version mismatch -> starts empty, no raise
+        assert len(cache.root.children) == 0
+
+
 class TestMultiTurnRoundtrip:
     def test_second_turn_cached_prefill_matches_fresh_decode(self):
         """Turn-2 decode using turn-1 cached state matches full fresh-sequence decode.

@@ -25,7 +25,7 @@ from vllm_mlx.cache_types import KVLayerSegment, KVConcatSegment, KVRotatingSegm
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-_CACHE_FORMAT_VERSION = 5
+_CACHE_FORMAT_VERSION = 6
 
 
 def _kv_segment_to_meta(seg: KVLayerSegment) -> dict:
@@ -50,6 +50,53 @@ def _kv_segment_to_meta(seg: KVLayerSegment) -> dict:
         "n_tokens": seg.n_tokens,
         "bits": seg.bits,
     }
+
+
+def _write_sliding_arrays(tensors: dict, j: int, kv_item) -> None:
+    """Serialize one sliding KV segment's arrays into `tensors`.
+
+    Handles both quantized (QuantizedArray) and float (mx.array) keys/values,
+    because sliding layers default to bf16 (KVQuantPolicy.sliding_bits=None).
+    """
+    from vllm_mlx.kv_cache import QuantizedArray
+
+    keys, values = kv_item.keys, kv_item.values
+    if isinstance(keys, QuantizedArray):
+        tensors[f"layer_{j}_keys_packed"] = np.array(keys.packed)
+        tensors[f"layer_{j}_keys_scales"] = np.array(keys.scales.astype(mx.float32))
+        tensors[f"layer_{j}_keys_biases"] = np.array(keys.biases.astype(mx.float32))
+        tensors[f"layer_{j}_values_packed"] = np.array(values.packed)
+        tensors[f"layer_{j}_values_scales"] = np.array(values.scales.astype(mx.float32))
+        tensors[f"layer_{j}_values_biases"] = np.array(values.biases.astype(mx.float32))
+    else:
+        k = keys.astype(mx.float32) if keys.dtype == mx.bfloat16 else keys
+        v = values.astype(mx.float32) if values.dtype == mx.bfloat16 else values
+        tensors[f"layer_{j}_keys_float"] = np.array(k)
+        tensors[f"layer_{j}_values_float"] = np.array(v)
+
+
+def _read_sliding_arrays(tensors: dict, j: int, item_meta: dict):
+    """Reconstruct one sliding KVLayerSegment from saved tensors + metadata."""
+    from vllm_mlx.kv_cache import QuantizedArray
+
+    if f"layer_{j}_keys_packed" in tensors:
+        keys = QuantizedArray(
+            packed=mx.array(tensors[f"layer_{j}_keys_packed"]),
+            scales=mx.array(tensors[f"layer_{j}_keys_scales"]).astype(mx.bfloat16),
+            biases=mx.array(tensors[f"layer_{j}_keys_biases"]).astype(mx.bfloat16),
+        )
+        values = QuantizedArray(
+            packed=mx.array(tensors[f"layer_{j}_values_packed"]),
+            scales=mx.array(tensors[f"layer_{j}_values_scales"]).astype(mx.bfloat16),
+            biases=mx.array(tensors[f"layer_{j}_values_biases"]).astype(mx.bfloat16),
+        )
+    else:
+        keys = mx.array(tensors[f"layer_{j}_keys_float"])
+        values = mx.array(tensors[f"layer_{j}_values_float"])
+        if item_meta.get("bits") is None:
+            keys = keys.astype(mx.bfloat16)
+            values = values.astype(mx.bfloat16)
+    return _meta_to_kv_segment(keys, values, item_meta)
 
 
 def _meta_to_kv_segment(keys, values, meta: dict) -> KVLayerSegment:
@@ -480,6 +527,7 @@ class TurnPrefixCache:
                 token_ids_blob BLOB NOT NULL,
                 kv_file_path TEXT NOT NULL,
                 recurrent_file_path TEXT,
+                sliding_file_path TEXT,
                 last_used REAL NOT NULL,
                 tokens_since_checkpoint INTEGER NOT NULL,
                 is_permanent_checkpoint INTEGER NOT NULL
@@ -496,30 +544,14 @@ class TurnPrefixCache:
 
                 kv_path = os.path.join(persist_dir, f"kv_{i}.safetensors")
                 rec_path: str | None = None
+                sliding_path: str | None = None
 
                 # Save kv_data: list[KVLayerSegment] — one safetensors file + JSON sidecar per item
                 if isinstance(node.kv_data, list) and node.kv_data:
                     tensors: dict[str, np.ndarray] = {}
                     all_meta: list[dict] = []
                     for j, kv_item in enumerate(node.kv_data):
-                        tensors[f"layer_{j}_keys_packed"] = np.array(
-                            kv_item.keys.packed
-                        )
-                        tensors[f"layer_{j}_keys_scales"] = np.array(
-                            kv_item.keys.scales.astype(mx.float32)
-                        )
-                        tensors[f"layer_{j}_keys_biases"] = np.array(
-                            kv_item.keys.biases.astype(mx.float32)
-                        )
-                        tensors[f"layer_{j}_values_packed"] = np.array(
-                            kv_item.values.packed
-                        )
-                        tensors[f"layer_{j}_values_scales"] = np.array(
-                            kv_item.values.scales.astype(mx.float32)
-                        )
-                        tensors[f"layer_{j}_values_biases"] = np.array(
-                            kv_item.values.biases.astype(mx.float32)
-                        )
+                        _write_sliding_arrays(tensors, j, kv_item)
                         all_meta.append(_kv_segment_to_meta(kv_item))
                     tmp = kv_path + ".tmp"
                     st_save(tensors, tmp)
@@ -558,15 +590,31 @@ class TurnPrefixCache:
                         with open(rec_meta_path, "w") as mf:
                             json.dump(rec_meta_list, mf)
 
+                # Save sliding_kv_data: list[KVLayerSegment] (own file)
+                if isinstance(node.sliding_kv_data, list) and node.sliding_kv_data:
+                    sliding_path = os.path.join(persist_dir, f"sliding_{i}.safetensors")
+                    s_tensors: dict[str, np.ndarray] = {}
+                    s_meta: list[dict] = []
+                    for j, kv_item in enumerate(node.sliding_kv_data):
+                        _write_sliding_arrays(s_tensors, j, kv_item)
+                        s_meta.append(_kv_segment_to_meta(kv_item))
+                    tmp = sliding_path + ".tmp"
+                    st_save(s_tensors, tmp)
+                    os.replace(tmp, sliding_path)
+                    s_meta_path = sliding_path.replace(".safetensors", "_meta.json")
+                    with open(s_meta_path, "w") as mf:
+                        json.dump(s_meta, mf)
+
                 parent_hash = node.parent.context_hash if node.parent is not None else 0
                 conn.execute(
-                    "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         node.context_hash,
                         parent_hash,
                         np.array(node.token_ids, dtype=np.int32).tobytes(),
                         kv_path,
                         rec_path,
+                        sliding_path,
                         node.last_used,
                         node.tokens_since_checkpoint,
                         int(node.is_permanent_checkpoint),
@@ -610,6 +658,7 @@ class TurnPrefixCache:
                 tok_blob,
                 kv_path,
                 rec_path,
+                sliding_path,
                 last_used,
                 tokens_since,
                 is_perm,
@@ -626,31 +675,10 @@ class TurnPrefixCache:
                     if os.path.exists(meta_path_kv):
                         with open(meta_path_kv) as mf:
                             all_meta = json.load(mf)
-                        from vllm_mlx.kv_cache import QuantizedArray
-
-                        kv_items: list[KVLayerSegment] = []
-                        for j, item_meta in enumerate(all_meta):
-                            keys = QuantizedArray(
-                                packed=mx.array(tensors[f"layer_{j}_keys_packed"]),
-                                scales=mx.array(
-                                    tensors[f"layer_{j}_keys_scales"]
-                                ).astype(mx.bfloat16),
-                                biases=mx.array(
-                                    tensors[f"layer_{j}_keys_biases"]
-                                ).astype(mx.bfloat16),
-                            )
-                            values = QuantizedArray(
-                                packed=mx.array(tensors[f"layer_{j}_values_packed"]),
-                                scales=mx.array(
-                                    tensors[f"layer_{j}_values_scales"]
-                                ).astype(mx.bfloat16),
-                                biases=mx.array(
-                                    tensors[f"layer_{j}_values_biases"]
-                                ).astype(mx.bfloat16),
-                            )
-                            kv_items.append(
-                                _meta_to_kv_segment(keys, values, item_meta)
-                            )
+                        kv_items: list[KVLayerSegment] = [
+                            _read_sliding_arrays(tensors, j, item_meta)
+                            for j, item_meta in enumerate(all_meta)
+                        ]
                         kv_data = kv_items if kv_items else None
                 except Exception as e:
                     logger.warning(f"[turn_cache] skipping node {ctx_hash}: {e}")
@@ -688,11 +716,31 @@ class TurnPrefixCache:
                         f"[turn_cache] recurrent load failed for {ctx_hash}: {e}"
                     )
 
+            # Load sliding_kv_data: list[KVLayerSegment]
+            sliding_kv_data: list[KVLayerSegment] | None = None
+            if sliding_path and os.path.exists(sliding_path):
+                try:
+                    s_tensors = st_load(sliding_path)
+                    s_meta_path = sliding_path.replace(".safetensors", "_meta.json")
+                    if os.path.exists(s_meta_path):
+                        with open(s_meta_path) as mf:
+                            s_meta_list = json.load(mf)
+                        s_items: list[KVLayerSegment] = [
+                            _read_sliding_arrays(s_tensors, j, item_meta)
+                            for j, item_meta in enumerate(s_meta_list)
+                        ]
+                        sliding_kv_data = s_items if s_items else None
+                except Exception as e:
+                    logger.warning(
+                        f"[turn_cache] sliding load failed for {ctx_hash}: {e}"
+                    )
+
             node = TurnNode(
                 token_ids=token_ids,
                 context_hash=ctx_hash,
                 kv_data=kv_data,
                 recurrent_data=recurrent_data,
+                sliding_kv_data=sliding_kv_data,
                 tokens_since_checkpoint=tokens_since,
                 is_permanent_checkpoint=bool(is_perm),
                 last_used=last_used,
@@ -720,7 +768,8 @@ class TurnPrefixCache:
                 continue
             if isinstance(node.recurrent_data, list) and node.recurrent_data:
                 self.has_recurrent_state = True
-                break
+            if isinstance(node.sliding_kv_data, list) and node.sliding_kv_data:
+                self.has_sliding_state = True
 
     # ── SSD offloading ─────────────────────────────────────────────────────
 
