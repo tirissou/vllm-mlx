@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 from .kv_cache import CacheIndexMap, _BATCH_KV_TYPES, validate_cache, extract_cache_states
 from .cache_types import KVQuantPolicy
 from vllm_mlx.cache_translator import segment, assemble, slice_kv_to_delta
+from vllm_mlx.cache_types import KVRotatingSegment
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -422,17 +423,24 @@ class TurnCacheManager(CacheManager):
             kv_sparse, rec_sparse = segment(
                 extracted_cache, policy=self._policy, group_size=self._kv_group_size
             )
-            kv_layers = [kv for kv in kv_sparse if kv is not None]
+            kv_layers, sliding_layers = [], []
+            for kv in kv_sparse:
+                if kv is None:
+                    continue
+                if isinstance(kv, KVRotatingSegment):
+                    sliding_layers.append(kv)
+                else:
+                    kv_layers.append(kv)
             rec_layers = [rec for rec in rec_sparse if rec is not None]
             _log_segment_breakdown(
                 f"checkpoint rid={getattr(request, 'request_id', '?')} "
                 f"abs_idx={abs_idx} tok_seg={len(turn_segment.token_ids)} "
                 f"prev_end={prev_end} total={total_tokens_prefilled}",
-                kv_layers,
+                kv_layers + sliding_layers,
                 rec_layers,
             )
         else:
-            kv_layers, rec_layers = [], []
+            kv_layers, sliding_layers, rec_layers = [], [], []
 
         # Snapshot the previous pinned leaf BEFORE any mutation so that an
         # exception from insert() leaves the existing pin intact (implicit
@@ -443,6 +451,7 @@ class TurnCacheManager(CacheManager):
             parent,
             turn_segment,
             kv_data=kv_layers or None,
+            sliding_kv_data=sliding_layers or None,
             recurrent_data=rec_layers or None,
             is_system_prompt=is_sys,
         )

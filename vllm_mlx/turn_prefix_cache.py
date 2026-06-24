@@ -370,8 +370,10 @@ class TurnPrefixCache:
     ) -> tuple[list[KVLayerSegment], list[RecurrentLayerSegment]]:
         """Walk from root to node and merge KV data per layer.
 
-        KVCache layers: merged via KVConcatSegment.merge_path() (incremental concat).
-        RotatingKVCache layers: merged via KVRotatingSegment.merge_path() (deepest node only).
+        Full-attention layers (kv_data): merged via KVConcatSegment.merge_path()
+        (incremental concat across the path).
+        Sliding-window layers (sliding_kv_data): taken from `node` (the anchor)
+        only — non-cumulative, so the deepest copy is authoritative.
         Recurrent data: leaf node only.
         """
         path = self._inorder_path(node)
@@ -380,13 +382,16 @@ class TurnPrefixCache:
         for n in path:
             if isinstance(n.kv_data, list):
                 for item in n.kv_data:
-                    li = item.layer_index
-                    kv_by_layer.setdefault(li, []).append(item)
+                    kv_by_layer.setdefault(item.layer_index, []).append(item)
 
         merged_kv: list[KVLayerSegment] = []
         for li in sorted(kv_by_layer):
             items = kv_by_layer[li]
             merged_kv.append(items[-1].merge_path(items))
+
+        # Sliding-window KV: anchor only (non-cumulative).
+        if isinstance(node.sliding_kv_data, list):
+            merged_kv.extend(node.sliding_kv_data)
 
         leaf = path[-1] if path else None
         recurrent: list[RecurrentLayerSegment] = (

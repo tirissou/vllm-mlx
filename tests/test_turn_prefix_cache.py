@@ -2036,3 +2036,21 @@ def _make_node(kv, sliding):
     from vllm_mlx.turn_prefix_cache import TurnNode
     return TurnNode(token_ids=[1], context_hash=1, kv_data=kv,
                     recurrent_data=None, sliding_kv_data=sliding)
+
+
+def test_collect_path_data_returns_full_and_sliding():
+    cache = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=10000))
+    a = cache.insert(cache.root, Segment("user", [1, 2]),
+                     kv_data=[_concat_seg(layer_index=0)],
+                     sliding_kv_data=[_rot_seg(layer_index=1)])
+    b = cache.insert(a, Segment("user", [3, 4]),
+                     kv_data=[_concat_seg(layer_index=0)],
+                     sliding_kv_data=[_rot_seg(layer_index=1)])
+
+    kv_layers, rec_layers = cache.collect_path_data(b)
+    layer_indices = sorted(seg.layer_index for seg in kv_layers)
+    assert layer_indices == [0, 1]            # one full (0) + one sliding (1)
+    # Sliding (layer 1) comes from the anchor b only — exactly one segment.
+    sliding = [s for s in kv_layers if s.layer_index == 1]
+    assert len(sliding) == 1
+    assert rec_layers == []
