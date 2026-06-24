@@ -14,7 +14,7 @@
 - Emitted segment arrays must stay graph-detached (`mx.eval` + `mx.stop_gradient`) — do not reintroduce live-graph references (CONTEXT.md "Segment contract", ADR-0005).
 - The trie's `step()`/scheduler path stays synchronous (ADR-0004) — no async added.
 - KV segments stored in mlx-lm native group-quantized format; `_assemble` emits `BatchQuantizedKVCache.from_quantized_arrays` (ADR-0005) — unchanged here.
-- KV serialization is **type-driven**: `_write_kv_segment_arrays` / `_read_kv_segment_arrays` (in `turn_prefix_cache.py`) dispatch on the array type of each segment — `QuantizedArray` → packed/scales/biases tensors; plain `mx.array` (float, e.g. bf16) → float tensors. These helpers are used by **both** the `kv_data` and `sliding_kv_data` persistence paths. In production, full-attention `kv_data` uses `KVQuantPolicy.full_bits=8` (quantized, byte-identical wire format to v5); sliding `kv_data` uses `sliding_bits=None` (bf16 float).
+- KV serialization is **type-driven**: `_write_kv_segment_arrays` / `_read_kv_segment_arrays` (in `turn_prefix_cache.py`) dispatch on the array type of each segment — `QuantizedArray` → packed/scales/biases tensors; plain `mx.array` (float, e.g. bf16) → float tensors. These helpers are used by **both** the `kv_data` and `sliding_kv_data` persistence paths. In production, full-attention `kv_data` uses `KVQuantPolicy.full_bits=8` (quantized, byte-identical wire format to v5); sliding-window `sliding_kv_data` uses `sliding_bits=None` (bf16 float).
 
 ## Deviation from the committed spec (2026-06-23 design doc)
 
