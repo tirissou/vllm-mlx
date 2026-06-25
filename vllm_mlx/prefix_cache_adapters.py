@@ -136,7 +136,7 @@ class CacheManager(ABC):
     def clear(self) -> None:
         pass
 
-    def on_prefill_checkpoint(
+    async def on_prefill_checkpoint(
         self, request, total_tokens_prefilled: int, extracted_cache: list
     ) -> None:
         """Called after each prefill chunk with the absolute token count.
@@ -412,7 +412,7 @@ class TurnCacheManager(CacheManager):
     def clear(self) -> None:
         pass
 
-    def on_prefill_checkpoint(
+    async def on_prefill_checkpoint(
         self, request, total_tokens_prefilled: int, extracted_cache: list
     ) -> None:
         _turn_boundaries = getattr(request, "_turn_boundaries", None) or []

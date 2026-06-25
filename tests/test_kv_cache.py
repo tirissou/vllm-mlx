@@ -376,24 +376,28 @@ class TestTurnCacheAdapterFetch:
         inner = TurnPrefixCache(TurnPrefixCacheConfig(checkpoint_stride=0))
         return TurnCacheManager(inner), inner
 
-    def test_miss_returns_false(self):
+    @pytest.mark.anyio
+    async def test_miss_returns_false(self):
         adapter, _ = self._make_adapter()
         tokens = list(range(60))
         req = _make_turn_request(tokens, [10])
-        assert adapter.fetch(req) is False
+        assert await adapter.fetch(req) is False
 
-    def test_no_segments_returns_false(self):
+    @pytest.mark.anyio
+    async def test_no_segments_returns_false(self):
         adapter, _ = self._make_adapter()
         req = _make_turn_request(list(range(50)), [])  # no boundaries → no segments
-        assert adapter.fetch(req) is False
+        assert await adapter.fetch(req) is False
 
-    def test_release_noop_when_no_pinned_leaf(self):
+    @pytest.mark.anyio
+    async def test_release_noop_when_no_pinned_leaf(self):
         adapter, _ = self._make_adapter()
         # Request that was never fetched: no pinned leaf, release must be a no-op.
         req = _make_turn_request(list(range(10)), [])
-        adapter.release(req)  # must not raise
+        adapter.release(req)
 
-    def test_release_decrements_refcount(self):
+    @pytest.mark.anyio
+    async def test_release_decrements_refcount(self):
         """release(path) decrements ref counts on matched nodes."""
         from vllm_mlx.turn_prefix_cache import Segment
 
@@ -414,7 +418,7 @@ class TestTurnCacheAdapterFetch:
         inner.release(path)
 
         # After fetch miss the handle should be empty and release is a noop
-        result = adapter.fetch(req)
+        result = await adapter.fetch(req)
         assert result is False
 
 

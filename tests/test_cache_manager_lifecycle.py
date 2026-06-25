@@ -115,7 +115,8 @@ def _insert_two_segment_path(
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
-def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.anyio
+async def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     """On a hit, only the leaf of the matched path is pinned (Active Leaf).
 
     This intentionally fails today: ``TurnPrefixCache.match`` pins every node
@@ -136,7 +137,7 @@ def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
         turn_boundaries=[len(sys_tokens)],  # B_sys = 10 → [system, user]
     )
 
-    assert manager.fetch(req) is True
+    assert await manager.fetch(req) is True
     assert req._cache_state.hit_type == "hit"
 
     # Active Leaf invariant: only the leaf is pinned.
@@ -153,7 +154,8 @@ def test_cache_fetch_hit_pins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     assert manager.pinned_leaf(req.request_id) is user_leaf
 
 
-def test_cache_fetch_miss_initialises_state() -> None:
+@pytest.mark.anyio
+async def test_cache_fetch_miss_initialises_state() -> None:
     """A miss leaves the trie unpinned and populates miss state on the request."""
     trie = _make_trie()
     manager = _make_manager(trie)
@@ -165,7 +167,7 @@ def test_cache_fetch_miss_initialises_state() -> None:
         turn_boundaries=[10],  # [system, user] segments, but trie is empty
     )
 
-    assert manager.fetch(req) is False
+    assert await manager.fetch(req) is False
     assert req._cache_state.hit_type == "miss"
     assert req._cache_state.cached_tokens == 0
     assert req._cache_state.remaining_tokens == req.prompt_token_ids
@@ -174,7 +176,8 @@ def test_cache_fetch_miss_initialises_state() -> None:
     assert manager.pinned_leaf(req.request_id) is None
 
 
-def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.anyio
+async def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     """``release`` undoes the leaf pin from ``fetch`` and clears state."""
     _stub_assemble_and_validate(monkeypatch)
 
@@ -190,7 +193,7 @@ def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
         turn_boundaries=[len(sys_tokens)],
     )
 
-    assert manager.fetch(req) is True
+    assert await manager.fetch(req) is True
     # Sanity: hit pinned the leaf.
     assert not user_leaf.is_evictable
     assert manager.pinned_leaf(req.request_id) is user_leaf
@@ -206,7 +209,8 @@ def test_cache_release_unpins_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_cache_store_advancement_unpins_old_pins_new(
+@pytest.mark.anyio
+async def test_cache_store_advancement_unpins_old_pins_new(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``store`` advances the active leaf: old leaf is unpinned, new leaf pinned."""
@@ -224,7 +228,7 @@ def test_cache_store_advancement_unpins_old_pins_new(
         turn_boundaries=[len(sys_tokens)],
     )
 
-    assert manager.fetch(req) is True
+    assert await manager.fetch(req) is True
     assert not leaf_a.is_evictable
     assert manager.pinned_leaf(req.request_id) is leaf_a
 
@@ -235,8 +239,6 @@ def test_cache_store_advancement_unpins_old_pins_new(
     # store with no cache layers is sufficient for lifecycle testing; the
     # important effect is that a new node is inserted below leaf_a.
     manager.store(req, tokens=req.output_token_ids, cache=[])
-
-    # The newly inserted child of leaf_a is the new leaf.
     new_children = list(leaf_a.children.values())
     assert len(new_children) == 1, (
         "store should insert exactly one new child under the previous leaf"
@@ -251,7 +253,8 @@ def test_cache_store_advancement_unpins_old_pins_new(
     )
 
 
-def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.anyio
+async def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """If insertion raises, ``store`` rolls back so the old leaf stays pinned."""
     _stub_assemble_and_validate(monkeypatch)
 
@@ -267,7 +270,7 @@ def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
         turn_boundaries=[len(sys_tokens)],
     )
 
-    assert manager.fetch(req) is True
+    assert await manager.fetch(req) is True
     assert not leaf_a.is_evictable
     assert manager.pinned_leaf(req.request_id) is leaf_a
 
@@ -283,8 +286,6 @@ def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(_BoomError):
         manager.store(req, tokens=req.output_token_ids, cache=[])
-
-    # Rollback invariant: leaf_a is still the pinned leaf for this request.
     assert not leaf_a.is_evictable, (
         "old leaf must remain pinned (not evictable) after a failed store"
     )
@@ -293,7 +294,8 @@ def test_cache_store_rollback_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_checkpoint_from_miss_pins_new_leaf() -> None:
+@pytest.mark.anyio
+async def test_checkpoint_from_miss_pins_new_leaf() -> None:
     """Miss path: the first on_prefill_checkpoint must pin the inserted node
     even though _pinned_leaves had no prior entry.
 
@@ -313,11 +315,11 @@ def test_checkpoint_from_miss_pins_new_leaf() -> None:
     )
 
     # Miss populates cache_state.turn_path == [] and leaves _pinned_leaves empty.
-    assert manager.fetch(req) is False
+    assert await manager.fetch(req) is False
     assert manager.pinned_leaf(req.request_id) is None
 
     # Drive the first checkpoint at the system-boundary (abs_idx=0).
-    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
+    await manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
                                   extracted_cache=[])
 
     turn_path = req._cache_state.turn_path
@@ -330,7 +332,8 @@ def test_checkpoint_from_miss_pins_new_leaf() -> None:
     assert manager.pinned_leaf(req.request_id) is new_leaf
 
 
-def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.anyio
+async def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hit path: fetch pins leaf A; the next checkpoint inserts B as child of A
     and must unpin A while pinning B.
 
@@ -363,12 +366,12 @@ def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> Non
         ],
     )
 
-    assert manager.fetch(req) is True
+    assert await manager.fetch(req) is True
     assert not leaf_a.is_evictable
     assert manager.pinned_leaf(req.request_id) is leaf_a
 
     # Drive a checkpoint at abs_idx=2 (past the matched depth of 2).
-    manager.on_prefill_checkpoint(
+    await manager.on_prefill_checkpoint(
         req,
         total_tokens_prefilled=len(prompt),
         extracted_cache=[],
@@ -384,7 +387,8 @@ def test_checkpoint_advances_active_leaf(monkeypatch: pytest.MonkeyPatch) -> Non
     assert req._cache_state.turn_path[-1] is leaf_b
 
 
-def test_consecutive_checkpoints_advance_leaf() -> None:
+@pytest.mark.anyio
+async def test_consecutive_checkpoints_advance_leaf() -> None:
     """Two checkpoints in a row from a miss: each advances the pin to the
     newest leaf; the intermediate node ends at ref_count == 0."""
     trie = _make_trie()
@@ -399,9 +403,9 @@ def test_consecutive_checkpoints_advance_leaf() -> None:
         turn_boundaries=[len(sys_tokens), len(prompt)],
     )
 
-    assert manager.fetch(req) is False
+    assert await manager.fetch(req) is False
 
-    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
+    await manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
                                   extracted_cache=[])
     node_sys = req._cache_state.turn_path[-1]
     # These two assertions are also part of the expected red state today
@@ -409,7 +413,7 @@ def test_consecutive_checkpoints_advance_leaf() -> None:
     assert not node_sys.is_evictable, "first checkpoint must pin the inserted node"
     assert manager.pinned_leaf(req.request_id) is node_sys
 
-    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(prompt),
+    await manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(prompt),
                                   extracted_cache=[])
     node_user = req._cache_state.turn_path[-1]
 
@@ -419,7 +423,8 @@ def test_consecutive_checkpoints_advance_leaf() -> None:
     assert manager.pinned_leaf(req.request_id) is node_user
 
 
-def test_release_after_checkpoint_unpins_latest_leaf() -> None:
+@pytest.mark.anyio
+async def test_release_after_checkpoint_unpins_latest_leaf() -> None:
     """Abort during prefill: fetch (miss) -> checkpoint -> release should
     unpin the checkpoint leaf, not the (non-existent) original leaf, and
     leave no dangling _pinned_leaves entry."""
@@ -435,8 +440,8 @@ def test_release_after_checkpoint_unpins_latest_leaf() -> None:
         turn_boundaries=[len(sys_tokens), len(prompt)],
     )
 
-    assert manager.fetch(req) is False
-    manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
+    assert await manager.fetch(req) is False
+    await manager.on_prefill_checkpoint(req, total_tokens_prefilled=len(sys_tokens),
                                   extracted_cache=[])
     leaf = req._cache_state.turn_path[-1]
     # This assertion is also red today (checkpoint never pins): it passes once Task 2 is done.
@@ -449,7 +454,8 @@ def test_release_after_checkpoint_unpins_latest_leaf() -> None:
     assert req._cache_state.turn_path == []
 
 
-def test_fetch_failure_no_checkpoint_ancestor_releases_pin(
+@pytest.mark.anyio
+async def test_fetch_failure_no_checkpoint_ancestor_releases_pin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When find_checkpoint_ancestor returns None after a match, fetch must
@@ -472,13 +478,14 @@ def test_fetch_failure_no_checkpoint_ancestor_releases_pin(
     monkeypatch.setattr(TurnPrefixCache, "find_checkpoint_ancestor",
                         lambda self, path: None)
 
-    assert manager.fetch(req) is False
+    assert await manager.fetch(req) is False
     assert req._cache_state.hit_type == "miss"
     assert user_leaf.is_evictable, "leaf pin must be released on this failure"
     assert manager.pinned_leaf(req.request_id) is None
 
 
-def test_fetch_failure_validate_returns_false_releases_pin(
+@pytest.mark.anyio
+async def test_fetch_failure_validate_returns_false_releases_pin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When validate(reconstructed) returns False, fetch must release the
@@ -503,7 +510,7 @@ def test_fetch_failure_validate_returns_false_releases_pin(
         turn_boundaries=[len(sys_tokens)],
     )
 
-    assert manager.fetch(req) is False
+    assert await manager.fetch(req) is False
     assert req._cache_state.hit_type == "miss"
     assert user_leaf.is_evictable, "leaf pin must be released on validate failure"
     assert manager.pinned_leaf(req.request_id) is None
